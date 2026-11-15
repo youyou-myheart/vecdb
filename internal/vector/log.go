@@ -8,6 +8,8 @@ import (
 	tikverr "github.com/tikv/client-go/v2/error"
 )
 
+var ErrInvalidLogCursor = errors.New("log cursor exceeds head")
+
 var ErrLogCompacted = errors.New("consumer behind retained log")
 
 const LogVersion = 1
@@ -72,7 +74,10 @@ func (r *Repository) ReadEvents(ctx context.Context, after, through uint64, limi
 	if e != nil {
 		return out, e
 	}
-	if out.Floor > out.Head || after > out.Head {
+	if after > out.Head {
+		return out, ErrInvalidLogCursor
+	}
+	if out.Floor > out.Head {
 		return out, errors.New("invalid log cursor")
 	}
 	if after < out.Floor {

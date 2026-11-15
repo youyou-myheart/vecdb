@@ -241,3 +241,12 @@ AC-58：`.venv/bin/python scripts/verify_hnsw_crash.py`，已加入普通一键�
 - AC110：图复制模式运行 2 Gateway、2 Master、3 Worker、32 分片的单进程流水线，覆盖 CRUD、幂等、过滤、分页、主节点切换、迁移、重建、重启。
 
 运行 `bash scripts/acceptance-graph.sh`，依赖本地 PD/TiKV/SeaweedFS。报告保存在 reports/graph-*.log/json；多进程测试仅使用一台物理机的不同 host 标签。
+
+## 对外变更订阅验收
+
+- AC111：数据事件分页序号连续；更新和删除完整保留；空尾页不改变游标；非法分片、流、页大小及未来游标被拒绝。
+- AC112：已提交未发布的图事件不可订阅；发布后可重复读取相同位置；图对象包含可读的分层邻接表；重建产生明确 reset 事件。
+- AC113：日志清理后的旧游标返回 reset_required 与 checkpoint，不静默跳过；Worker 下线不影响已有日志读取。
+- AC114：HTTP 鉴权、RPC Gateway 角色限制、Go/Python SDK、vectorctl 断点及大于 2^53 的整数序号不丢精度。
+
+模块 UT：subscription_test.go、patch_links_test.go、subscription_handler_test.go，以及 RPC/CLI/Python SDK 测试。端到端：`.venv/bin/python scripts/verify_subscriptions.py`，依赖已构建的 .tools/vector-server/vectorctl、本地 PD/TiKV/SeaweedFS 和 Python gRPC/boto3。报告为 reports/subscriptions.json。

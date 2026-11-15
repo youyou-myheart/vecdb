@@ -90,3 +90,8 @@ class Client:
 
     def prune(self, *, timeout=None):
         return self._call(self.stub.Prune, messages.Empty(), timeout)
+
+    def changes(self, partition, *, stream='data', after=0, limit=100, timeout=None):
+        """One bounded page. Persist next after processing; handle reset_required explicitly."""
+        return self._call(self.stub.ReadChanges, messages.ChangeRequest(
+            partition=partition, stream=stream, after=after, limit=limit), timeout)

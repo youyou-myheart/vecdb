@@ -216,3 +216,27 @@ func (s *Server) Prune(ctx context.Context, _ *pb.Empty) (*pb.PruneResponse, err
 	out := &pb.PruneResponse{}
 	return out, convert(state, out)
 }
+
+func (s *Server) ReadChanges(ctx context.Context, r *pb.ChangeRequest) (*pb.ChangePage, error) {
+	reader, ok := s.backend.(interface {
+		ReadChanges(context.Context, vector.ChangeRequest) (vector.ChangePage, error)
+	})
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "change stream unavailable")
+	}
+	if r.Limit > 256 {
+		return nil, status.Error(codes.InvalidArgument, "limit must be 0..256")
+	}
+	page, e := reader.ReadChanges(ctx, vector.ChangeRequest{Partition: vector.IndexPartitionID(r.Partition), Stream: r.Stream, After: r.After, Limit: int(r.Limit)})
+	if errors.Is(e, vector.ErrInvalidSubscription) {
+		return nil, status.Error(codes.InvalidArgument, e.Error())
+	}
+	if errors.Is(e, vector.ErrSubscriptionUnavailable) {
+		return nil, status.Error(codes.Unimplemented, e.Error())
+	}
+	if e != nil {
+		return nil, rpcError(e)
+	}
+	out := &pb.ChangePage{}
+	return out, convert(page, out)
+}

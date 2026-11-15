@@ -34,6 +34,11 @@ class VectorStoreStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.ReadChanges = channel.unary_unary(
+                '/vectorstore.v1.VectorStore/ReadChanges',
+                request_serializer=vectorstore_dot_v1_dot_vector__pb2.ChangeRequest.SerializeToString,
+                response_deserializer=vectorstore_dot_v1_dot_vector__pb2.ChangePage.FromString,
+                _registered_method=True)
         self.Put = channel.unary_unary(
                 '/vectorstore.v1.VectorStore/Put',
                 request_serializer=vectorstore_dot_v1_dot_vector__pb2.PutRequest.SerializeToString,
@@ -93,6 +98,12 @@ class VectorStoreStub(object):
 
 class VectorStoreServicer(object):
     """Missing associated documentation comment in .proto file."""
+
+    def ReadChanges(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def Put(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -163,6 +174,11 @@ class VectorStoreServicer(object):
 
 def add_VectorStoreServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'ReadChanges': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReadChanges,
+                    request_deserializer=vectorstore_dot_v1_dot_vector__pb2.ChangeRequest.FromString,
+                    response_serializer=vectorstore_dot_v1_dot_vector__pb2.ChangePage.SerializeToString,
+            ),
             'Put': grpc.unary_unary_rpc_method_handler(
                     servicer.Put,
                     request_deserializer=vectorstore_dot_v1_dot_vector__pb2.PutRequest.FromString,
@@ -228,6 +244,33 @@ def add_VectorStoreServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class VectorStore(object):
     """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def ReadChanges(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vectorstore.v1.VectorStore/ReadChanges',
+            vectorstore_dot_v1_dot_vector__pb2.ChangeRequest.SerializeToString,
+            vectorstore_dot_v1_dot_vector__pb2.ChangePage.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def Put(request,

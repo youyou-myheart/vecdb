@@ -8,7 +8,7 @@
 
 已经实现：单 namespace / 固定多分区的 HTTP 服务，支持单进程及 Master/Gateway/Worker 多进程模式，新增、条件更新、逻辑删除、按 ID 读取、属性倒排等值过滤、HNSW 与精确 squared-L2 Top-K、可见性 token、快照发布、启动恢复、幂等重放。
 
-尚未实现：向量聚类分区、多租户身份映射、按负载调度、在线分区迁移、MVCC GC 协调、生产 TLS 与配额。这是进入向量存储开发的基线，不能直接当作商用完成版。
+尚未完成：向量聚类分区、多租户身份映射、完整生命周期 GC、生产环境 TLS 部署与配额。按负载调度、在线副本迁移、RPC TLS 配置和异步图复制见后续章节。这是进入向量存储开发的基线，不能直接当作商用完成版。
 
 ## 2. 当前实现架构
 
@@ -131,7 +131,7 @@ sequenceDiagram
 | POST /v1/checkpoint | 生成 SeaweedFS 快照并发布 TiKV 清单 |
 | GET /healthz | 进程已完成初始化；不是持续依赖健康探针 |
 
-不存在记录返回 404；参数错误 400；幂等或条件版本冲突 409；后端或提交未确认 503。错误响应包含说明。当前未实现分页与批量 API。
+不存在记录返回 404；参数错误 400；幂等或条件版本冲突 409；后端或提交未确认 503。错误响应包含说明。记录分页已实现；批量写入 API 尚未实现。
 
 ## 8. 商用演进方案
 
@@ -317,3 +317,9 @@ flowchart LR
 `/v1/cluster`、vectorctl cluster status 和 gRPC GetCluster 增加 index_replication、graph_heads、graph_positions。graph_heads 展示 committed/visible/term/checkpoint；graph_positions 是各副本通过心跳上报的已应用位置，可能比真实进度稍旧。
 
 第一版保留全部图日志及对象，尚未实现图日志 GC 和孤儿对象回收。原始数据日志仍支持已有的 checkpoint/prune。跨分片查询不是全局时间点快照。二进制图格式固定为 hnswlib 0.8.0 的 64 位小端格式，不承诺跨版本/架构导入。测试中的跨 host 标签在一台机器上模拟，不代表已完成真实多机器或 TiKV/SeaweedFS 自身高可用验收。
+
+## 对外订阅边界
+
+`subscription.go` 提供按绑定分区读取 data/graph 流的只读接口，`subscription_handler.go` 与 RPC ReadChanges 负责协议适配。Gateway 直接读取持久化日志，订阅不依赖 Worker 当前在线或当前 Leader 所在机器。图流读取开始时固定 visible 上界；对象引用经过日志 hash 校验，载荷由消费者从 S3 读取并验证校验和。原生图变更额外导出 links 投影，不触发距离计算，不改变副本应用路径。
+
+当前交付是无服务端消费状态的分页拉取订阅；持久化消费 ACK、保留租约、图日志 GC 和孤儿对象回收仍待完成。详细字段、reset 和断点语义见 RPC.md。

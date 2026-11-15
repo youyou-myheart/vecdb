@@ -169,3 +169,12 @@ INDEX_REPLICATION=graph .tools/vectorctl --socket .state/graph-control.sock clus
 多机器部署额外设置 `REPLICA_FAILURE_DOMAIN=host`，每台物理机器配置唯一且稳定的 `HOST_ID`；同机多个 Worker 使用相同 HOST_ID。全部角色必须使用相同的 failure-domain 策略。独立构图与图复制不能混用已有 namespace。
 
 状态字段 `graph_heads[index].visible` 是该分区最新已发布位置，`graph_positions[replica]` 是副本已应用位置。两个副本进度不同是允许的；Follower 落后不阻塞 Leader 发布。普通查询允许陈旧结果，需要确认某次写入可见时使用原有 MinVisible token。
+
+## 订阅数据和图变更
+
+```bash
+.tools/vectorctl changes --partition index-0000 --stream data --after 0 --limit 100
+.tools/vectorctl changes --partition index-0000 --stream graph --after 0 --limit 10
+```
+
+每次命令读取一页，消费成功后使用 next 继续读取。空页不代表订阅结束，可以稍后从相同 next 轮询。data 流遇到 reset_required 必须恢复基线；graph 流返回带校验信息的 S3 对象引用，消费规则见 [RPC.md](RPC.md#按分片订阅变更)。

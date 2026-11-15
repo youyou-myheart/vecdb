@@ -27,6 +27,7 @@ Credentials: API_TOKEN environment variable. cluster start also requires CLUSTER
 Endpoint: VECTOR_ENDPOINT or http://127.0.0.1:18202.
 Output: JSON on stdout; errors on stderr and nonzero exit. Global options precede COMMAND.
 
+  changes --partition index-0000 --stream data|graph [--after 0 --limit 100]
   cluster status|nodes|partitions|leader|layout|health
   cluster tasks [--limit 50 --after CURSOR] | task ID | explain PARTITION | balance --dry-run
   cluster checkpoint|rebuild|prune
@@ -106,6 +107,20 @@ func run(args []string, stdout, stderr io.Writer) error {
 	var body any
 	field := ""
 	switch args[0] {
+	case "changes":
+		f := flags("changes", stderr)
+		part := f.String("partition", "", "index partition")
+		stream := f.String("stream", "data", "data or graph")
+		after := f.Uint64("after", 0, "exclusive sequence cursor")
+		limit := f.Int("limit", 100, "page size 1..256")
+		if e := f.Parse(args[1:]); e != nil {
+			return e
+		}
+		if f.NArg() != 0 || *part == "" || (*stream != "data" && *stream != "graph") || *limit < 1 || *limit > 256 {
+			return errors.New("invalid changes arguments")
+		}
+		method, path = "POST", "/v1/changes"
+		body = map[string]any{"partition": *part, "stream": *stream, "after": *after, "limit": *limit}
 	case "cluster":
 		if len(args) < 2 {
 			return errors.New("cluster requires a subcommand")

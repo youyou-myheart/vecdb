@@ -2,6 +2,7 @@ package vector
 
 import (
 	"errors"
+	"example.com/vector-storage/internal/ann"
 	"maps"
 	"slices"
 	"sort"
@@ -12,6 +13,7 @@ var ErrGraphCorrupt = errors.New("graph replica requires recovery")
 // GraphDelta is a reversible, versioned materialized mutation, not an insertion
 // command. Followers never call addPoint or evaluate distances while replaying.
 type GraphDelta struct {
+	Links      []ann.NodeLinks        `json:"links,omitempty"`
 	Format     string                 `json:"format"`
 	Dimension  int                    `json:"dimension"`
 	Config     IndexConfig            `json:"config"`
@@ -78,7 +80,8 @@ func (i *HNSWIndex) GenerateDelta(batch []Record) (GraphDelta, error) {
 	i.changeRecordsLocked(d.Records, true)
 	i.next = d.BeforeNext
 	i.epoch = epoch
-	return d, nil
+	d.Links, err = ann.PatchLinks(native)
+	return d, err
 }
 func (i *HNSWIndex) changeRecordsLocked(changes []RecordChange, reverse bool) {
 	for _, change := range changes {

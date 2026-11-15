@@ -134,3 +134,38 @@ PYTHONPATH=sdk/python .venv/bin/python -m unittest discover -s sdk/python/tests 
 真实验收使用 2 Master + 2 Worker + 1 Gateway、真实 TiKV/SeaweedFS，Python 写入后 Go 读取和更新，再由 Python 验证；包含认证、幂等/CAS、分页、过滤、可见性、快照/清理/重建和删除，结果在 reports/rpc-http.json。已加入统一验收入口。
 
 目前是同步 unary RPC，无流式批量导入、异步 Python 客户端、自动服务发现、自动负载均衡或 SDK 发布流程。vectorctl 的业务命令仍走 HTTP；本机扩缩容仍走控制 socket，两者均保留兼容。
+
+## 按分片订阅变更
+
+新增 `ReadChanges(ChangeRequest) -> ChangePage`；HTTP 等价接口是 `POST /v1/changes`。这是有界分页拉取接口，适合消费者自行轮询和保存断点，不是长连接推送。
+
+请求字段：`partition`（如 index-0000）、`stream`（data 或 graph）、`after`（不包含该序号，初始为 0）、`limit`（默认 100，最大 256）。一个游标只属于一个 namespace、分片、流；不同分片不能共用游标，也不存在全局顺序。消费一页并持久化处理结果后，再持久化响应 `next`。重试可能重复返回事件，消费者应按分片/流/sequence 幂等处理。
+
+- data：返回包含完整 Record 的顺序事件，包括更新和墓碑；它表达 TiKV 已持久化，不代表已可检索。
+- graph：只在 INDEX_REPLICATION=graph 时提供；只返回已发布条目，不返回 committed-but-unpublished。条目含 previous、position、term、kind 和 object manifest。消费者通过已有 SeaweedFS S3 端点读取 object.key，核验 size/SHA256，再处理内容。RPC 不转发大对象，也不下发 S3 凭据。
+- delta 对象中的 records 是记录前后版本，nodes 将 label 映射到 record ID/revision，新增 links 提供被修改节点的完整分层邻接表：internal_id、label、layers。先安装本批所有节点映射，再替换邻接表。邻居使用内部节点 ID，旧记录版本可能仍留在图中，须根据 records 的当前 revision/deleted 过滤。
+- links 是 HNSW 图边，**不是每个向量的精确 Top-K 最近邻表**。本次版本之前的图日志对象可能没有 links 字段；不能把缺失字段当成空邻接表。
+- kind=reset 表示 Leader 重建后的完整 IndexSnapshot，消费者必须加载并替换整个图及映射，再应用后续 delta；不能跨 reset 复用旧内部节点编号。
+- 若 data 游标已经低于清理水位，响应 `reset_required=true`、floor、checkpoint（若有），events 为空、next 保持原值。消费者必须从经校验的 checkpoint 恢复记录基线，再从快照 Offset 续读。没有可用快照时应停止并请求基线，不能直接把 after 改成 floor。分页 List 不提供一致性快照，不能作为无损补齐基线。
+- 当前订阅不注册保留租约，不会阻止既有 prune。图日志尚未 GC；消费者 ACK、保留策略和对象回收仍待开发。Worker 全部离线时，只要 Gateway、TiKV 与所需对象存储可用，已有日志仍可订阅。
+
+Python：
+
+```python
+page = client.changes('index-0000', stream='data', after=saved_offset, limit=100)
+if page.reset_required:
+    raise RuntimeError('需要先从 checkpoint 恢复')
+for event in page.data:
+    apply_idempotently(event.sequence, event.record)
+save_offset(page.next)
+```
+
+Go（已有 Client 内嵌生成的 RPC client）：
+
+```go
+page, err := client.ReadChanges(ctx, &vectorv1.ChangeRequest{
+    Partition: "index-0000", Stream: "graph", After: savedOffset, Limit: 100,
+})
+```
+
+需使用与现有 RPC 相同的 API_TOKEN 和 Gateway 角色。无效参数返回 InvalidArgument/HTTP 400；未启用图日志返回 Unimplemented/HTTP 501。`reset_required` 是正常协议状态，应显式处理。

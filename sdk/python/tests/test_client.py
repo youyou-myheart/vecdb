@@ -31,3 +31,12 @@ class ClientTests(unittest.TestCase):
             Client('localhost:1','',timeout=1)
         with self.assertRaises(ValueError):
             Client('localhost:1','token',root_certificates=b'cert')
+
+    def test_changes_cursor_and_auth(self):
+        with Client('localhost:1','secret',timeout=4) as client:
+            client.stub = Mock()
+            client.changes('index-0000', stream='graph', after=9007199254740993, limit=7)
+            call = client.stub.ReadChanges.call_args
+            self.assertEqual(call.args[0].after, 9007199254740993)
+            self.assertEqual(call.args[0].stream, 'graph')
+            self.assertEqual(call.kwargs['metadata'], (('authorization','Bearer secret'),))

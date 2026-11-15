@@ -173,3 +173,35 @@ func TestSDKWithTLS(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func (*backend) ReadChanges(_ context.Context, q vector.ChangeRequest) (vector.ChangePage, error) {
+	if q.Stream != "data" && q.Stream != "graph" {
+		return vector.ChangePage{}, vector.ErrInvalidSubscription
+	}
+	return vector.ChangePage{Partition: q.Partition, Stream: q.Stream, Next: 9007199254740993, Head: 9007199254740993, Data: []vector.LogEvent{{Sequence: 9007199254740993, Record: vector.Record{ID: "a", Revision: 3, Deleted: true}}}}, nil
+}
+func TestChangesGRPC(t *testing.T) {
+	c, e := sdk.Dial(context.Background(), serve(t, true), "rpc-unit-token-12345", sdk.Options{})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer c.Close()
+	page, e := c.ReadChanges(context.Background(), &pb.ChangeRequest{Partition: "index-0000", Stream: "data", After: 9007199254740992, Limit: 1})
+	if e != nil || page.Next != 9007199254740993 || len(page.Data) != 1 || !page.Data[0].Record.Deleted {
+		t.Fatal(page, e)
+	}
+	if _, e = c.ReadChanges(context.Background(), &pb.ChangeRequest{Stream: "bad"}); status.Code(e) != codes.InvalidArgument {
+		t.Fatal(e)
+	}
+	if _, e = c.ReadChanges(context.Background(), &pb.ChangeRequest{Stream: "data", Limit: 257}); status.Code(e) != codes.InvalidArgument {
+		t.Fatal(e)
+	}
+	worker, e := sdk.Dial(context.Background(), serve(t, false), "rpc-unit-token-12345", sdk.Options{})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer worker.Close()
+	if _, e = worker.ReadChanges(context.Background(), &pb.ChangeRequest{Stream: "data"}); status.Code(e) != codes.PermissionDenied {
+		t.Fatal(e)
+	}
+}

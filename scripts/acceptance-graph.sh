@@ -10,4 +10,5 @@ ONEBOX_ACCEPTANCE=1 bash scripts/go.sh test -count=1 -race -timeout=10m -run '^T
 bash scripts/go.sh build -o .tools/vector-server ./cmd/vector-server > reports/graph-build.log 2>&1
 bash scripts/go.sh build -o .tools/vectorctl ./cmd/vectorctl >> reports/graph-build.log 2>&1
 python3 scripts/verify_graph_replication.py > reports/graph-processes.log 2>&1
+.venv/bin/python scripts/verify_subscriptions.py > reports/subscriptions.log 2>&1
 printf 'passed\n' > reports/graph-acceptance.status

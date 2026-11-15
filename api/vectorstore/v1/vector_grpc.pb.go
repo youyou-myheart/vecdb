@@ -19,23 +19,25 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	VectorStore_Put_FullMethodName        = "/vectorstore.v1.VectorStore/Put"
-	VectorStore_Get_FullMethodName        = "/vectorstore.v1.VectorStore/Get"
-	VectorStore_Delete_FullMethodName     = "/vectorstore.v1.VectorStore/Delete"
-	VectorStore_List_FullMethodName       = "/vectorstore.v1.VectorStore/List"
-	VectorStore_Search_FullMethodName     = "/vectorstore.v1.VectorStore/Search"
-	VectorStore_Health_FullMethodName     = "/vectorstore.v1.VectorStore/Health"
-	VectorStore_GetCluster_FullMethodName = "/vectorstore.v1.VectorStore/GetCluster"
-	VectorStore_GetLayout_FullMethodName  = "/vectorstore.v1.VectorStore/GetLayout"
-	VectorStore_Checkpoint_FullMethodName = "/vectorstore.v1.VectorStore/Checkpoint"
-	VectorStore_Rebuild_FullMethodName    = "/vectorstore.v1.VectorStore/Rebuild"
-	VectorStore_Prune_FullMethodName      = "/vectorstore.v1.VectorStore/Prune"
+	VectorStore_ReadChanges_FullMethodName = "/vectorstore.v1.VectorStore/ReadChanges"
+	VectorStore_Put_FullMethodName         = "/vectorstore.v1.VectorStore/Put"
+	VectorStore_Get_FullMethodName         = "/vectorstore.v1.VectorStore/Get"
+	VectorStore_Delete_FullMethodName      = "/vectorstore.v1.VectorStore/Delete"
+	VectorStore_List_FullMethodName        = "/vectorstore.v1.VectorStore/List"
+	VectorStore_Search_FullMethodName      = "/vectorstore.v1.VectorStore/Search"
+	VectorStore_Health_FullMethodName      = "/vectorstore.v1.VectorStore/Health"
+	VectorStore_GetCluster_FullMethodName  = "/vectorstore.v1.VectorStore/GetCluster"
+	VectorStore_GetLayout_FullMethodName   = "/vectorstore.v1.VectorStore/GetLayout"
+	VectorStore_Checkpoint_FullMethodName  = "/vectorstore.v1.VectorStore/Checkpoint"
+	VectorStore_Rebuild_FullMethodName     = "/vectorstore.v1.VectorStore/Rebuild"
+	VectorStore_Prune_FullMethodName       = "/vectorstore.v1.VectorStore/Prune"
 )
 
 // VectorStoreClient is the client API for VectorStore service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type VectorStoreClient interface {
+	ReadChanges(ctx context.Context, in *ChangeRequest, opts ...grpc.CallOption) (*ChangePage, error)
 	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*MutationResponse, error)
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*Record, error)
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*MutationResponse, error)
@@ -55,6 +57,15 @@ type vectorStoreClient struct {
 
 func NewVectorStoreClient(cc grpc.ClientConnInterface) VectorStoreClient {
 	return &vectorStoreClient{cc}
+}
+
+func (c *vectorStoreClient) ReadChanges(ctx context.Context, in *ChangeRequest, opts ...grpc.CallOption) (*ChangePage, error) {
+	out := new(ChangePage)
+	err := c.cc.Invoke(ctx, VectorStore_ReadChanges_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *vectorStoreClient) Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*MutationResponse, error) {
@@ -160,6 +171,7 @@ func (c *vectorStoreClient) Prune(ctx context.Context, in *Empty, opts ...grpc.C
 // All implementations must embed UnimplementedVectorStoreServer
 // for forward compatibility
 type VectorStoreServer interface {
+	ReadChanges(context.Context, *ChangeRequest) (*ChangePage, error)
 	Put(context.Context, *PutRequest) (*MutationResponse, error)
 	Get(context.Context, *GetRequest) (*Record, error)
 	Delete(context.Context, *DeleteRequest) (*MutationResponse, error)
@@ -178,6 +190,9 @@ type VectorStoreServer interface {
 type UnimplementedVectorStoreServer struct {
 }
 
+func (UnimplementedVectorStoreServer) ReadChanges(context.Context, *ChangeRequest) (*ChangePage, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ReadChanges not implemented")
+}
 func (UnimplementedVectorStoreServer) Put(context.Context, *PutRequest) (*MutationResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Put not implemented")
 }
@@ -222,6 +237,24 @@ type UnsafeVectorStoreServer interface {
 
 func RegisterVectorStoreServer(s grpc.ServiceRegistrar, srv VectorStoreServer) {
 	s.RegisterService(&VectorStore_ServiceDesc, srv)
+}
+
+func _VectorStore_ReadChanges_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ChangeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VectorStoreServer).ReadChanges(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VectorStore_ReadChanges_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VectorStoreServer).ReadChanges(ctx, req.(*ChangeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _VectorStore_Put_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -429,6 +462,10 @@ var VectorStore_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "vectorstore.v1.VectorStore",
 	HandlerType: (*VectorStoreServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "ReadChanges",
+			Handler:    _VectorStore_ReadChanges_Handler,
+		},
 		{
 			MethodName: "Put",
 			Handler:    _VectorStore_Put_Handler,

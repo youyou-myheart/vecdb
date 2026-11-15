@@ -175,3 +175,32 @@ func TestMigrationCommands(t *testing.T) {
 		}
 	}
 }
+
+func TestChangeCursorCommand(t *testing.T) {
+	t.Setenv("API_TOKEN", "test-token")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" || r.URL.Path != "/v1/changes" || r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Error(r.Method, r.URL)
+		}
+		var body struct {
+			After     uint64 `json:"after"`
+			Partition string `json:"partition"`
+			Stream    string `json:"stream"`
+		}
+		if e := json.NewDecoder(r.Body).Decode(&body); e != nil {
+			t.Error(e)
+		}
+		if body.After != 9007199254740993 || body.Partition != "index-0000" || body.Stream != "graph" {
+			t.Error(body)
+		}
+		_, _ = w.Write([]byte(`{"next":9007199254740993,"head":9007199254740993}`))
+	}))
+	defer server.Close()
+	var out bytes.Buffer
+	if e := run([]string{"--endpoint", server.URL, "changes", "--partition", "index-0000", "--stream", "graph", "--after", "9007199254740993"}, &out, &out); e != nil {
+		t.Fatal(e)
+	}
+	if !strings.Contains(out.String(), "9007199254740993") {
+		t.Fatal(out.String())
+	}
+}

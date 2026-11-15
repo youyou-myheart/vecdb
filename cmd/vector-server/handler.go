@@ -43,6 +43,7 @@ func decode(w http.ResponseWriter, r *http.Request, v any) error {
 func newHandler(repo recordAPI, service searchAPI, dim int, token, namespace string) http.Handler {
 	mux := http.NewServeMux()
 	registerMigrationHandlers(mux, service)
+	registerSubscriptionHandler(mux, service)
 	mux.HandleFunc("/v1/drain", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			w.WriteHeader(405)

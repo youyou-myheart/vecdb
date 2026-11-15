@@ -24,6 +24,7 @@ python3 scripts/verify_balance.py > reports/balance-http.log 2>&1
 python3 scripts/verify_cli.py > reports/cli-http.log 2>&1
 PYTHONPATH=sdk/python .venv/bin/python -m unittest discover -s sdk/python/tests -v > reports/python-sdk-unit.log 2>&1
 .venv/bin/python scripts/verify_rpc.py > reports/rpc-http.log 2>&1
+.venv/bin/python scripts/verify_subscriptions.py > reports/subscriptions.log 2>&1
 .venv/bin/python scripts/verify_hnsw_crash.py > reports/hnsw-crash.log 2>&1
 .venv/bin/python -m unittest -v test_storage.py > reports/python-unit.log 2>&1
 .venv/bin/python verify.py > reports/acceptance-s3.log
