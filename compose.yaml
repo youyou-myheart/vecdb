@@ -1,0 +1,12 @@
+name: vector-storage-poc
+services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.53
+    command: server -dir=/data -ip=seaweedfs -volume.max=8 -master.volumeSizeLimitMB=128 -master.telemetry=false -s3 -s3.config=/etc/seaweedfs/s3.json
+    ports:
+      - "127.0.0.1:18333:8333"
+    volumes:
+      - seaweed-data:/data
+      - ./s3.json:/etc/seaweedfs/s3.json:ro
+volumes:
+  seaweed-data:

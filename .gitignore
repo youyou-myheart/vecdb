@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+.state/
+reports/
+.tools/
+.DS_Store
+*.py[cod]
+*.egg-info/
+sdk/python/build/
+sdk/python/dist/
+.env
+.env.*

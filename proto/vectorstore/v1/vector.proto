@@ -1,0 +1,46 @@
+syntax = "proto3";
+package vectorstore.v1;
+option go_package = "example.com/vector-storage/api/vectorstore/v1;vectorv1";
+
+service VectorStore {
+  rpc Put(PutRequest) returns (MutationResponse);
+  rpc Get(GetRequest) returns (Record);
+  rpc Delete(DeleteRequest) returns (MutationResponse);
+  rpc List(ListRequest) returns (ListResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc Health(Empty) returns (HealthResponse);
+  rpc GetCluster(Empty) returns (ClusterStatus);
+  rpc GetLayout(Empty) returns (Layout);
+  rpc Checkpoint(Empty) returns (Manifest);
+  rpc Rebuild(Empty) returns (Manifest);
+  rpc Prune(Empty) returns (PruneResponse);
+}
+message Empty {}
+message Record { string id=1; uint64 revision=2; repeated double vector=3; map<string,string> payload=4; bool deleted=5; }
+message Token { string id=1; uint64 revision=2; }
+message PutRequest { string id=1; string request_id=2; repeated double vector=3; map<string,string> payload=4; optional uint64 expected_revision=5; }
+message DeleteRequest { string id=1; string request_id=2; optional uint64 expected_revision=3; }
+message MutationResponse { bool durable=1; Token token=2; }
+message GetRequest { string id=1; }
+message ListRequest { uint32 limit=1; string cursor=2; bool include_deleted=3; }
+message ListResponse { repeated Record records=1; string next_cursor=2; }
+message SearchRequest { repeated double vector=1; uint32 k=2; map<string,string> filter=3; bool exact=4; uint32 ef_search=5; Token min_visible=6; }
+message Hit { string id=1; uint64 revision=2; double distance=3; map<string,string> payload=4; }
+message SearchResponse { repeated Hit hits=1; bool partial=2; }
+message HealthResponse { string status=1; string namespace=2; }
+message Node { string id=1; string session=2; string url=3; repeated string roles=4; int64 expires_ms=5; bool draining=6; double capacity=7; map<string,ShardLoad> load=8; uint64 memory_budget_bytes=9; string host_id=10; string zone=11; }
+message Owner { string partition=1; string node=2; string session=3; string url=4; uint64 epoch=5; int64 expires_ms=6; bool ready=7; uint64 offset=8; string phase=9; string last_error=10; }
+message Assignment { string partition=1; string node=2; string session=3; string url=4; uint64 leader_epoch=5; }
+message ClusterStatus { Owner leader=1; bool master_available=2; map<string,Assignment> assignments=3; repeated string local_partitions=4; Node node=5; repeated Node nodes=6; map<string,Owner> owners=7; bool ready=8; map<string,ReplicaPlan> replica_plans=9; map<string,ReplicaOwners> replica_owners=10; uint32 replicas=11; bool fully_replicated=12; string failure_domain=13; map<string,int64> routing_cooldown_until_ms=14; map<string,uint64> log_heads=15; map<string,uint64> replica_lag=16; string index_replication=17; map<string,GraphHead> graph_heads=18; map<string,GraphPosition> graph_positions=19; }
+message Binding { uint32 data_partition=1; string index_partition=2; }
+message Layout { uint32 version=1; uint64 epoch=2; string hash=3; uint32 data_partitions=4; repeated Binding bindings=5; }
+message Manifest { map<string,Manifest> partitions=1; uint32 log_version=2; uint64 offset=3; string format=4; string generation=5; string key=6; string sha256=7; int64 size=8; uint32 dimension=9; }
+message PruneResponse { map<string,uint64> partitions=1; optional uint64 retained_after=2; }
+
+message ReplicaPlan { repeated Assignment desired=1; repeated Assignment serving=2; uint64 barrier=3; string publisher=4; uint64 version=5; string task_id=6; }
+message ReplicaOwners { repeated Owner owners=1; }
+
+message ShardLoad { uint64 estimated_bytes=1; double busy=2; }
+
+message GraphPosition { uint64 sequence=1; uint64 data_offset=2; string hash=3; }
+message GraphHead { uint64 term=1; Owner leader=2; GraphPosition committed=3; GraphPosition visible=4; Manifest checkpoint=5; GraphPosition checkpoint_position=6; }

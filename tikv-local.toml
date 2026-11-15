@@ -1,0 +1,8 @@
+# Local development only. Keep disk protection enabled within a small capacity budget.
+memory-usage-limit = "2GiB"
+[storage]
+reserve-space = "512MiB"
+[storage.block-cache]
+capacity = "256MiB"
+[raftstore]
+capacity = "4GiB"
