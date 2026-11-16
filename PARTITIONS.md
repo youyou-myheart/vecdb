@@ -1,27 +1,16 @@
 # 两层分区第一版：Hash 数据分区 + 一一对应的索引分区
 
-本版把数据分区和索引分区建模为两个独立概念，暂时采用一一对应的索引放置策略。单进程模式仍支持全部分区同进程运行；新增多进程 Master/Gateway/Worker 模式见 [CLUSTER.md](CLUSTER.md)。尚未加入向量聚类、负载调度或在线迁移协议。
+本版把数据分区和索引分区建模为两个独立概念，暂时采用一一对应的索引放置策略。单进程模式仍支持全部分区同进程运行；新增多进程 Master/Gateway/Worker 模式见 [CLUSTER.md](CLUSTER.md)。向量聚类尚未实现；负载调度和在线索引副本迁移已经实现，见 [BALANCING.md](BALANCING.md) 和 [REPLICAS.md](REPLICAS.md)。当前架构、简化分区图与保留 DataPartition 的设计决策见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 路由与数据流
 
 ```mermaid
-flowchart TB
-    W[按 ID 写入、读取、删除] --> HASH[SHA256：取前 8 字节大端整数，对数据分区数取模]
-    HASH --> D0[数据分区 0：记录、log、head、floor]
-    HASH --> D1[数据分区 1：记录、log、head、floor]
-    D0 --> MAP[TiKV 持久化的分区映射：layout epoch 1]
-    D1 --> MAP
-    MAP --> I0[索引分区 index-0000：独立 HNSW、属性倒排、消费位点]
-    MAP --> I1[索引分区 index-0001：独立 HNSW、属性倒排、消费位点]
-    I0 --> S0[独立 manifest 与 SeaweedFS 图快照]
-    I1 --> S1[独立 manifest 与 SeaweedFS 图快照]
-    Q[向量查询] --> QR[索引查询路由：当前选择全部索引分区]
-    QR --> I0
-    QR --> I1
-    I0 --> MERGE[合并局部 Top-K，按距离和 ID 排序]
-    I1 --> MERGE
-    MERGE --> RESULT[全局 Top-K；任一分区失败则整体报错]
+flowchart LR
+    D0["DataPartition 0：记录与数据日志"] -->|一一映射| I0["IndexPartition 0：逻辑 HNSW"]
+    D1["DataPartition 1：记录与数据日志"] -->|一一映射| I1["IndexPartition 1：逻辑 HNSW"]
 ```
+
+此图仅表达逻辑映射。数据分区存入 TiKV，没有应用层主备；索引副本部署与主备传递单独见 [架构说明](ARCHITECTURE.md)。向量查询当前访问全部索引分区，再合并局部 Top-K。
 
 第一层通过记录 ID 的原始 UTF-8 字节做稳定 hash，与向量和属性无关。第二层读取 layout 中的映射，不再次计算 hash。目前数据分区 0 对应 index-0000，数据分区 1 对应 index-0001，依此类推；两类 ID 使用不同类型。
 
@@ -66,7 +55,7 @@ flowchart TB
 - `POST /v1/log/prune`：多分区返回 `partitions: {index-0000: floor, ...}`，不同分区的 offset 不能相互比较。
 - `POST /v1/rebuild`：各索引重建后发布各自快照。
 
-Checkpoint、清理和重建均按分区独立生效。中途失败会报错，但已完成分区不会回滚；重试即可继续。服务启动逐一恢复各索引，全部恢复成功后才监听 HTTP。
+Checkpoint、清理和重建均按分区独立生效。中途失败会报错，但已完成分区不会回滚；重试即可继续。单进程非集群模式启动时恢复全部索引后才监听 HTTP；集群模式由 Worker 按分配异步加载并上报 Ready，Gateway 只向可服务副本路由。
 
 ## 配置与兼容
 

@@ -1,5 +1,7 @@
 # TiKV + SeaweedFS 向量存储详细设计
 
+当前架构入口见 [ARCHITECTURE.md](ARCHITECTURE.md)，覆盖异步图复制及消费保留模式。本文前半部分记录初始基线，后续章节记录增量演进；配置、协议与能力边界应结合对应模式阅读。
+
 状态：v0.5 已实现主备 Master、Gateway/Worker 多进程与故障接管，以及两层分区（一一映射），以及增量日志、位点绑定快照、安全分批清理、并发查询及重建追赶。日期：2026-11-12。查询算法见 [HNSW.md](HNSW.md)，当前日志和并发协议见 [INCREMENTAL.md](INCREMENTAL.md)，两层分区及全局查询协议见 [PARTITIONS.md](PARTITIONS.md)，多进程角色与选主见 [CLUSTER.md](CLUSTER.md)。
 
 ## 1. 本轮结论与边界
@@ -10,7 +12,7 @@
 
 尚未完成：向量聚类分区、多租户身份映射、完整生命周期 GC、生产环境 TLS 部署与配额。按负载调度、在线副本迁移、RPC TLS 配置和异步图复制见后续章节。这是进入向量存储开发的基线，不能直接当作商用完成版。
 
-## 2. 当前实现架构
+## 2. 初始单服务基线架构
 
 ```mermaid
 flowchart TB

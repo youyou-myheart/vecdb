@@ -2,6 +2,8 @@
 
 已实现可运行的 Go HTTP 服务：真实 TiKV 事务写入记录/Outbox/幂等凭证，HNSW / 精确向量检索、属性倒排过滤，SeaweedFS 图快照，TiKV 清单 CAS，服务重启恢复。
 
+先阅读 [当前架构与分区设计](ARCHITECTURE.md)：用独立图说明两层分区、Worker 部署与主备复制，并记录保留 DataPartition 的原因和未来聚类索引边界。
+
 详细架构、协议与商用开发阶段见 [DESIGN.md](DESIGN.md)。索引实现和验收数据见 [HNSW.md](HNSW.md)。增量消费、升级步骤和并发优化见 [INCREMENTAL.md](INCREMENTAL.md)。两层分区见 [PARTITIONS.md](PARTITIONS.md)：数据按 ID hash 分区，索引分区暂与数据分区一一对应，支持固定多分区。多进程角色、TiKV 主备选举和故障接管见 [CLUSTER.md](CLUSTER.md)，尚非生产完成版。
 
 本机多 Worker 可用 `python3 scripts/cluster_local.py --namespace demo/multiworker-v1 --workers 2 --partitions 8 --dimension 16` 启动（需先编译并设置 API_TOKEN / CLUSTER_TOKEN），运行中输入 `scale 3`、`status` 或 `quit`。完整步骤和迁移期间的可用性边界见 [CLUSTER.md](CLUSTER.md#一键运行多个-worker-与扩缩容)。

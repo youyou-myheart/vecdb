@@ -4,6 +4,8 @@
 
 新增可选双副本与排空迁移：见 [REPLICAS.md](REPLICAS.md)。本文原有流程描述默认 `REPLICAS=1` 模式。
 
+最新双副本异步图复制的分区、部署和数据传递图见 [ARCHITECTURE.md](ARCHITECTURE.md)。下图是单副本基线，不表示 graph 模式下 Follower 也消费数据日志构图。
+
 ## 架构
 
 ```mermaid
