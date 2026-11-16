@@ -32,6 +32,8 @@ onebox 默认分片数现为 32；负载放置调度使用 `--replicas 2 --sched
 
 聚类 Index Leader 已采用事件消费：入队唤醒、连续处理到队列为空、阻塞等待新通知。各索引分片独立推进，取消该模式下每 500 ms 只处理一批的后台调度。
 
+受限容量探索入口：`.venv/bin/python scripts/capacity_explore.py --series my-run --records 960 --dimension 64 --rate 80`。每次只跑一个档位，包含磁盘/内存/CPU 守卫和本轮数据清理；资源预算及已验证范围见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md)。
+
 ## 启动基础组件
 
 实测 PD/TiKV 8.5.8、SeaweedFS 4.53，macOS ARM64。安装包和 Go 缓存在 `.tools/`，数据在 `.state/`。已有本次安装包时，在三个终端分别启动，已运行的组件不要重复启动：

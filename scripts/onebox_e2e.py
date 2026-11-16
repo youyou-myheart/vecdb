@@ -139,11 +139,12 @@ class Storage:
 
 
 class Oracle:
-    def __init__(self, transport):
+    def __init__(self, transport, capacity=RECORDS, vector_factory=vector_for):
         self.transport = transport
+        self.vector_factory = vector_factory
         self.records = {}
         self.lock = threading.Lock()
-        self.id_locks = [threading.Lock() for _ in range(RECORDS)]
+        self.id_locks = [threading.Lock() for _ in range(capacity)]
         self.receipts = {}
         self.acknowledged = {}
 
@@ -155,7 +156,7 @@ class Oracle:
             revision = previous+1
             deleted = not initial and revision % 11 == 0 if deleted is None else deleted
             request = dict(request_id=f'{id}-r{revision}', expected_revision=previous)
-            vector = [] if deleted else vector_for(n, revision)
+            vector = [] if deleted else self.vector_factory(n, revision)
             payload = {} if deleted else dict(group=str(n%8), revision=str(revision))
             if not deleted: request.update(vector=vector, payload=payload)
             method = 'DELETE' if deleted else 'PUT'
@@ -188,16 +189,18 @@ class Oracle:
 class Onebox:
     def __init__(self, args):
         self.args = args
+        self.dimension = getattr(args, 'dimension', DIMENSION)
+        self.centers = getattr(args, 'centers', CENTERS)
         self.run_id = datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y%m%dT%H%M%S')+'-'+uuid.uuid4().hex[:8]
-        self.logs = ROOT/'reports/onebox-e2e'/self.run_id; self.logs.mkdir(parents=True)
-        self.state_dir = ROOT/'.state/onebox-e2e'/self.run_id
+        self.logs = getattr(args, 'report_root', ROOT/'reports/onebox-e2e')/self.run_id; self.logs.mkdir(parents=True)
+        self.state_dir = getattr(args, 'state_root', ROOT/'.state/onebox-e2e')/self.run_id
         self.control = ROOT/'.state/onebox-e2e.sock'
         if self.control.exists(): raise RuntimeError('onebox control socket already exists; inspect existing cluster first')
         self.measurements = Measurements()
         self.report = dict(status='running', run_id=self.run_id, started_at=datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),
             commit=subprocess.check_output(['git','rev-parse','HEAD'], cwd=ROOT, text=True).strip(),
             dirty=bool(subprocess.check_output(['git','status','--porcelain'],cwd=ROOT)),
-            topology=dict(pd=1,tikv=1,seaweed=1,master=2,gateway=2,worker=3,data_partitions=16,index_partitions=8,replicas=2,dimension=16),
+            topology=dict(pd=1,tikv=1,seaweed=1,master=2,gateway=2,worker=3,data_partitions=16,index_partitions=8,replicas=2,dimension=self.dimension),
             requested_steady_seconds=args.steady_seconds, continuous_fault_rounds=args.rounds,
             latency_only=args.latency_only, cases=[])
         base = args.base_port
@@ -209,19 +212,19 @@ class Onebox:
                     probe.bind(('127.0.0.1', port))
                 except OSError as exc:
                     raise RuntimeError(f'onebox port {port} is already occupied') from exc
-        route = self.logs/'routing.json'; route.write_text(json.dumps(dict(version=1, centers=CENTERS)))
+        route = self.logs/'routing.json'; route.write_text(json.dumps(dict(version=1, centers=self.centers)))
         env = dict(os.environ, API_TOKEN='onebox-api-'+uuid.uuid4().hex, CLUSTER_TOKEN='onebox-peer-'+uuid.uuid4().hex,
             PD_ENDPOINTS=f'127.0.0.1:{base}', S3_ENDPOINT=f'127.0.0.1:{base+13}', S3_BUCKET='onebox-e2e',
             S3_ACCESS_KEY='poc-access', S3_SECRET_KEY='poc-secret-local-only', INDEX_REPLICATION='graph', CONSUMER_RETENTION='1',
             LEASE_TTL='6s', CLUSTER_ROUTING_FILE=str(route))
-        self.c = LocalCluster('onebox-e2e/'+self.run_id, partitions=16, dimension=16, base_port=base+100,
+        self.c = LocalCluster('onebox-e2e/'+self.run_id, partitions=16, dimension=self.dimension, base_port=base+100,
             grpc_port=base+180, replicas=2, scheduler='load', environment=env, directory=self.logs/'services')
         self.storage = Storage(self.state_dir, self.logs, base)
         self.slots = {}
         self.urls = [f'http://127.0.0.1:{base+102}', f'http://127.0.0.1:{base+135}']
         self.request_counter = 0
         self.request_lock = threading.Lock()
-        self.oracle = Oracle(self.request)
+        self.oracle = Oracle(self.request, getattr(args, 'oracle_capacity', RECORDS), getattr(args, 'vector_factory', vector_for))
         self.work_stop = threading.Event(); self.workers = []
         self.failures = []; self.failure_lock = threading.Lock()
         self.watch_stop = threading.Event(); self.watcher = None
@@ -289,7 +292,7 @@ class Onebox:
 
     def state(self):
         s = self.request('/v1/cluster', budget=10)
-        assert s['routing']['centers']==CENTERS and s['routing']['version']==1
+        assert s['routing']['centers']==self.centers and s['routing']['version']==1
         for id,d in s.get('data_progress',{}).items():
             assert d['floor']<=d['completed_lsn']<=d['head'], d
             assert d['completed_lsn']>=self.last_completed.get(id,0), ('completed regressed', id, d)

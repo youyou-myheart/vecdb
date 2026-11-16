@@ -102,11 +102,16 @@ def probe(fixture, baseline, expected, t0, *, name, target_seconds=1, observe_se
                 events.extend(batch); after = page['next']
             return name,end,events
         targets, heads, count = {}, {}, 0
+        mutations = dict(insert=0, update=0, delete=0)
         with ThreadPoolExecutor(max_workers=len(baseline['data_progress'])) as pool:
             for name,head,events in pool.map(source,baseline['data_progress'].items()):
                 heads[name]=head; count+=len(events)
                 add_targets(targets,int(name.split('-')[-1]),events,centers)
-        return dict(sources=targets,heads=heads,events=count,elapsed=time.monotonic()-t0)
+                for event in events:
+                    r=event['record']
+                    kind='delete' if r.get('deleted') else ('insert' if r['revision']==1 else 'update')
+                    mutations[kind]+=1
+        return dict(sources=targets,heads=heads,events=count,mutations=mutations,elapsed=time.monotonic()-t0)
 
     started = time.monotonic(); first_positions = None; final_queries = None; target = None
     path = fixture.logs/(name+'-visibility.jsonl')
