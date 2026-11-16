@@ -145,25 +145,28 @@ class Oracle:
         self.lock = threading.Lock()
         self.id_locks = [threading.Lock() for _ in range(RECORDS)]
         self.receipts = {}
+        self.acknowledged = {}
 
-    def mutate(self, n, *, initial=False):
+    def mutate(self, n, *, initial=False, deleted=None):
         id = f'v-{n:04d}'
         with self.id_locks[n]:
             with self.lock:
                 previous = self.records.get(id, {}).get('revision', 0)
             revision = previous+1
-            deleted = not initial and revision % 11 == 0
+            deleted = not initial and revision % 11 == 0 if deleted is None else deleted
             request = dict(request_id=f'{id}-r{revision}', expected_revision=previous)
             vector = [] if deleted else vector_for(n, revision)
             payload = {} if deleted else dict(group=str(n%8), revision=str(revision))
             if not deleted: request.update(vector=vector, payload=payload)
             method = 'DELETE' if deleted else 'PUT'
             response = self.transport('/v1/records/'+id, method, request, budget=120)
+            acknowledged = time.monotonic()
             assert response['durable'] and response['token']==dict(id=id, revision=revision), response
             record = dict(id=id, revision=revision, vector=vector, payload=payload, deleted=deleted)
             with self.lock:
                 self.records[id] = record
                 self.receipts[id] = (method, request, response['token'])
+                self.acknowledged[id] = dict(revision=revision,request_id=request['request_id'],monotonic=acknowledged)
             actual = self.transport('/v1/records/'+id)
             self.check_record(actual, record)
             if revision % 7 == 0:
@@ -482,6 +485,8 @@ class Onebox:
             save(self.logs/'steady-metrics-after.json',after)
             row['pipeline_stages'] = interval(baseline,after)
             assert row['pipeline_stages'].get('index_queue_wait/success',{}).get('count',0)>0
+            assert row['pipeline_stages'].get('index_consumer_work/success',{}).get('count',0)>0, 'event consumer did not execute'
+            assert not any(h['count'] for key,h in row['pipeline_stages'].items() if key.startswith('worker_sync/')), 'periodic Worker sync still drives clustered indexes'
             summary=self.measurements.summary()['steady_concurrent_read_write']
             assert 'attempt_failure' not in summary, summary.get('attempt_failure')
         if not self.args.latency_only:

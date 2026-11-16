@@ -10,7 +10,11 @@ import (
 func (c *ClusterService) Mutate(ctx context.Context, id string, m Mutation, deleted bool) (_ Record, err error) {
 	partition := c.router.DataForID(id)
 	defer c.observations.pipeline.track("data_mutate", string(sourceID(partition)))(&err)
-	return c.PartitionedService.Mutate(ctx, id, m, deleted)
+	record, err := c.PartitionedService.Mutate(ctx, id, m, deleted)
+	if err == nil {
+		c.signalSource(partition, "write", false)
+	}
+	return record, err
 }
 
 func (c *ClusterService) Sync(ctx context.Context) error {

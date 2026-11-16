@@ -20,6 +20,10 @@ bash scripts/acceptance-onebox-e2e.sh --steady-seconds 1800 --rounds 12 --recove
 
 # 仅常稳 + 时延定位，跳过故障矩阵；仍启动全部 10 个进程并执行完整业务核验。
 bash scripts/acceptance-onebox-e2e.sh --latency-only --steady-seconds 600 --keep-running
+
+# 重复测量：最后一次写 ACK 后，全部副本应用且真实查询正确，必须 <= 1 秒。
+# 不和上面的测试同时运行，它们使用相同默认端口与构建路径。
+bash scripts/acceptance-onebox-freshness.sh --freshness-rounds 20 --load-seconds 5
 ```
 
 默认端口范围由 `--base-port 25400` 决定：PD 25400、TiKV 25402、S3 25413；Gateway HTTP 25502/25535，gRPC 25580/25581。启动前检查全部监听端口，发现占用即失败，不抢占已有进程。旧运行产生的 TIME_WAIT 连接不算存活服务。
@@ -48,6 +52,8 @@ bash scripts/acceptance-onebox-e2e.sh --latency-only --steady-seconds 600 --keep
 
 每次追平还记录约 100 ms 间隔的位点轨迹，区分图提交、发布、副本内存应用、心跳上报和 source completed；常稳阶段保存各进程的 Histogram 差分。指标口径、报告文件和误差说明见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md)。
 
+`onebox_freshness.py` 使用独立计时口径：各写线程退出并完成尾部插入/更新/删除后，以实际最后一次 durable ACK 的单调时间为 t0，线程收尾和探针准备时间仍计入。它读取本轮 data log 来确定每个 Index 的来源 LSN，检查 published 和当前 epoch 的本地 applied，并对每份副本和两个 Gateway 做无 `min_visible` 的普通精确搜索。返回的 ID、revision、属性、距离必须与停写时 oracle 完全一致。每轮均保存 `<case>-visibility.jsonl`、`<case>-visibility.json`、`<case>-targets.json` 和阶段指标差分。初始化批量、常稳停写和故障恢复分别统计；探针本身的采样/查询开销包含在结果中。当前全量探针最多支持 1,000 条存活记录，不能据此宣称百万级容量下同样满足目标。
+
 ## 报告与运维
 
 `reports/onebox-e2e-latest.json` 是最新结果，独立运行目录保留：
@@ -71,7 +77,30 @@ curl -H "Authorization: Bearer $API_TOKEN" "$VECTOR_ENDPOINT/metrics"
 
 这些是单机真实进程与本地持久化故障测试。10 分钟常稳不是 24/72 小时 soak，单 PD/单 TiKV 也不代表跨机器存储多数派或网络分区验收。冷恢复计时包含依赖启动、分片追平和完整结果验证，不等同于首次可读的精确 RTO。
 
-## 2026-11-16 实测
+## 2026-11-16 事件消费复测
+
+运行 `20261116T224624-a0ac0ab9`：真实启动 PD、TiKV、SeaweedFS 和七个向量服务，12 组 case 全部通过，结束后本次启动的全部进程已停止。16 Data / 8 Index / 双副本；768 条结构化 16 维向量；二进制与 [一秒可见性正式验收](PIPELINE_LATENCY.md) 相同。
+
+| 项目 | 结果 |
+|---|---|
+| 常稳 | 600.257 秒，业务请求错误/重试为 0；完整核验通过 |
+| 常稳请求 | GET 记录 14,256、PUT 11,956、DELETE 1,024、搜索 2,831 次，含幂等重放与最终核验 |
+| PUT / 搜索 | P95 为 5.94 / 32.58 ms，P99 为 50.18 / 47.27 ms |
+| 常稳停写追平 | 108 ms 首次观察到图发布、所有副本实际应用与来源完成；982 ms 心跳上报也追平 |
+| Master / 旧 Worker 来源接管 | 4.859 / 7.244 秒；恢复旧进程后完整 oracle 通过 |
+| S3 / TiKV 暂停后追平 | 1.534 / 4.671 秒；原始持久化和不确定写重试均核验通过 |
+| 两 Worker + Master + Gateway 叠加故障 | 恢复进程后 3.679 秒追平 |
+| 全 Worker 丢失 | 512 次更新持久化成功、pending=512；恢复后 10.113 秒追平 |
+| 连续故障 | 6 轮之间没有追平屏障，最终 6.071 秒追平 |
+| 全栈原目录冷恢复 | 全部 10 个进程 SIGKILL，复用原目录启动并完成完整校验 36.082 秒 |
+| 恢复后常稳 | 60 秒负载，完整 oracle 通过，无业务请求错误 |
+| 最终数据 | 14,714 条持久化数据变更；768 条记录，764 条有效、4 条预期墓碑 |
+
+故障阶段共有 193 次请求尝试失败，保留具体类型和重试结果；没有计入常稳零错误，也没有删除失败记录。服务日志未发现 panic/fatal/race 签名，运行服务为普通构建，race 检查由独立质量门禁执行。各故障追平时间从恢复后开始观测，与“最后 durable ACK 后一秒内真实查询可见”的专项口径不同；恢复时仍受租约和依赖启动影响。
+
+证据位于 `reports/onebox-e2e/20261116T224624-a0ac0ab9/`：报告、全量 oracle、故障观测轨迹、指标差分和服务日志；`latency-analysis.json` 汇总事件消费者执行、排队与图提交阶段。优化前的失败实验和基线继续保留，见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md)。
+
+## 2026-11-16 优化前实测
 
 北京时间 20:03–20:18，运行 `20261116T200354-147c2a3a` 的 12 组 case 全部通过，随后保留恢复后的 onebox。另有短预检通过；短预检不计入正式 10 分钟常稳时间。
 

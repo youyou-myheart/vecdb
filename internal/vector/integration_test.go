@@ -721,7 +721,14 @@ func TestObjectAdoptionGCConflictTiKV(t *testing.T) {
 
 type dispatchHookTx struct {
 	transactionAPI
-	beforeCommit func() error
+	beforeCommit  func() error
+	forceTwoPhase bool
+}
+
+func (t dispatchHookTx) SetEnable1PC(enabled bool) {
+	if native, ok := t.transactionAPI.(interface{ SetEnable1PC(bool) }); ok {
+		native.SetEnable1PC(enabled && !t.forceTwoPhase)
+	}
 }
 
 func (t dispatchHookTx) Commit(ctx context.Context) error {
@@ -735,6 +742,16 @@ func TestDispatchCommitSourceFenceTiKV(t *testing.T) {
 	if os.Getenv("INTEGRATION") != "1" {
 		t.Skip("requires TiKV")
 	}
+	for _, twoPhase := range []bool{false, true} {
+		for _, sources := range []int{1, 2} {
+			t.Run(fmt.Sprintf("force_2pc_%t/sources_%d", twoPhase, sources), func(t *testing.T) {
+				testDispatchCommitSourceFenceTiKV(t, twoPhase, sources)
+			})
+		}
+	}
+}
+
+func testDispatchCommitSourceFenceTiKV(t *testing.T, twoPhase bool, sourceCount int) {
 	ctx := context.Background()
 	r, e := NewRepository([]string{"127.0.0.1:12379"}, "dispatch-fence/"+uuid.NewString(), 2)
 	if e != nil {
@@ -749,7 +766,6 @@ func TestDispatchCommitSourceFenceTiKV(t *testing.T) {
 	index := IndexPartitionID("index-0000")
 	replica := replicaID(index, node)
 	testAssignment(t, coord, node, replica)
-	testAssignment(t, coord, node, sourceID(0))
 	owner, e := coord.Acquire(ctx, replica, node)
 	if e != nil {
 		t.Fatal(e)
@@ -758,13 +774,18 @@ func TestDispatchCommitSourceFenceTiKV(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	source, e := coord.Acquire(ctx, sourceID(0), node)
-	if e != nil {
-		t.Fatal(e)
-	}
-	source, e = coord.Update(ctx, source, true, false)
-	if e != nil {
-		t.Fatal(e)
+	var sources []Ownership
+	for n := 0; n < sourceCount; n++ {
+		testAssignment(t, coord, node, sourceID(DataPartitionID(n)))
+		source, err := coord.Acquire(ctx, sourceID(DataPartitionID(n)), node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		source, err = coord.Update(ctx, source, true, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sources = append(sources, source)
 	}
 	tx, _ := r.begin()
 	if e = putJSON(tx, coord.planKey(index), ReplicaPlan{Publisher: replica}); e != nil {
@@ -774,6 +795,7 @@ func TestDispatchCommitSourceFenceTiKV(t *testing.T) {
 		t.Fatal(e)
 	}
 	l, _ := newLayout(1)
+	l.DataPartitions = sourceCount
 	l.Routing = &ClusterRouting{Version: 1, Centers: [][]float64{{0, 0}}}
 	c := &ClusterService{root: r, coordinator: coord, PartitionedService: &PartitionedService{layout: l, router: IdentityPartitionRouter{l}, data: map[DataPartitionID]*Repository{0: r}, dimension: 2}}
 	j := graphJournal{coord, index, owner}
@@ -781,18 +803,31 @@ func TestDispatchCommitSourceFenceTiKV(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	q := Delivery{Source: 0, Owner: source, RouteVersion: 1, Through: 1, Events: []LogEvent{{Sequence: 1, Record: Record{ID: "x", Revision: 1, Vector: []float64{0, 0}}}}}
+	var inputs []Delivery
+	for n, source := range sources {
+		id := ""
+		for k := 0; ; k++ {
+			id = fmt.Sprint(k)
+			if c.router.DataForID(id) == DataPartitionID(n) {
+				break
+			}
+		}
+		inputs = append(inputs, Delivery{Source: DataPartitionID(n), Owner: source, RouteVersion: 1, Through: 1, Events: []LogEvent{{Sequence: 1, Record: Record{ID: id, Revision: 1, Vector: []float64{0, 0}}}}})
+	}
 	base := *r
 	other := *coord
 	other.root = &base
 	r.beginTxn = func() (transactionAPI, error) {
 		tx, e := base.begin()
-		return dispatchHookTx{tx, func() error { _, e := other.Update(ctx, source, false, true); return e }}, e
+		return dispatchHookTx{transactionAPI: tx, beforeCommit: func() error { _, e := other.Update(ctx, sources[len(sources)-1], false, true); return e }, forceTwoPhase: twoPhase}, e
 	}
-	_, e = j.commit(ctx, head, 1, "delta", Manifest{Generation: "object", Key: "object", SHA256: "checksum"}, &q, c)
+	e = retryIndexCommit(ctx, func() error {
+		_, err := j.commitInputs(ctx, head, 1, "delta", Manifest{Generation: "object", Key: "object", SHA256: "checksum"}, inputs, c)
+		return err
+	}, func() {})
 	r.beginTxn = nil
-	if e == nil {
-		t.Fatal("graph and source watermark committed after dispatcher was fenced")
+	if !errors.Is(e, ErrFenced) {
+		t.Fatal("retry did not recheck the revoked source fence", e)
 	}
 	h, e := j.Head(ctx)
 	if e != nil {
@@ -800,5 +835,10 @@ func TestDispatchCommitSourceFenceTiKV(t *testing.T) {
 	}
 	if h.Committed.Sequence != 0 || h.Sources["0"] != 0 {
 		t.Fatal("partial source progress escaped", h)
+	}
+	for n := range sources {
+		if h.Sources[fmt.Sprint(n)] != 0 {
+			t.Fatal("partial batch source progress escaped", h)
+		}
 	}
 }

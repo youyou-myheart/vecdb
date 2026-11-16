@@ -33,6 +33,9 @@ type ClusterService struct {
 	dispatchMu         sync.Mutex
 	dispatchers        map[DataPartitionID]*dataDispatcher
 	dispatchDone       chan struct{}
+	dispatchSignals    *sourceSignals
+	outboundSignals    *sourceSignals
+	notifyDone         chan struct{}
 	consumerRetention  bool
 	graphReplication   bool
 	routingMu          sync.Mutex
@@ -172,6 +175,9 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 		c.router = clusterRouter{IdentityPartitionRouter{layout}, layout.Routing}
 		c.dispatchers = map[DataPartitionID]*dataDispatcher{}
 		c.dispatchDone = make(chan struct{})
+		c.dispatchSignals = newSourceSignals()
+		c.outboundSignals = newSourceSignals()
+		c.notifyDone = make(chan struct{})
 	}
 	if hasRole(node, RoleMaster) {
 		c.master = &Master{replicas: cfg.Replicas, coordinator: c.coordinator, node: node, layout: layout}
@@ -211,6 +217,7 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 	}
 	if cfg.Routing != nil {
 		go c.dispatchLoop(runCtx)
+		go c.notifySourceLoop(runCtx)
 	}
 	go c.run(runCtx, cfg.LeaseTTL/3)
 	return c, nil
@@ -263,6 +270,9 @@ func (c *ClusterService) Close() {
 	<-c.done
 	if c.dispatchDone != nil {
 		<-c.dispatchDone
+	}
+	if c.notifyDone != nil {
+		<-c.notifyDone
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

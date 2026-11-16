@@ -88,7 +88,7 @@ func (c *ClusterService) load(ctx context.Context, b PartitionBinding, entry *lo
 		if e == nil {
 			service.graphReplica.retention = c.consumerRetention
 			if c.layout.Routing != nil {
-				service.graphReplica.input = &routedInput{cluster: c, queue: map[DataPartitionID]*queuedDelivery{}}
+				service.graphReplica.input = newRoutedInput(c)
 			}
 		}
 	} else {
@@ -166,6 +166,7 @@ func (c *ClusterService) MaybeRebuild(ctx context.Context) error {
 func (c *ClusterService) replicaTick(ctx context.Context) {
 	allowed := map[IndexPartitionID]PartitionBinding{}
 	versions := map[IndexPartitionID]uint64{}
+	publishers := map[IndexPartitionID]IndexPartitionID{}
 	for _, b := range c.layout.Bindings {
 		p, e := c.coordinator.Plan(ctx, b.Index)
 		if e != nil {
@@ -175,6 +176,7 @@ func (c *ClusterService) replicaTick(ctx context.Context) {
 			if a.Node == c.node.ID && a.Session == c.node.Session {
 				allowed[a.Partition] = b
 				versions[a.Partition] = p.Version
+				publishers[a.Partition] = p.Publisher
 			}
 		}
 	}
@@ -193,6 +195,9 @@ func (c *ClusterService) replicaTick(ctx context.Context) {
 		var journal *graphJournal
 		if ready {
 			if g := entry.service.graphReplica; g != nil {
+				if g.input != nil {
+					g.input.planChanged(versions[entry.owner.Partition], publishers[entry.owner.Partition])
+				}
 				g.viewMu.RLock()
 				graphPos = g.position
 				g.viewMu.RUnlock()

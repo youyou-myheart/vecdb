@@ -11,11 +11,16 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"io"
+	"sync"
+	"time"
 )
 
 type Objects struct {
-	Client blobAPI
-	Bucket string
+	Client        blobAPI
+	Bucket        string
+	probeOnEnsure bool
+	readyMu       sync.Mutex
+	ready         bool
 }
 
 func NewObjects(endpoint, access, secret, bucket string) (*Objects, error) {
@@ -23,7 +28,7 @@ func NewObjects(endpoint, access, secret, bucket string) (*Objects, error) {
 	if e != nil {
 		return nil, e
 	}
-	return &Objects{minioBlobs{c}, bucket}, nil
+	return &Objects{Client: minioBlobs{c}, Bucket: bucket, probeOnEnsure: true}, nil
 }
 func (o *Objects) Ensure(ctx context.Context) error {
 	ok, e := o.Client.Exists(ctx, o.Bucket)
@@ -31,8 +36,48 @@ func (o *Objects) Ensure(ctx context.Context) error {
 		return e
 	}
 	if !ok {
-		return o.Client.Create(ctx, o.Bucket)
+		if e = o.Client.Create(ctx, o.Bucket); e != nil {
+			// Another replica may have created the same bucket concurrently.
+			if exists, check := o.Client.Exists(ctx, o.Bucket); check != nil || !exists {
+				return e
+			}
+		}
 	}
+	if !o.probeOnEnsure {
+		return nil
+	}
+	return o.ensureWritable(ctx)
+}
+
+// Bucket metadata can be available before the object data path (e.g. a
+// SeaweedFS filer lock ring). A native adapter checks one complete round trip
+// before its replicas announce readiness. This is startup readiness, not an
+// ongoing liveness cache or an index synchronization barrier.
+func (o *Objects) ensureWritable(ctx context.Context) error {
+	o.readyMu.Lock()
+	defer o.readyMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if o.ready {
+		return nil
+	}
+	data := []byte(`{"vecdb":"object-readiness"}`)
+	key := ".vecdb-readiness/" + uuid.NewString()
+	manifest := Manifest{Key: key, Size: int64(len(data)), SHA256: fmt.Sprintf("%x", sha256.Sum256(data))}
+	err := o.Client.Put(ctx, o.Bucket, key, data)
+	if err == nil {
+		_, err = o.loadBytes(ctx, manifest)
+	}
+	// Delete our unique probe even on an uncertain PUT/GET error. A failed
+	// cleanup cannot mark readiness as successful; no user object is touched.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	err = errors.Join(err, o.removeObject(cleanupCtx, key))
+	if err != nil {
+		return err
+	}
+	o.ready = true
 	return nil
 }
 func (o *Objects) Save(ctx context.Context, namespace string, dimension int, records []Record) (Manifest, error) {

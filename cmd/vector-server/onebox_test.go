@@ -134,6 +134,10 @@ func oneProcessPipeline(t *testing.T, graph, retention bool, clustered ...bool) 
 		go func() { _ = server.Serve(listener) }()
 		go func() {
 			defer close(n.done)
+			if service.EventDrivenIndexing() {
+				<-ctx.Done()
+				return
+			}
 			ticker := time.NewTicker(100 * time.Millisecond)
 			defer ticker.Stop()
 			for {

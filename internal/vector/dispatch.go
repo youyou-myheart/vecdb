@@ -64,6 +64,10 @@ func (c *ClusterService) dispatchLoop(ctx context.Context) {
 	defer close(c.dispatchDone)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
+	if c.worker != nil {
+		c.dispatchTick(ctx)
+	}
+	retry := initialIndexRetry
 	for {
 		select {
 		case <-ctx.Done():
@@ -72,6 +76,17 @@ func (c *ClusterService) dispatchLoop(ctx context.Context) {
 		case <-ticker.C:
 			if c.worker != nil {
 				c.dispatchTick(ctx)
+			}
+		case <-c.dispatchSignals.wake:
+			ids := c.dispatchSignals.take()
+			if c.worker != nil && c.dispatchSelected(ctx, ids) {
+				if !waitIndexRetry(ctx, retry) {
+					c.releaseDispatchers()
+					return
+				}
+				retry = min(2*retry, maxIndexRetry)
+			} else {
+				retry = initialIndexRetry
 			}
 		}
 	}
@@ -84,12 +99,20 @@ func (c *ClusterService) releaseDispatchers() {
 	}
 }
 func (c *ClusterService) dispatchTick(ctx context.Context) {
+	ids := make([]DataPartitionID, c.layout.DataPartitions)
+	for i := range ids {
+		ids[i] = DataPartitionID(i)
+	}
+	c.dispatchSelected(ctx, ids)
+}
+
+func (c *ClusterService) dispatchSelected(ctx context.Context, ids []DataPartitionID) bool {
 	defer c.observations.pipeline.track("dispatch_tick", "")(nil)
 	c.dispatchMu.Lock()
 	defer c.dispatchMu.Unlock()
 	var wg sync.WaitGroup
-	for d := 0; d < c.layout.DataPartitions; d++ {
-		id := DataPartitionID(d)
+	failed := make([]bool, len(ids))
+	for n, id := range ids {
 		state := c.dispatchers[id]
 		a, e := c.coordinator.Assignment(ctx, sourceID(id))
 		if e != nil {
@@ -118,13 +141,23 @@ func (c *ClusterService) dispatchTick(ctx context.Context) {
 		}
 		state.owner = o
 		wg.Add(1)
-		go func(id DataPartitionID, s *dataDispatcher) {
+		go func(n int, id DataPartitionID, s *dataDispatcher) {
 			defer wg.Done()
 			err := c.dispatchSource(ctx, id, s)
 			c.reportDispatch(ctx, s, err)
-		}(id, state)
+			if err != nil {
+				failed[n] = true
+				c.signalSource(id, "retry", true)
+			}
+		}(n, id, state)
 	}
 	wg.Wait()
+	for _, failure := range failed {
+		if failure {
+			return true
+		}
+	}
+	return false
 }
 func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID, s *dataDispatcher) (err error) {
 	started := time.Now()
@@ -181,6 +214,11 @@ func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID,
 		s.window = s.window[int(next-done):]
 		s.completed = next
 		done = next
+		if len(s.window) == 0 {
+			// The previous window is durably complete. Read the next bounded
+			// window immediately, without waiting for another control tick.
+			c.signalSource(id, "window_drained", true)
+		}
 	}
 	var wg sync.WaitGroup
 	errs := make([]error, len(c.layout.Bindings))

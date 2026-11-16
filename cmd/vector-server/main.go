@@ -102,28 +102,32 @@ func main() {
 	if e != nil {
 		log.Fatal(e)
 	}
-	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				c, cancel := context.WithTimeout(ctx, 10*time.Second)
-				var e error
-				if cluster != nil {
-					e = cluster.SyncOwned(c)
-				} else {
-					e = service.Sync(c)
-				}
-				cancel()
-				if e != nil {
-					log.Printf("index sync failed: %v", e)
+	// Routed replicas start an ownership-scoped event consumer when loaded.
+	// Legacy pull-based indexes still use the periodic synchronization loop.
+	if cluster == nil || !cluster.EventDrivenIndexing() {
+		go func() {
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					c, cancel := context.WithTimeout(ctx, 10*time.Second)
+					var e error
+					if cluster != nil {
+						e = cluster.SyncOwned(c)
+					} else {
+						e = service.Sync(c)
+					}
+					cancel()
+					if e != nil {
+						log.Printf("index sync failed: %v", e)
+					}
 				}
 			}
-		}
-	}()
+		}()
+	}
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()

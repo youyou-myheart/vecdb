@@ -11,6 +11,7 @@ import (
 )
 
 type partitionRPC struct {
+	Source      *DataPartitionID `json:"source,omitempty"`
 	Delivery    *Delivery        `json:"delivery,omitempty"`
 	ReadThrough uint64           `json:"read_through,omitempty"`
 	Namespace   string           `json:"namespace"`
@@ -73,6 +74,13 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 	var reply partitionReply
 	if req.Namespace != c.root.Prefix {
 		return reply, ErrFenced
+	}
+	if req.Operation == "wake_source" {
+		if !c.EventDrivenIndexing() || c.worker == nil || req.Source == nil || *req.Source < 0 || int(*req.Source) >= c.layout.DataPartitions || req.Partition != sourceID(*req.Source) {
+			return reply, ErrFenced
+		}
+		c.signalSource(*req.Source, "received", true)
+		return reply, nil
 	}
 	c.mu.Lock()
 	entry := c.locals[req.Partition]

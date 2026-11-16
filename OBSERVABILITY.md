@@ -8,6 +8,16 @@
 
 时延诊断新增 `GET /metrics?scope=local`，只读进程内指标，不依赖 TiKV。阶段 Histogram、最老队列年龄、内存实时应用位点以及 10 分钟 onebox 追平时间线见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md)。各 Worker 必须单独采集，Gateway 不汇总 Worker 的进程内时延。
 
+聚类 Index Leader 使用入队通知驱动连续消费，空队列阻塞等待。`vecdb_index_consumer_cycles_total{index_partition,reason}` 区分启动、通知、连续处理、Follower 轮询和失败重试；`vecdb_index_consumer_waiting` 显示是否正在等待，`index_consumer_work` / `index_consumer_idle` 阶段记录工作与等待时间。正常空闲 Leader 不应持续产生周期消费；Follower 的远端日志轮询单独计数。
+
+`vecdb_graph_commit_conflict_retries_total{index_partition}` 记录复用已持久化对象的确定写冲突重试。`graph_commit_attempt` 阶段的 error 表示单次事务冲突等错误，`graph_commit` 的 error 才表示整批提交最终失败；业务请求成功率另行观察，不能将这两种错误计数相加。
+
+`graph_source_lock` 是图事务 prewrite 前获取共享来源 fencing key 锁的 RPC 耗时，采用 NOWAIT，锁占用拒绝计入 error。`dispatch_notify` 记录异步来源提示的 owner 解析与网络发送时间；失败只表示提示没送达，来源仍由持久化日志和控制巡检恢复。`vecdb_graph_local_owner_epoch` 必须与同份副本的 `vecdb_graph_local_applied_sequence` 配对，避免把旧 owner 的内存位点误认为新副本进度。
+
+查询超时可以结合 `route_plan`、`route_owner` 和 `replica_rpc_search` 阶段定位：分别对应计划读取、owner 解析、单次 Worker 查询调用，避免把 TiKV 元数据锁等待误判为 HNSW 计算慢。
+
+`vecdb_route_plan_fallback_total{index_partition}` 记录图查询在读取计划超时后使用上次成功读取的路由提示的次数。该值上升即使业务零错误也说明元数据读取存在长尾；缓存只提供地址，仍逐次验证当前 owner 租约和 epoch，不能被视为跳过 fencing 的成功。
+
 ```bash
 curl -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:18202/metrics
 curl -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:18202/v1/cluster
@@ -31,6 +41,7 @@ curl -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:18202/v1/cluster
 | `vecdb_cluster_ready` / `fully_replicated` / `master_available` / `master_epoch` / `routing_version` | 查询副本可用性、配置副本数、Master 租约及布局版本；ready 不是全部来源完成或全部副本追平的承诺 |
 | `vecdb_dispatch_acquisitions_total` | 本进程获得 DataPartition 执行权的次数，包含首次获取，不等于纯 failover 次数 |
 | `vecdb_dispatch_ticks_total` / `dispatch_errors_total` / `dispatch_duration_seconds_total` | 本进程来源轮询次数、失败次数、累计耗时；包含空闲 tick |
+| `vecdb_dispatch_wake_total{data_partition,reason}` | 来源提示次数，合并前计数；`write`、`graph_commit` 为发出提示，`received`、`window_drained`、`retry` 为本地调度原因；不代表持久化 ACK 或实际执行次数 |
 | `vecdb_delivery_attempts_total` / `delivery_errors_total` | 本进程向 Index 投递的次数/失败次数，包含重试；成功只表示入队，不代表图已持久化 |
 | `vecdb_index_admissions_total` / `duplicates_total` / `rejections_total` | 本进程接受批次、重复批次、拒绝批次；拒绝包括背压和 fencing，需要结合错误状态判断 |
 | `vecdb_index_queue_batches` / `queue_bytes` | 当前本地 Index 输入队列大小；每来源最多一批，总编码预算 4 MiB，不包括正在构图的批次 |

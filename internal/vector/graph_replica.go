@@ -26,6 +26,7 @@ type graphReplica struct {
 	prepared  GraphPosition
 	delta     *GraphDelta
 	reset     *IndexSnapshot
+	leader    bool // Last authoritative plan read; guarded by Service.syncMu.
 }
 
 func newGraphService(ctx context.Context, r *Repository, o ObjectAPI, j graphJournal) (*Service, error) {
@@ -216,6 +217,13 @@ func (g *graphReplica) prepare(ctx context.Context, s *Service, head GraphHead) 
 // elected leader completes a committed entry before touching the data journal.
 func (g *graphReplica) sync(ctx context.Context, s *Service, rebuild bool) (err error) {
 	defer g.track("graph_sync")(&err)
+	// Explicit sync/rebuild paths can fail after a durable commit. Wake the
+	// consumer even if no new data arrives so pending publication can recover.
+	defer func() {
+		if err != nil && g.input != nil {
+			g.input.notify()
+		}
+	}()
 	head, e := g.journal.Head(ctx)
 	if e != nil {
 		return e
@@ -228,6 +236,7 @@ func (g *graphReplica) sync(ctx context.Context, s *Service, rebuild bool) (err 
 		return e
 	}
 	leader := plan.Publisher == g.journal.owner.Partition
+	g.leader = leader
 	if rebuild && !leader {
 		return ErrFenced
 	}
@@ -386,7 +395,8 @@ func (s *Service) searchGraphLocal(ctx context.Context, q Search) ([]Hit, GraphP
 }
 
 // syncGraphThrough preserves the explicit Sync contract: consume a finite data
-// head captured at entry. Background Sync remains bounded to one graph batch.
+// head captured at entry. Each Sync call is bounded to one graph batch; the
+// routed consumer repeats calls without waiting while its queue has input.
 func (s *Service) syncGraphThrough(ctx context.Context) error {
 	if s.graphReplica.input != nil {
 		return s.Sync(ctx)

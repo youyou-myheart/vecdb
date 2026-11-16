@@ -38,7 +38,7 @@ func routedFixture(t *testing.T) (*graphFixture, *ClusterService, Ownership) {
 		t.Fatal(e)
 	}
 	for _, s := range f.services {
-		s.graphReplica.input = &routedInput{cluster: c, queue: map[DataPartitionID]*queuedDelivery{}}
+		s.graphReplica.input = newRoutedInput(c)
 	}
 	return f, c, owner
 }

@@ -25,6 +25,21 @@ vecdb_graph_local_applied_sequence{{index_partition="index-0000",replica="replic
                               (self.metrics(1,2),{}),(self.metrics(1,2),{'node':{'error':'TimeoutError'}})]:
             with self.assertRaises(ValueError): interval(before,after)
 
+    def test_consumer_trigger_and_waiting_metrics(self):
+        snapshot = parse_metrics('''
+vecdb_index_consumer_cycles_total{index_partition="index-0000",reason="notification"} 42
+vecdb_index_consumer_cycles_total{index_partition="index-0000",reason="continue"} 7
+vecdb_index_consumer_waiting{index_partition="index-0000",replica="replica-a"} 1
+vecdb_graph_commit_conflict_retries_total{index_partition="index-0000"} 9
+vecdb_route_plan_fallback_total{index_partition="index-0000"} 3
+vecdb_dispatch_wake_total{data_partition="data-0000",reason="graph_commit"} 4
+vecdb_graph_local_owner_epoch{index_partition="index-0000",replica="replica-a"} 7
+''')
+        self.assertEqual(snapshot['consumers']['index-0000'],dict(waiting=1,commit_conflict_retries=9,cycles=dict(notification=42,**{'continue':7})))
+        self.assertEqual(snapshot['route_fallbacks'],{'index-0000':3})
+        self.assertEqual(snapshot['source_signals'],{'data-0000':{'graph_commit':4}})
+        self.assertEqual(snapshot['applied_epochs'],{'replica-a':7})
+
     def test_drain_separates_commits_apply_and_heartbeat(self):
         state=dict(graph_heads={'index-0000':dict(sources={'0':5},committed={'sequence':3},visible={'sequence':3})},
                    replica_owners={'index-0000':{'owners':[{'partition':'a'},{'partition':'b'}]}},

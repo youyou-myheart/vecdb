@@ -47,13 +47,27 @@ bash scripts/acceptance-dispatch.sh
 | 多进程旧模式 | 消费 lease pin/ACK/release、图对象 GC、落后副本快照恢复、GC 后 Leader 故障 | 不清理被租约保护的日志；reset 可恢复；图副本可继续构建 |
 | 观测 | 鉴权、指标格式与数值、位点、队列、错误/去重计数、故障积压及恢复收敛 | 故障不能显示为零积压的假健康；指标能被 Prometheus parser 读取；RPC uint64 不经 float64 |
 | 时延诊断 | Histogram 并发采样和失败归属、重投不重置队列年龄、清空后年龄归零、实时应用位点、TiKV 失败时局部指标仍可读 | UT 校验桶/计数/累计值及接口鉴权；onebox 记录停写后图提交、发布、内存应用、心跳上报和完成位点的时间线 |
+| 事件消费 | 空队列与入队竞态、通知合并、积压连续处理、错误退避、Follower 转 Leader、持续输入取消、慢分片隔离、等待中的分片退休、不确定提交后主动发布 | UT/race 验证无丢失唤醒；聚类七服务禁用旧定时 SyncOwned；真实 onebox 断言事件消费者有执行且没有后台 worker_sync 样本 |
+| 来源唤醒与合批 | 多来源通知合并、鉴权、窗口完成后继续取数、空来源不自旋；有界取批与来源轮转 | 通知不推进水位；跨来源合批只有一条图日志，所有来源同时提交或全部失败；Leader/Follower 图结构相同 |
+| 对象启动就绪 | PUT/GET/校验/清理失败、取消、多副本并发启动 | 桶存在不能绕过数据路径检查；失败不缓存就绪、成功检查只执行一次、probe 不触及业务对象 |
+| 并发图提交 | 确定写冲突的有限重试、取消、对象复用、重试期间来源撤销；TiKV 原子提交快速路径及强制 2PC | 只有确定未提交的冲突可重试；每次重新检查 fencing；被撤销来源不得提交图日志或来源完成水位 |
+| 来源提交锁 | 键排序/去重、原快照 forUpdateTS、NOWAIT 与有限重试；真实 TiKV 的锁竞争、并发撤销和陈旧快照 | 持锁期间撤销不能越过图事务；锁占用必须在图 prewrite 前返回；新事务拒绝失效 owner，旧快照不能通过新锁读取陈旧 fencing token |
+| 查询路由长尾 | 真实 TiKV secondary prewrite 锁、计划读取超时、长期闲置提示/计划失效、并发刷新、owner 被撤销、调用者取消 | 最近计划只能辅助选副本；仍重新校验 owner；维护调用不能使用缓存；底层超时和回退次数均可观测；锁清理后刷新到新计划 |
 | 脚本自测 | 非零退出、超时、缺报告、旧成功报告、cleanup=false、依赖启动失败 | 所有失败都向上传播，不能误报 passed |
 
 七服务各实例通过真实 HTTP 通信；TiKV/S3 是外部服务。独立进程场景才使用 OS SIGSTOP/SIGKILL。数据按固定簇中心、渐变偏移、跨簇更新构造，不是纯随机向量。
 
 专项时延验收可运行 `bash scripts/acceptance-onebox-e2e.sh --latency-only --steady-seconds 600`。报告使用负载前后逐进程直方图差分，拒绝混入重启计数和缺失采样，详见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md)。
 
+一秒可见性门禁：`bash scripts/acceptance-onebox-freshness.sh --freshness-rounds 20 --load-seconds 5`。它单独启动真实进程，等待存储、来源 owner、查询副本和构图 Publisher 就绪，检查 640 条初始化批量和 20 次停写；每轮最后都包含插入、更新、删除。启动等待单独记录，业务 t0 为最后一次持久化写 ACK；要求所有 Index 发布目标来源水位、全部在役副本在当前 owner epoch 下实际应用，且每份副本和两个 Gateway 的普通查询均通过全量 ID/revision/属性/距离 oracle。查询不带隐式同步参数，心跳进度不作为完成条件。任何轮次超过 1 秒，报告和退出码均失败；即使之后追平，也不能改算通过。各轮保留原始轨迹、来源 LSN 目标、图目标、阶段耗时、硬件/负载条件和 N/P50/P95/P99/max。故障恢复另由完整 onebox 评估，不与健康停写样本混合。
+
 ## CI 与边界
+
+事件消费最终回归：`20261116T150019Z-d62292a0`，完整 smoke **10/10 阶段通过**。包括全项目 Go UT/race/coverage、vet、35 个 Python harness UT、5 个 Python SDK UT、真实 TiKV/S3 集成、四种模式的七服务流水线、服务端/CLI 构建、独立进程投递故障和订阅/GC 故障。聚类七服务最终核对 383 条记录，多进程投递故障核对 246 条；所有测试实例和子进程已清理。最终 smoke 构建的二进制 SHA-256 与正式可见性和完整 onebox 使用的二进制一致。
+
+独立真实进程验收也已完成：`20261116T223954-201993cf` 的初始批量和 20 轮稳态可见性全部在 1 秒内；`20261116T224624-a0ac0ab9` 的 10 分钟常稳、故障矩阵、6 轮连续故障、原目录冷恢复和恢复后常稳共 12 组 case 全部通过。运行条件、分位数、历史失败记录及尚未覆盖的大规模/跨机边界见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md) 和 [ONEBOX_E2E.md](ONEBOX_E2E.md)。这些报告对应提交前的工作区，原始 commit/dirty 字段保持不改写。
+
+以下为事件消费优化前的历史验收记录：
 
 2026-11-16 本地执行 `bash scripts/acceptance-dispatch.sh`，10 个阶段全部通过；报告运行 ID 为 `20261116T103659Z-263fda42`（本地路径 `reports/quality/<运行ID>/report.json`）。四种七服务模式全部通过；聚类单 PID 场景最终核对 383 条记录，多进程反复故障场景最终核对 246 条记录；18 个 Python harness UT、5 个 Python SDK UT 通过，测试启动的全部服务/子进程已停止。RPC 生成物可重复生成且无差异，CI YAML 与 Compose 配置通过本地解析校验。
 

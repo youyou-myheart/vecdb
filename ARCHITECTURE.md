@@ -57,7 +57,7 @@ A 不直接向 B 复制进程内存。B 读取 TiKV 中的已发布图日志，�
 详细提交顺序：
 
 1. 任意 Gateway 将记录、数据日志、分区 log-head 和幂等凭证写入同一个 TiKV 事务。支持 expected_revision 条件更新；提交结果不确定时用原 request_id 重试。
-2. Leader 从上次数据 offset 增量读取，每批最多 256 条。500 ms 同步触发器不是全量扫描 Outbox。
+2. 一一对应模式下，Leader 每 500 ms 从上次数据 offset 增量读取，每批最多 256 条。聚类投递模式改由来源处理器投递到队列，入队唤醒 Leader 连续消费，见第 6 节。
 3. Leader 在写锁内构图，捕获修改过的节点和记录等状态，再回退推测修改，避免查询提前看到未提交结果。
 4. 上传并校验不可变图对象，在带 fencing 的 TiKV 事务中提交图日志引用和数据消费位置。
 5. Leader 验证变更可重放，推进 Visible；不等待 Follower ACK。随后 Leader 应用已发布图变更。
@@ -115,11 +115,13 @@ Master 维护的 ReplicaPlan 区分 Desired、Serving、Publisher、Barrier 和 
 ```mermaid
 flowchart LR
     D["DataPartition 日志"] --> R["来源处理器<br/>固定版本聚类路由"]
-    R --> I["IndexPartition Leader<br/>有界内存队列"]
+    R --> I["IndexPartition Leader<br/>入队唤醒，连续消费"]
     I --> G["图变更日志<br/>原子提交来源完成水位"]
 ```
 
-没有增加持久化索引输入日志，也不先保存逐事件路由结果。来源保留原始日志并承担重试；索引提交来源 commit_lsn，来源每 500 ms 根据各事件目标计算连续完成前缀。处理器故障后只需从完成位置恢复有界窗口。具体投递、去重、空洞、订阅及恢复协议见 [CLUSTER_ROUTING.md](CLUSTER_ROUTING.md)。
+没有增加持久化索引输入日志，也不先保存逐事件路由结果。来源保留原始日志并承担重试；数据写入和图提交会异步唤醒来源处理器，来源读取持久化 commit_lsn，按各事件目标计算连续完成前缀，窗口完成后立即读下一窗口。500 ms 控制巡检负责租约与漏通知兜底。处理器故障后只需从完成位置恢复有界窗口。具体投递、去重、空洞、订阅及恢复协议见 [CLUSTER_ROUTING.md](CLUSTER_ROUTING.md)。
+
+每个本地索引副本有独立消费循环：Leader 由入队事件唤醒，逐批完成持久化和发布后立即取下一批，队列为空时阻塞等待。不同索引可以并行，单个索引仍有序提交；Follower 当前每 100 ms 追赶持久化图日志。切主计划变化和提交失败也能唤醒恢复流程。时延对比与观测见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md)。
 
 这一取舍减少一层日志持久化，但慢索引会通过来源窗口产生反压。未来若需要隔离积压，可再评估独立索引输入日志。
 

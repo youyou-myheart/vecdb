@@ -130,12 +130,35 @@ func (j graphJournal) Commit(ctx context.Context, base GraphHead, offset uint64,
 	return j.commit(ctx, base, offset, kind, object, nil, nil)
 }
 func (j graphJournal) commit(ctx context.Context, base GraphHead, offset uint64, kind string, object Manifest, input *Delivery, cluster *ClusterService) (GraphEntry, error) {
+	var inputs []Delivery
+	if input != nil {
+		inputs = []Delivery{*input}
+	}
+	return j.commitInputs(ctx, base, offset, kind, object, inputs, cluster)
+}
+
+func (j graphJournal) commitInputs(ctx context.Context, base GraphHead, offset uint64, kind string, object Manifest, inputs []Delivery, cluster *ClusterService) (GraphEntry, error) {
 	var entry GraphEntry
 	tx, e := j.c.root.begin()
 	if e != nil {
 		return entry, e
 	}
 	defer tx.Rollback()
+	// Prefer TiKV's atomic single-region commit for these short metadata
+	// transactions, avoiding 2PC prewrite locks on conflicts in this fast path.
+	// The client falls back to 2PC for mutations spanning regions; fencing and
+	// uncertain-outcome recovery remain unchanged.
+	if native, ok := tx.(interface{ SetEnable1PC(bool) }); ok {
+		native.SetEnable1PC(true)
+	}
+	if len(inputs) > 0 {
+		measure := cluster.observations.pipeline.track("graph_source_lock", string(j.id))
+		e = lockSourceFences(ctx, tx, j.c, inputs)
+		measure(&e)
+		if e != nil {
+			return entry, e
+		}
+	}
 	if e = j.c.ReplicaFence(j.id, j.owner)(ctx, tx); e != nil {
 		return entry, e
 	}
@@ -149,8 +172,8 @@ func (j graphJournal) commit(ctx context.Context, base GraphHead, offset uint64,
 	if h.Committed.Sequence == ^uint64(0) || offset < h.Committed.DataOffset || (kind != "delta" && kind != "reset") {
 		return entry, errors.New("invalid graph commit")
 	}
-	if input != nil {
-		if e = cluster.validateDelivery(ctx, tx, j.id, *input, h.Sources[fmt.Sprint(input.Source)]); e != nil {
+	for _, input := range inputs {
+		if e = cluster.validateDelivery(ctx, tx, j.id, input, h.Sources[fmt.Sprint(input.Source)]); e != nil {
 			return entry, e
 		}
 		if input.Through <= h.Sources[fmt.Sprint(input.Source)] {

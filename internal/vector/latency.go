@@ -13,12 +13,16 @@ import (
 // Labels are code-defined stages and configured partitions, never IDs, epochs,
 // request IDs or error text. All durations use the local monotonic clock.
 type pipelineMetrics struct {
-	once     sync.Once
-	registry *prometheus.Registry
-	duration *prometheus.HistogramVec
-	batch    *prometheus.HistogramVec
-	mu       sync.Mutex
-	lastSync time.Time
+	once              sync.Once
+	registry          *prometheus.Registry
+	duration          *prometheus.HistogramVec
+	batch             *prometheus.HistogramVec
+	consumerWake      *prometheus.CounterVec
+	commitRetries     *prometheus.CounterVec
+	routePlanFallback *prometheus.CounterVec
+	dispatchWake      *prometheus.CounterVec
+	mu                sync.Mutex
+	lastSync          time.Time
 }
 
 func (p *pipelineMetrics) init() {
@@ -32,9 +36,25 @@ func (p *pipelineMetrics) init() {
 		p.batch = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "vecdb_index_batch_records",
 			Help:    "Input records per routed graph commit attempt, before revision coalescing.",
-			Buckets: []float64{1, 2, 4, 8, 16, 32},
+			Buckets: []float64{1, 2, 4, 8, 16, 32, 64, 128},
 		}, []string{"partition", "outcome"})
-		p.registry.MustRegister(p.duration, p.batch)
+		p.consumerWake = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vecdb_index_consumer_cycles_total",
+			Help: "Local index consumer cycles by trigger; continue drains without waiting, retry is failed IO backoff.",
+		}, []string{"index_partition", "reason"})
+		p.commitRetries = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vecdb_graph_commit_conflict_retries_total",
+			Help: "Definite TiKV write-conflict retries reusing a persisted graph object, with fresh fencing checks.",
+		}, []string{"index_partition"})
+		p.routePlanFallback = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vecdb_route_plan_fallback_total",
+			Help: "Searches using the last routing hint after a plan-read timeout; current replica ownership is still checked.",
+		}, []string{"index_partition"})
+		p.dispatchWake = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vecdb_dispatch_wake_total",
+			Help: "Source work hints before coalescing; every hint still requires durable log and commit-watermark reads.",
+		}, []string{"data_partition", "reason"})
+		p.registry.MustRegister(p.duration, p.batch, p.consumerWake, p.commitRetries, p.routePlanFallback, p.dispatchWake)
 	})
 }
 

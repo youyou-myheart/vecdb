@@ -11,7 +11,7 @@ LABEL = re.compile(r'(\w+)=("(?:\\.|[^"\\])*")')
 
 
 def parse_metrics(text):
-    histograms, queues, applied = {}, {}, {}
+    histograms, queues, applied, applied_epochs, consumers, route_fallbacks, source_signals = {}, {}, {}, {}, {}, {}, {}
     for line in text.splitlines():
         if not line or line.startswith('#'): continue
         match = SAMPLE.fullmatch(line)
@@ -31,7 +31,19 @@ def parse_metrics(text):
             queues.setdefault(labels['replica'], {})[name.removeprefix('vecdb_index_queue_')] = value
         elif name == 'vecdb_graph_local_applied_sequence':
             applied[labels['replica']] = int(value)
-    return dict(histograms=histograms, queues=queues, applied=applied)
+        elif name == 'vecdb_graph_local_owner_epoch':
+            applied_epochs[labels['replica']] = int(value)
+        elif name == 'vecdb_index_consumer_cycles_total':
+            consumers.setdefault(labels['index_partition'], {}).setdefault('cycles', {})[labels['reason']] = int(value)
+        elif name == 'vecdb_index_consumer_waiting':
+            consumers.setdefault(labels['index_partition'], {})['waiting'] = int(value)
+        elif name == 'vecdb_graph_commit_conflict_retries_total':
+            consumers.setdefault(labels['index_partition'], {})['commit_conflict_retries'] = int(value)
+        elif name == 'vecdb_route_plan_fallback_total':
+            route_fallbacks[labels['index_partition']] = int(value)
+        elif name == 'vecdb_dispatch_wake_total':
+            source_signals.setdefault(labels['data_partition'],{})[labels['reason']] = int(value)
+    return dict(histograms=histograms, queues=queues, applied=applied, applied_epochs=applied_epochs, consumers=consumers, route_fallbacks=route_fallbacks, source_signals=source_signals)
 
 
 def collect(endpoints, token):

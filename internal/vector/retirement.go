@@ -56,5 +56,12 @@ func (c *ClusterService) startLoad(ctx context.Context, b PartitionBinding, o Ow
 	c.mu.Lock()
 	c.locals[o.Partition] = entry
 	c.mu.Unlock()
-	go func() { defer close(entry.loadDone); defer cancel(); c.load(loadCtx, b, entry) }()
+	go func() {
+		defer close(entry.loadDone)
+		defer cancel()
+		c.load(loadCtx, b, entry)
+		if c.EventDrivenIndexing() {
+			c.runRoutedIndex(loadCtx, entry)
+		}
+	}()
 }

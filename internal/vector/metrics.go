@@ -156,7 +156,13 @@ func (c *ClusterService) localMetrics(m *metricText) error {
 			sequence := g.position.Sequence
 			g.viewMu.RUnlock()
 			m.add("vecdb_graph_local_applied_sequence", "gauge", "Actual local applied sequence without waiting for the heartbeat progress report.", fmt.Sprintf("{index_partition=%q,replica=%q}", g.journal.id, entry.owner.Partition), sequence)
+			m.add("vecdb_graph_local_owner_epoch", "gauge", "Owner epoch of the local graph, paired with its applied sequence.", fmt.Sprintf("{index_partition=%q,replica=%q}", g.journal.id, entry.owner.Partition), entry.owner.Epoch)
 			in := g.input
+			waiting := 0
+			if in.waiting.Load() {
+				waiting = 1
+			}
+			m.add("vecdb_index_consumer_waiting", "gauge", "Local consumer is blocked waiting for a notification or follower poll.", fmt.Sprintf("{index_partition=%q,replica=%q}", g.journal.id, entry.owner.Partition), waiting)
 			in.mu.Lock()
 			batches, bytes := len(in.queue), in.bytes
 			oldest := in.oldestAge(time.Now())

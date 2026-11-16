@@ -14,6 +14,7 @@ import (
 
 type remotePartition struct {
 	rotation atomic.Uint64
+	plans    routePlanCache
 	cluster  *ClusterService
 	id       IndexPartitionID
 }
@@ -132,7 +133,7 @@ func (p *remotePartition) replicaCall(ctx context.Context, op string, q Search) 
 			case <-timer.C:
 			}
 		}
-		plan, e := p.cluster.coordinator.Plan(ctx, p.id)
+		plan, e := p.routingPlan(ctx, op)
 		if e != nil {
 			return partitionReply{}, fmt.Errorf("%w: %w", ErrPartitionUnavailable, e)
 		}
@@ -152,7 +153,9 @@ func (p *remotePartition) replicaCall(ctx context.Context, op string, q Search) 
 				if (op != "search" && op != "sync" || op == "sync" && p.cluster.graphReplication) && a.Partition != plan.Publisher {
 					continue
 				}
+				ownerTimer := p.cluster.observations.pipeline.track("route_owner", string(p.id))
 				o, err := p.cluster.coordinator.Resolve(ctx, a.Partition)
+				ownerTimer(&err)
 				if err != nil {
 					last = err
 					continue
@@ -172,7 +175,9 @@ func (p *remotePartition) replicaCall(ctx context.Context, op string, q Search) 
 					budget = 30 * time.Second
 				}
 				attempt, cancel := context.WithTimeout(ctx, budget)
+				rpcTimer := p.cluster.observations.pipeline.track("replica_rpc_"+op, string(p.id))
 				result, err := p.callOwnerThrough(attempt, op, q, o, through)
+				rpcTimer(&err)
 				cancel()
 				if err == nil {
 					if hot && read {

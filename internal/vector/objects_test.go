@@ -155,17 +155,23 @@ func TestObjectsS3Adapter(t *testing.T) {
 	methods := map[string]int{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		methods[r.Method]++
+		response := data
+		if strings.Contains(r.URL.Path, "/.vecdb-readiness/") {
+			response = []byte(`{"vecdb":"object-readiness"}`)
+		}
 		w.Header().Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
 		switch r.Method {
 		case "HEAD":
-			w.Header().Set("Content-Length", "2")
+			w.Header().Set("Content-Length", fmt.Sprint(len(response)))
 		case "GET":
-			w.Header().Set("Content-Length", "2")
+			w.Header().Set("Content-Length", fmt.Sprint(len(response)))
 			w.Header().Set("ETag", `"abc"`)
-			_, _ = w.Write(data)
+			_, _ = w.Write(response)
 		case "PUT":
 			_, _ = io.Copy(io.Discard, r.Body)
 			w.Header().Set("ETag", `"abc"`)
+		case "DELETE":
+			w.WriteHeader(http.StatusNoContent)
 		}
 	}))
 	defer server.Close()
@@ -188,7 +194,7 @@ func TestObjectsS3Adapter(t *testing.T) {
 	if _, e = o.Load(ctx, m); e != nil {
 		t.Fatal(e)
 	}
-	for _, method := range []string{"HEAD", "PUT", "GET"} {
+	for _, method := range []string{"HEAD", "PUT", "GET", "DELETE"} {
 		if methods[method] == 0 {
 			t.Fatal("adapter not exercised", method)
 		}
