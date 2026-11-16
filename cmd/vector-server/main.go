@@ -79,7 +79,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		cluster, e = vector.OpenClusterService(ctx, repo, objects, partitions, vector.ClusterConfig{IndexReplication: env("INDEX_REPLICATION", "independent"), HostID: os.Getenv("HOST_ID"), Zone: os.Getenv("ZONE"), FailureDomain: env("REPLICA_FAILURE_DOMAIN", "node"), MemoryBudgetBytes: memoryBudget, Scheduler: env("SCHEDULER", "hash"), Capacity: capacity, BalanceCooldown: cooldown, Replicas: replicas, NodeID: os.Getenv("NODE_ID"), AdvertiseURL: os.Getenv("ADVERTISE_URL"), Token: os.Getenv("CLUSTER_TOKEN"), LeaseTTL: ttl, Roles: env("ROLES", "master,gateway,worker")})
+		cluster, e = vector.OpenClusterService(ctx, repo, objects, partitions, vector.ClusterConfig{ConsumerRetention: os.Getenv("CONSUMER_RETENTION") == "1", IndexReplication: env("INDEX_REPLICATION", "independent"), HostID: os.Getenv("HOST_ID"), Zone: os.Getenv("ZONE"), FailureDomain: env("REPLICA_FAILURE_DOMAIN", "node"), MemoryBudgetBytes: memoryBudget, Scheduler: env("SCHEDULER", "hash"), Capacity: capacity, BalanceCooldown: cooldown, Replicas: replicas, NodeID: os.Getenv("NODE_ID"), AdvertiseURL: os.Getenv("ADVERTISE_URL"), Token: os.Getenv("CLUSTER_TOKEN"), LeaseTTL: ttl, Roles: env("ROLES", "master,gateway,worker")})
 		if e == nil {
 			service = cluster
 			defer cluster.Close()

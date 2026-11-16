@@ -240,3 +240,30 @@ func (s *Server) ReadChanges(ctx context.Context, r *pb.ChangeRequest) (*pb.Chan
 	out := &pb.ChangePage{}
 	return out, convert(page, out)
 }
+
+func (s *Server) ManageConsumer(ctx context.Context, r *pb.ConsumerRequest) (*pb.ConsumerState, error) {
+	manager, ok := s.backend.(interface {
+		ManageConsumer(context.Context, vector.ConsumerRequest) (vector.ConsumerState, error)
+	})
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "consumer leases unavailable")
+	}
+	if r.TtlSeconds > 3600 {
+		return nil, status.Error(codes.InvalidArgument, "TTL exceeds 3600")
+	}
+	result, e := manager.ManageConsumer(ctx, vector.ConsumerRequest{Partition: vector.IndexPartitionID(r.Partition), Stream: r.Stream, Consumer: r.Consumer, Session: r.Session, Epoch: r.Epoch, Ack: r.Ack, TTLSeconds: int(r.TtlSeconds), Action: r.Action})
+	if errors.Is(e, vector.ErrInvalidSubscription) {
+		return nil, status.Error(codes.InvalidArgument, e.Error())
+	}
+	if errors.Is(e, vector.ErrFenced) || errors.Is(e, vector.ErrLogCompacted) {
+		return nil, status.Error(codes.FailedPrecondition, e.Error())
+	}
+	if errors.Is(e, vector.ErrSubscriptionUnavailable) {
+		return nil, status.Error(codes.Unimplemented, e.Error())
+	}
+	if e != nil {
+		return nil, rpcError(e)
+	}
+	out := &pb.ConsumerState{}
+	return out, convert(result, out)
+}

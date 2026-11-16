@@ -147,7 +147,7 @@ PYTHONPATH=sdk/python .venv/bin/python -m unittest discover -s sdk/python/tests 
 - links 是 HNSW 图边，**不是每个向量的精确 Top-K 最近邻表**。本次版本之前的图日志对象可能没有 links 字段；不能把缺失字段当成空邻接表。
 - kind=reset 表示 Leader 重建后的完整 IndexSnapshot，消费者必须加载并替换整个图及映射，再应用后续 delta；不能跨 reset 复用旧内部节点编号。
 - 若 data 游标已经低于清理水位，响应 `reset_required=true`、floor、checkpoint（若有），events 为空、next 保持原值。消费者必须从经校验的 checkpoint 恢复记录基线，再从快照 Offset 续读。没有可用快照时应停止并请求基线，不能直接把 after 改成 floor。分页 List 不提供一致性快照，不能作为无损补齐基线。
-- 当前订阅不注册保留租约，不会阻止既有 prune。图日志尚未 GC；消费者 ACK、保留策略和对象回收仍待开发。Worker 全部离线时，只要 Gateway、TiKV 与所需对象存储可用，已有日志仍可订阅。
+- 单独读取订阅页不注册保留租约，不会阻止 prune。需要保留承诺时，启用下述消费保留模式并先 acquire、处理后 ACK。Worker 全部离线时，只要 Gateway、TiKV 与所需对象存储可用，已有日志仍可订阅。
 
 Python：
 
@@ -169,3 +169,28 @@ page, err := client.ReadChanges(ctx, &vectorv1.ChangeRequest{
 ```
 
 需使用与现有 RPC 相同的 API_TOKEN 和 Gateway 角色。无效参数返回 InvalidArgument/HTTP 400；未启用图日志返回 Unimplemented/HTTP 501。`reset_required` 是正常协议状态，应显式处理。
+
+## 消费 ACK 与保留租约
+
+在 `CONSUMER_RETENTION=1` 的新 graph namespace 中，使用 `ManageConsumer` RPC 或 `POST /v1/consumers`。旧模式仍可无租约订阅，但此接口返回 Unimplemented/501。
+
+请求：partition、stream、consumer、session、epoch、ack、ttl_seconds、action。action 为 acquire / ack / release / list；list 是只读操作，只需 partition 和 stream。响应 leases 按消费者名称返回 session、epoch、ack、expires_ms，并返回当前 floor/head。租约时间使用 TiKV 时间，消费者应提前续租，不要等本机时间到期才续。
+
+```python
+import uuid
+session = uuid.uuid4().hex
+state = client.consumer('index-0000', stream='graph', action='acquire',
+                        consumer='analytics', session=session, ack=saved_sequence)
+lease = state.leases['analytics']
+# 拉取并校验图对象，在下游持久化本页全部效果之后，才推进 ACK。
+state = client.consumer('index-0000', stream='graph', action='ack',
+                        consumer='analytics', session=session,
+                        epoch=lease.epoch, ack=processed_sequence, ttl_seconds=60)
+# 处理耗时较长时，以原 ACK 续租，不提前确认尚未处理的数据。
+```
+
+Go Client 内嵌的 `ManageConsumer(ctx, *vectorv1.ConsumerRequest)` 提供同样接口。租约是保留承诺，不是 exactly-once 下游提交：消费者仍需幂等写入，并协调下游事务与自己的断点。ACK 是消费者对完成处理的声明，服务端不验证下游实际完成。
+
+有效租约不能被另一 session 抢占。冲突返回 Aborted/HTTP 409；过期、已释放或旧 epoch 返回 FailedPrecondition/409；从已清理位置 acquire 返回 FailedPrecondition/410；无效参数为 InvalidArgument/400。遇到过期应查询最新 floor，必要时恢复检查点，并使用新 session acquire。
+
+启用保留模式后，`Prune` / `POST /v1/log/prune` 同时执行数据日志清理、图日志清理与登记对象 sweep。原有返回值仍是数据日志 floor；图 floor 在 GetCluster 的 graph_heads 中查看，consumer_retention 表示是否开启。清理失败可能已完成某些分片或阶段，可检查状态后重新执行；操作有界且可继续推进。

@@ -40,3 +40,13 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(call.args[0].after, 9007199254740993)
             self.assertEqual(call.args[0].stream, 'graph')
             self.assertEqual(call.kwargs['metadata'], (('authorization','Bearer secret'),))
+
+    def test_consumer_epoch_and_ack(self):
+        with Client('localhost:1','secret') as client:
+            client.stub = Mock()
+            client.consumer('index-0000', stream='graph', action='ack', consumer='sink',
+                            session='session-123456789', epoch=7, ack=9007199254740993)
+            request = client.stub.ManageConsumer.call_args.args[0]
+            self.assertEqual(request.epoch, 7)
+            self.assertEqual(request.ack, 9007199254740993)
+            self.assertEqual(request.action, 'ack')

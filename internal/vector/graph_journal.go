@@ -18,6 +18,7 @@ type GraphPosition struct {
 	Hash       string `json:"hash"`
 }
 type GraphHead struct {
+	Floor              GraphPosition `json:"floor"`
 	Term               uint64        `json:"term"`
 	Leader             Ownership     `json:"leader"`
 	Committed          GraphPosition `json:"committed"`
@@ -58,7 +59,7 @@ func (j graphJournal) headIn(ctx context.Context, tx transactionAPI) (GraphHead,
 	if tikverr.IsErrNotFound(e) {
 		e = nil
 	}
-	if e == nil && (h.Visible.Sequence > h.Committed.Sequence || h.Committed.Sequence-h.Visible.Sequence > 1 || h.Visible.DataOffset > h.Committed.DataOffset) {
+	if e == nil && (h.Visible.Sequence > h.Committed.Sequence || h.Committed.Sequence-h.Visible.Sequence > 1 || h.Visible.DataOffset > h.Committed.DataOffset || h.Floor.Sequence > h.Visible.Sequence || h.Floor.Sequence > h.CheckpointPosition.Sequence) {
 		e = errors.New("invalid graph publication head")
 	}
 	return h, e
@@ -77,6 +78,13 @@ func (j graphJournal) Entry(ctx context.Context, seq uint64) (GraphEntry, error)
 		return GraphEntry{}, e
 	}
 	defer tx.Rollback()
+	h, e := j.headIn(ctx, tx)
+	if e != nil {
+		return GraphEntry{}, e
+	}
+	if seq <= h.Floor.Sequence {
+		return GraphEntry{}, ErrLogCompacted
+	}
 	var entry GraphEntry
 	e = readJSON(ctx, tx, j.key(fmt.Sprintf("entries/%020d", seq)), &entry)
 	if e == nil && (entry.Position.Sequence != seq || entry.Position.Hash != entryHash(entry)) {
@@ -136,6 +144,9 @@ func (j graphJournal) Commit(ctx context.Context, base GraphHead, offset uint64,
 	}
 	if h.Committed.Sequence == ^uint64(0) || offset < h.Committed.DataOffset || (kind != "delta" && kind != "reset") {
 		return entry, errors.New("invalid graph commit")
+	}
+	if e = j.adoptObject(ctx, tx, object); e != nil {
+		return entry, e
 	}
 	entry = GraphEntry{Term: h.Term, Previous: h.Committed, Position: GraphPosition{Sequence: h.Committed.Sequence + 1, DataOffset: offset}, Kind: kind, Object: object}
 	entry.Position.Hash = entryHash(entry)
@@ -230,6 +241,9 @@ func (j graphJournal) SaveCheckpoint(ctx context.Context, pos GraphPosition, m M
 	}
 	if h.Visible != pos {
 		return ErrConflict
+	}
+	if e = j.adoptObject(ctx, tx, m); e != nil {
+		return e
 	}
 	h.Checkpoint = &m
 	h.CheckpointPosition = pos

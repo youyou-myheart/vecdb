@@ -27,6 +27,7 @@ Credentials: API_TOKEN environment variable. cluster start also requires CLUSTER
 Endpoint: VECTOR_ENDPOINT or http://127.0.0.1:18202.
 Output: JSON on stdout; errors on stderr and nonzero exit. Global options precede COMMAND.
 
+  consumer acquire|ack|release|list --partition ID --stream data|graph [--consumer NAME --session ID --epoch N --ack N --ttl 60]
   changes --partition index-0000 --stream data|graph [--after 0 --limit 100]
   cluster status|nodes|partitions|leader|layout|health
   cluster tasks [--limit 50 --after CURSOR] | task ID | explain PARTITION | balance --dry-run
@@ -107,6 +108,30 @@ func run(args []string, stdout, stderr io.Writer) error {
 	var body any
 	field := ""
 	switch args[0] {
+	case "consumer":
+		if len(args) < 2 {
+			return errors.New("consumer action required")
+		}
+		action := args[1]
+		f := flags("consumer "+action, stderr)
+		part := f.String("partition", "", "partition")
+		stream := f.String("stream", "data", "data or graph")
+		name := f.String("consumer", "", "logical consumer")
+		session := f.String("session", "", "unique session, at least 16 bytes")
+		epoch := f.Uint64("epoch", 0, "lease epoch")
+		ack := f.Uint64("ack", 0, "last durably processed sequence")
+		ttl := f.Int("ttl", 60, "lease seconds")
+		if e := f.Parse(args[2:]); e != nil {
+			return e
+		}
+		if f.NArg() != 0 || *part == "" || (*stream != "data" && *stream != "graph") || (action != "list" && action != "acquire" && action != "ack" && action != "release") {
+			return errors.New("invalid consumer arguments")
+		}
+		if action != "list" && (*name == "" || len(*session) < 16 || *ttl < 10 || *ttl > 3600) {
+			return errors.New("consumer, session and TTL 10..3600 required")
+		}
+		method, path = "POST", "/v1/consumers"
+		body = map[string]any{"partition": *part, "stream": *stream, "consumer": *name, "session": *session, "epoch": *epoch, "ack": *ack, "ttl_seconds": *ttl, "action": action}
 	case "changes":
 		f := flags("changes", stderr)
 		part := f.String("partition", "", "index partition")

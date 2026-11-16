@@ -274,6 +274,16 @@ func (s *Service) Prune(ctx context.Context) (uint64, error) {
 	if !ok {
 		return 0, errors.New("incremental log unavailable")
 	}
-	return repo.PruneEvents(ctx, LogBatchSize)
+	floor, e := repo.PruneEvents(ctx, LogBatchSize)
+	if e != nil {
+		return floor, e
+	}
+	if g := s.graphReplica; g != nil && g.retention {
+		if _, e = g.journal.Prune(ctx, g.repo, LogBatchSize); e != nil {
+			return floor, e
+		}
+		e = g.journal.CollectObjects(ctx, g.repo, g.objects, 128)
+	}
+	return floor, e
 }
 func (s *Service) Cursor() uint64 { s.syncMu.Lock(); defer s.syncMu.Unlock(); return s.cursor }

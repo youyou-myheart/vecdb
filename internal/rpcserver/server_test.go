@@ -205,3 +205,27 @@ func TestChangesGRPC(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+
+func (*backend) ManageConsumer(_ context.Context, q vector.ConsumerRequest) (vector.ConsumerState, error) {
+	if q.Session == "expired" {
+		return vector.ConsumerState{}, vector.ErrFenced
+	}
+	return vector.ConsumerState{Head: 9007199254740993, Leases: map[string]vector.ConsumerLease{"sink": {Consumer: "sink", Session: q.Session, Epoch: 7, Ack: q.Ack, Expires: 12345}}}, nil
+}
+func TestConsumerGRPC(t *testing.T) {
+	c, e := sdk.Dial(context.Background(), serve(t, true), "rpc-unit-token-12345", sdk.Options{})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer c.Close()
+	out, e := c.ManageConsumer(context.Background(), &pb.ConsumerRequest{Partition: "index-0000", Stream: "graph", Action: "ack", Session: "session-123456789", Epoch: 7, Ack: 9007199254740993})
+	if e != nil || out.Leases["sink"].Ack != 9007199254740993 || out.Leases["sink"].Epoch != 7 {
+		t.Fatal(out, e)
+	}
+	if _, e = c.ManageConsumer(context.Background(), &pb.ConsumerRequest{Session: "expired"}); status.Code(e) != codes.FailedPrecondition {
+		t.Fatal(e)
+	}
+	if _, e = c.ManageConsumer(context.Background(), &pb.ConsumerRequest{TtlSeconds: 3601}); status.Code(e) != codes.InvalidArgument {
+		t.Fatal(e)
+	}
+}

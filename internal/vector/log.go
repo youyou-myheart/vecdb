@@ -176,6 +176,13 @@ func (r *Repository) PruneEvents(ctx context.Context, limit int) (uint64, error)
 			return floor, nil
 		}
 	}
+	end, e = r.retainConsumers(ctx, tx, "data", end)
+	if e != nil {
+		return floor, e
+	}
+	if end < floor {
+		return floor, errors.New("consumer retention below existing floor")
+	}
 	if end-floor > uint64(limit) {
 		end = floor + uint64(limit)
 	}

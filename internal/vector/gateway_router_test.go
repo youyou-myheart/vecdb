@@ -64,3 +64,40 @@ func TestReplicaRouteOrderAndMaintenanceNoRetry(t *testing.T) {
 		t.Fatalf("retry order %v", visited)
 	}
 }
+
+func TestGraphRouteWaitsForStableOwnership(t *testing.T) {
+	root, db := newFakeRepo()
+	db.nowMillis = 1000
+	coord := &Coordinator{root: root}
+	id := IndexPartitionID("index-0000")
+	raw, _ := json.Marshal(ReplicaPlan{Publisher: "r", Serving: []Assignment{{Partition: "r"}}})
+	db.data[string(coord.planKey(id))] = raw
+	raw, _ = json.Marshal(Ownership{Partition: "r", Node: "worker", Ready: true, Expires: 10000, URL: "http://worker"})
+	db.data[string(coord.ownerKey("r"))] = raw
+	calls := 0
+	alwaysFail := false
+	client := &http.Client{Transport: routeTransport(func(r *http.Request) (*http.Response, error) {
+		calls++
+		code := 200
+		body := "{}"
+		if alwaysFail || calls <= 2 {
+			code = 503
+			body = `{"code":"fenced"}`
+		}
+		return &http.Response{StatusCode: code, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+	p := &remotePartition{id: id, cluster: &ClusterService{graphReplication: true, root: root, coordinator: coord, replicas: 2, client: client}}
+	if _, e := p.replicaCall(context.Background(), "search", Search{}); e != nil || calls != 3 {
+		t.Fatal(calls, e)
+	}
+	alwaysFail = true
+	calls = 0
+	if _, e := p.replicaCall(context.Background(), "checkpoint", Search{}); e == nil || calls != 1 {
+		t.Fatal("maintenance retried", calls, e)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, e := p.replicaCall(ctx, "search", Search{}); !errors.Is(e, context.Canceled) {
+		t.Fatal(e)
+	}
+}

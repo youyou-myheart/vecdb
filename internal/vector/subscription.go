@@ -18,15 +18,16 @@ type ChangeRequest struct {
 	Limit     int              `json:"limit"`
 }
 type ChangePage struct {
-	Partition     IndexPartitionID `json:"partition"`
-	Stream        string           `json:"stream"`
-	Next          uint64           `json:"next"`
-	Head          uint64           `json:"head"`
-	Floor         uint64           `json:"floor"`
-	ResetRequired bool             `json:"reset_required"`
-	Data          []LogEvent       `json:"data"`
-	Graph         []GraphEntry     `json:"graph"`
-	Checkpoint    *Manifest        `json:"checkpoint,omitempty"`
+	Partition          IndexPartitionID `json:"partition"`
+	Stream             string           `json:"stream"`
+	Next               uint64           `json:"next"`
+	Head               uint64           `json:"head"`
+	Floor              uint64           `json:"floor"`
+	ResetRequired      bool             `json:"reset_required"`
+	Data               []LogEvent       `json:"data"`
+	Graph              []GraphEntry     `json:"graph"`
+	CheckpointPosition *GraphPosition   `json:"checkpoint_position,omitempty"`
+	Checkpoint         *Manifest        `json:"checkpoint,omitempty"`
 }
 
 func validateChangeRequest(q *ChangeRequest) error {
@@ -103,13 +104,33 @@ func (c *ClusterService) ReadChanges(ctx context.Context, q ChangeRequest) (Chan
 	}
 	// Capture one published head. A committed but unpublished entry is invisible.
 	out.Head = h.Visible.Sequence
+	out.Floor = h.Floor.Sequence
+	out.CheckpointPosition = &h.CheckpointPosition
 	out.Checkpoint = h.Checkpoint
+	if q.After < out.Floor {
+		out.ResetRequired = true
+		return out, nil
+	}
 	if q.After > out.Head {
 		return out, fmt.Errorf("%w: after exceeds published head", ErrInvalidSubscription)
 	}
 	for n := q.After; n < out.Head && len(out.Graph) < q.Limit; {
 		n++
 		entry, e := j.Entry(ctx, n)
+		if errors.Is(e, ErrLogCompacted) {
+			fresh, err := j.Head(ctx)
+			if err != nil {
+				return out, err
+			}
+			out.Graph = []GraphEntry{}
+			out.Next = q.After
+			out.ResetRequired = true
+			out.Floor = fresh.Floor.Sequence
+			out.Head = fresh.Visible.Sequence
+			out.Checkpoint = fresh.Checkpoint
+			out.CheckpointPosition = &fresh.CheckpointPosition
+			return out, nil
+		}
 		if e != nil {
 			return out, e
 		}

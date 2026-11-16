@@ -250,3 +250,14 @@ AC-58：`.venv/bin/python scripts/verify_hnsw_crash.py`，已加入普通一键�
 - AC114：HTTP 鉴权、RPC Gateway 角色限制、Go/Python SDK、vectorctl 断点及大于 2^53 的整数序号不丢精度。
 
 模块 UT：subscription_test.go、patch_links_test.go、subscription_handler_test.go，以及 RPC/CLI/Python SDK 测试。端到端：`.venv/bin/python scripts/verify_subscriptions.py`，依赖已构建的 .tools/vector-server/vectorctl、本地 PD/TiKV/SeaweedFS 和 Python gRPC/boto3。报告为 reports/subscriptions.json。
+
+## 消费保留与回收验收
+
+- AC115：有效 data/graph 消费租约阻止清理；ACK 单调且不越过 head；释放、过期、新 session/epoch 与旧会话隔离符合协议。
+- AC116：真实 TiKV 验证并发 acquire 与清理双向冲突，过期位置无法通过旧事务重新注册；对象采用与回收标记也产生事务冲突。
+- AC117：图日志由检查点覆盖后才能清理，S3 对象随清理被删除，检查点保留；无租约旧游标收到 reset_required 和 checkpoint_position。
+- AC118：落后副本跨图日志 floor 从快照恢复，继续追增量，并在 Leader 被 SIGKILL 后接管写服务。
+- AC119：上传失败留下登记意图；孤儿意图过期后回收；删除失败可重试；迟到 PUT 不能重新被采用，后续 sweep 再次删除。
+- AC120：启用保留模式的 32 分片七服务流水线覆盖 CRUD、迁移、主备切换、checkpoint/prune、重建和重启；读取类请求在路由切换时有界刷新，维护操作不自动重试。
+
+执行 `bash scripts/acceptance-retention.sh`。该脚本包含全量 Go race/真实 TiKV 集成、vet、七服务流水线、Python SDK 和真实 S3/进程故障验收。报告位于 reports/retention-*.log/json，测试子进程负责清理。仍未覆盖物理多主机掉电或 TiKV/SeaweedFS 自身高可用故障。

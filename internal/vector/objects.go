@@ -43,11 +43,19 @@ func (o *Objects) Save(ctx context.Context, namespace string, dimension int, rec
 	return o.saveBytes(ctx, namespace, dimension, "", data)
 }
 func (o *Objects) saveBytes(ctx context.Context, namespace string, dimension int, format string, data []byte) (Manifest, error) {
+	return o.saveTracked(ctx, namespace, dimension, format, data, nil)
+}
+func (o *Objects) saveTracked(ctx context.Context, namespace string, dimension int, format string, data []byte, before func(Manifest) error) (Manifest, error) {
 	if len(data) > 512<<20 {
 		return Manifest{}, errors.New("snapshot size outside prototype limit")
 	}
 	id := uuid.NewString()
 	m := Manifest{Generation: id, Key: namespace + "snapshots/" + id + ".json", SHA256: fmt.Sprintf("%x", sha256.Sum256(data)), Size: int64(len(data)), Dimension: dimension, Format: format}
+	if before != nil {
+		if err := before(m); err != nil {
+			return Manifest{}, err
+		}
+	}
 	if err := o.Client.Put(ctx, o.Bucket, m.Key, data); err != nil {
 		return Manifest{}, err
 	}
@@ -136,4 +144,17 @@ func (m minioBlobs) Put(ctx context.Context, b, k string, data []byte) error {
 }
 func (m minioBlobs) Get(ctx context.Context, b, k string) (io.ReadCloser, error) {
 	return m.client.GetObject(ctx, b, k, minio.GetObjectOptions{})
+}
+
+func (o *Objects) removeObject(ctx context.Context, key string) error {
+	d, ok := o.Client.(interface {
+		Delete(context.Context, string, string) error
+	})
+	if !ok {
+		return errors.New("object delete adapter unavailable")
+	}
+	return d.Delete(ctx, o.Bucket, key)
+}
+func (m minioBlobs) Delete(ctx context.Context, b, key string) error {
+	return m.client.RemoveObject(ctx, b, key, minio.RemoveObjectOptions{})
 }

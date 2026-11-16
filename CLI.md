@@ -178,3 +178,21 @@ INDEX_REPLICATION=graph .tools/vectorctl --socket .state/graph-control.sock clus
 ```
 
 每次命令读取一页，消费成功后使用 next 继续读取。空页不代表订阅结束，可以稍后从相同 next 轮询。data 流遇到 reset_required 必须恢复基线；graph 流返回带校验信息的 S3 对象引用，消费规则见 [RPC.md](RPC.md#按分片订阅变更)。
+
+## 消费保留与 GC
+
+所有角色启用 `INDEX_REPLICATION=graph`、`REPLICAS=2`、`CONSUMER_RETENTION=1`，且使用全新 namespace。已有 namespace 不支持在线切换此协议。
+
+```bash
+CONSUMER_RETENTION=1 INDEX_REPLICATION=graph .tools/vectorctl --socket .state/retention.sock cluster start --namespace retention-demo --replicas 2
+.tools/vectorctl consumer list --partition index-0000 --stream graph
+.tools/vectorctl consumer acquire --partition index-0000 --stream graph --consumer analytics --session session-unique-123456 --ack 0 --ttl 60
+# epoch 使用 acquire 返回的实际值；ACK 只确认已持久化处理的图序号。
+.tools/vectorctl consumer ack --partition index-0000 --stream graph --consumer analytics --session session-unique-123456 --epoch 1 --ack 10 --ttl 60
+.tools/vectorctl consumer release --partition index-0000 --stream graph --consumer analytics --session session-unique-123456 --epoch 1
+.tools/vectorctl cluster checkpoint
+.tools/vectorctl cluster prune
+.tools/vectorctl cluster status
+```
+
+每次 prune 有界执行，不是全库一次清空；有效消费者可能使 floor 暂停。没有后台定时 sweep，需要运维继续触发 prune。过期后必须生成新 session。数据流 ACK 是数据 offset，图流 ACK 是 graph sequence，两者不可互换。

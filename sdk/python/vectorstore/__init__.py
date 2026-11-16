@@ -95,3 +95,10 @@ class Client:
         """One bounded page. Persist next after processing; handle reset_required explicitly."""
         return self._call(self.stub.ReadChanges, messages.ChangeRequest(
             partition=partition, stream=stream, after=after, limit=limit), timeout)
+
+    def consumer(self, partition, *, stream='data', action='list', consumer='', session='',
+                 epoch=0, ack=0, ttl_seconds=60, timeout=None):
+        """Acquire/renew/ACK/release retention. Use a fresh session after expiry."""
+        return self._call(self.stub.ManageConsumer, messages.ConsumerRequest(
+            partition=partition, stream=stream, action=action, consumer=consumer,
+            session=session, epoch=epoch, ack=ack, ttl_seconds=ttl_seconds), timeout)

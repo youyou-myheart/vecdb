@@ -234,3 +234,10 @@ func TestSinglePartitionCompatibility(t *testing.T) {
 		t.Fatal(latest, e)
 	}
 }
+
+func (b *partitionBlobs) Delete(_ context.Context, bucket, key string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.values, key)
+	return nil
+}

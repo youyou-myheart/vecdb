@@ -21,9 +21,10 @@ import (
 
 // All seven service instances live in this test executable. TiKV/PD/S3 are
 // external dependencies; no vector-server or supervisor subprocess is created.
-func TestOneProcessPipeline(t *testing.T)      { oneProcessPipeline(t, false) }
-func TestGraphOneProcessPipeline(t *testing.T) { oneProcessPipeline(t, true) }
-func oneProcessPipeline(t *testing.T, graph bool) {
+func TestOneProcessPipeline(t *testing.T)          { oneProcessPipeline(t, false, false) }
+func TestGraphOneProcessPipeline(t *testing.T)     { oneProcessPipeline(t, true, false) }
+func TestRetentionOneProcessPipeline(t *testing.T) { oneProcessPipeline(t, true, true) }
+func oneProcessPipeline(t *testing.T, graph, retention bool) {
 	if os.Getenv("ONEBOX_ACCEPTANCE") != "1" {
 		t.Skip("set ONEBOX_ACCEPTANCE=1; requires TiKV/PD/SeaweedFS")
 	}
@@ -34,6 +35,9 @@ func oneProcessPipeline(t *testing.T, graph bool) {
 	if graph {
 		replication = "graph"
 		reportName = "graph-onebox-pipeline.json"
+	}
+	if retention {
+		reportName = "retention-onebox-pipeline.json"
 	}
 	started := time.Now()
 	lastStep := started
@@ -105,7 +109,7 @@ func oneProcessPipeline(t *testing.T, graph bool) {
 			t.Fatal(e)
 		}
 		url := "http://" + listener.Addr().String()
-		service, e := vector.OpenClusterService(ctx, repo, objects, 32, vector.ClusterConfig{IndexReplication: replication, NodeID: id, Roles: role, AdvertiseURL: url, Token: "onebox-pipeline-peer-token", LeaseTTL: 6 * time.Second, Replicas: 2, Scheduler: "load", BalanceCooldown: time.Second})
+		service, e := vector.OpenClusterService(ctx, repo, objects, 32, vector.ClusterConfig{ConsumerRetention: retention, IndexReplication: replication, NodeID: id, Roles: role, AdvertiseURL: url, Token: "onebox-pipeline-peer-token", LeaseTTL: 6 * time.Second, Replicas: 2, Scheduler: "load", BalanceCooldown: time.Second})
 		if e != nil {
 			listener.Close()
 			cancel()

@@ -34,6 +34,11 @@ class VectorStoreStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.ManageConsumer = channel.unary_unary(
+                '/vectorstore.v1.VectorStore/ManageConsumer',
+                request_serializer=vectorstore_dot_v1_dot_vector__pb2.ConsumerRequest.SerializeToString,
+                response_deserializer=vectorstore_dot_v1_dot_vector__pb2.ConsumerState.FromString,
+                _registered_method=True)
         self.ReadChanges = channel.unary_unary(
                 '/vectorstore.v1.VectorStore/ReadChanges',
                 request_serializer=vectorstore_dot_v1_dot_vector__pb2.ChangeRequest.SerializeToString,
@@ -98,6 +103,12 @@ class VectorStoreStub(object):
 
 class VectorStoreServicer(object):
     """Missing associated documentation comment in .proto file."""
+
+    def ManageConsumer(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def ReadChanges(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -174,6 +185,11 @@ class VectorStoreServicer(object):
 
 def add_VectorStoreServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'ManageConsumer': grpc.unary_unary_rpc_method_handler(
+                    servicer.ManageConsumer,
+                    request_deserializer=vectorstore_dot_v1_dot_vector__pb2.ConsumerRequest.FromString,
+                    response_serializer=vectorstore_dot_v1_dot_vector__pb2.ConsumerState.SerializeToString,
+            ),
             'ReadChanges': grpc.unary_unary_rpc_method_handler(
                     servicer.ReadChanges,
                     request_deserializer=vectorstore_dot_v1_dot_vector__pb2.ChangeRequest.FromString,
@@ -244,6 +260,33 @@ def add_VectorStoreServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class VectorStore(object):
     """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def ManageConsumer(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vectorstore.v1.VectorStore/ManageConsumer',
+            vectorstore_dot_v1_dot_vector__pb2.ConsumerRequest.SerializeToString,
+            vectorstore_dot_v1_dot_vector__pb2.ConsumerState.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def ReadChanges(request,

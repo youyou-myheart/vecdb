@@ -8,29 +8,31 @@ type ReplicaOwners struct {
 	Owners []Ownership `json:"owners"`
 }
 type ClusterStatus struct {
-	IndexReplication string                             `json:"index_replication"`
-	GraphHeads       map[IndexPartitionID]GraphHead     `json:"graph_heads,omitempty"`
-	GraphPositions   map[IndexPartitionID]GraphPosition `json:"graph_positions,omitempty"`
-	FailureDomain    string                             `json:"failure_domain"`
-	RoutingCooldown  map[string]int64                   `json:"routing_cooldown_until_ms,omitempty"`
-	LogHeads         map[IndexPartitionID]uint64        `json:"log_heads,omitempty"`
-	ReplicaLag       map[IndexPartitionID]uint64        `json:"replica_lag,omitempty"`
-	FullyReplicated  bool                               `json:"fully_replicated,omitempty"`
-	ReplicaPlans     map[IndexPartitionID]ReplicaPlan   `json:"replica_plans,omitempty"`
-	ReplicaOwners    map[IndexPartitionID]ReplicaOwners `json:"replica_owners,omitempty"`
-	Replicas         int                                `json:"replicas,omitempty"`
-	Leader           Ownership                          `json:"leader"`
-	MasterAvailable  bool                               `json:"master_available"`
-	Assignments      map[IndexPartitionID]Assignment    `json:"assignments"`
-	LocalPartitions  []IndexPartitionID                 `json:"local_partitions"`
-	Node             ClusterNode                        `json:"node"`
-	Nodes            []ClusterNode                      `json:"nodes"`
-	Owners           map[IndexPartitionID]Ownership     `json:"owners"`
-	Ready            bool                               `json:"ready"`
+	ConsumerRetention bool                               `json:"consumer_retention"`
+	IndexReplication  string                             `json:"index_replication"`
+	GraphHeads        map[IndexPartitionID]GraphHead     `json:"graph_heads,omitempty"`
+	GraphPositions    map[IndexPartitionID]GraphPosition `json:"graph_positions,omitempty"`
+	FailureDomain     string                             `json:"failure_domain"`
+	RoutingCooldown   map[string]int64                   `json:"routing_cooldown_until_ms,omitempty"`
+	LogHeads          map[IndexPartitionID]uint64        `json:"log_heads,omitempty"`
+	ReplicaLag        map[IndexPartitionID]uint64        `json:"replica_lag,omitempty"`
+	FullyReplicated   bool                               `json:"fully_replicated,omitempty"`
+	ReplicaPlans      map[IndexPartitionID]ReplicaPlan   `json:"replica_plans,omitempty"`
+	ReplicaOwners     map[IndexPartitionID]ReplicaOwners `json:"replica_owners,omitempty"`
+	Replicas          int                                `json:"replicas,omitempty"`
+	Leader            Ownership                          `json:"leader"`
+	MasterAvailable   bool                               `json:"master_available"`
+	Assignments       map[IndexPartitionID]Assignment    `json:"assignments"`
+	LocalPartitions   []IndexPartitionID                 `json:"local_partitions"`
+	Node              ClusterNode                        `json:"node"`
+	Nodes             []ClusterNode                      `json:"nodes"`
+	Owners            map[IndexPartitionID]Ownership     `json:"owners"`
+	Ready             bool                               `json:"ready"`
 }
 
 func (c *ClusterService) Status(ctx context.Context) (ClusterStatus, error) {
 	s := ClusterStatus{Assignments: map[IndexPartitionID]Assignment{}, LocalPartitions: []IndexPartitionID{}, Node: c.node, Owners: map[IndexPartitionID]Ownership{}, Ready: true}
+	s.ConsumerRetention = c.consumerRetention
 	s.IndexReplication = "independent"
 	if c.graphReplication {
 		s.IndexReplication = "graph"

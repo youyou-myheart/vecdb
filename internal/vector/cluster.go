@@ -15,6 +15,7 @@ import (
 )
 
 type ClusterConfig struct {
+	ConsumerRetention           bool
 	IndexReplication            string
 	HostID, Zone, FailureDomain string
 	MemoryBudgetBytes           uint64
@@ -27,6 +28,7 @@ type ClusterConfig struct {
 	Roles                       string
 }
 type ClusterService struct {
+	consumerRetention  bool
 	graphReplication   bool
 	routingMu          sync.Mutex
 	unhealthy          map[string]time.Time
@@ -130,8 +132,11 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 	if cfg.IndexReplication == "graph" && cfg.Replicas != 2 {
 		return nil, errors.New("graph replication requires two configured replicas")
 	}
+	if cfg.ConsumerRetention && cfg.IndexReplication != "graph" {
+		return nil, errors.New("consumer retention requires graph replication")
+	}
 	if cfg.IndexReplication == "graph" {
-		e = root.ensureGraphMode(ctx, cfg.Scheduler, cfg.FailureDomain)
+		e = root.ensureGraphProtocol(ctx, cfg.Scheduler, cfg.FailureDomain, cfg.ConsumerRetention)
 	} else if cfg.FailureDomain != "node" {
 		e = root.ensureTopologyMode(ctx, cfg.Scheduler, cfg.FailureDomain)
 	} else if cfg.Scheduler == "load" {
@@ -146,7 +151,7 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 		return nil, e
 	}
 	runCtx, cancel := context.WithCancel(ctx)
-	c := &ClusterService{graphReplication: cfg.IndexReplication == "graph", lastSample: time.Now(), replicas: cfg.Replicas, PartitionedService: &PartitionedService{layout: layout, router: IdentityPartitionRouter{layout}, data: map[DataPartitionID]*Repository{}, indexes: map[IndexPartitionID]PartitionIndex{}, dimension: root.Dimension}, coordinator: &Coordinator{failureDomain: cfg.FailureDomain, loadBalance: cfg.Scheduler == "load", balanceCooldown: cfg.BalanceCooldown, root: root, ttl: cfg.LeaseTTL.Milliseconds()}, node: node, objects: objects, token: cfg.Token, root: root, locals: map[IndexPartitionID]*localPartition{}, cancel: cancel, done: make(chan struct{}), client: &http.Client{Timeout: 30 * time.Second}}
+	c := &ClusterService{consumerRetention: cfg.ConsumerRetention, graphReplication: cfg.IndexReplication == "graph", lastSample: time.Now(), replicas: cfg.Replicas, PartitionedService: &PartitionedService{layout: layout, router: IdentityPartitionRouter{layout}, data: map[DataPartitionID]*Repository{}, indexes: map[IndexPartitionID]PartitionIndex{}, dimension: root.Dimension}, coordinator: &Coordinator{failureDomain: cfg.FailureDomain, loadBalance: cfg.Scheduler == "load", balanceCooldown: cfg.BalanceCooldown, root: root, ttl: cfg.LeaseTTL.Milliseconds()}, node: node, objects: objects, token: cfg.Token, root: root, locals: map[IndexPartitionID]*localPartition{}, cancel: cancel, done: make(chan struct{}), client: &http.Client{Timeout: 30 * time.Second}}
 	if hasRole(node, RoleMaster) {
 		c.master = &Master{replicas: cfg.Replicas, coordinator: c.coordinator, node: node, layout: layout}
 	}

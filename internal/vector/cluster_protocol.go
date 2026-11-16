@@ -101,6 +101,9 @@ func (r *Repository) ensureClusterMode(ctx context.Context, count int) error {
 // A distinct namespace protocol prevents independent rebuilders from corrupting
 // graph-replicated shards during a rolling start with incompatible binaries.
 func (r *Repository) ensureGraphMode(ctx context.Context, scheduler, domain string) error {
+	return r.ensureGraphProtocol(ctx, scheduler, domain, false)
+}
+func (r *Repository) ensureGraphProtocol(ctx context.Context, scheduler, domain string, retention bool) error {
 	tx, e := r.begin()
 	if e != nil {
 		return e
@@ -108,6 +111,9 @@ func (r *Repository) ensureGraphMode(ctx context.Context, scheduler, domain stri
 	defer tx.Rollback()
 	key := []byte(r.Prefix + "cluster-mode")
 	want := "v8-graph-async-" + scheduler + "-" + domain + "-2"
+	if retention {
+		want = "v9-graph-retention-" + scheduler + "-" + domain + "-2"
+	}
 	b, e := tx.Get(ctx, key)
 	if e == nil {
 		if string(b) != want {

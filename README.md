@@ -129,3 +129,5 @@ Python 验证 17 MiB 分段上传、Range、SHA-256、四路恢复；SQLite 清�
 扩展运行：`EXTENDED_ACCEPTANCE=1 bash scripts/acceptance.sh`，含有规律的主题簇、近重复、离群点、属性过滤及更新删除后的召回测试。结构化数据和调参结果见 INCREMENTAL.md；样本在 reports/structured-sample-10000.json。
 
 用例矩阵见 [ACCEPTANCE.md](ACCEPTANCE.md)。执行 `bash scripts/acceptance.sh`，本次总结果见 `reports/acceptance.status`。
+
+消费 ACK、保留租约和有界图日志/对象清理可用 `CONSUMER_RETENTION=1` 在新 graph namespace 中启用，见 [CLI.md](CLI.md#消费保留与-gc)。验收入口：`bash scripts/acceptance-retention.sh`。

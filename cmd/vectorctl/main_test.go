@@ -204,3 +204,27 @@ func TestChangeCursorCommand(t *testing.T) {
 		t.Fatal(out.String())
 	}
 }
+
+func TestConsumerCommand(t *testing.T) {
+	t.Setenv("API_TOKEN", "test-token")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var q struct {
+			Action  string `json:"action"`
+			Epoch   uint64 `json:"epoch"`
+			Ack     uint64 `json:"ack"`
+			Session string `json:"session"`
+		}
+		if e := json.NewDecoder(r.Body).Decode(&q); e != nil {
+			t.Error(e)
+		}
+		if r.Method != "POST" || r.URL.Path != "/v1/consumers" || q.Action != "ack" || q.Epoch != 3 || q.Ack != 9007199254740993 || q.Session != "session-123456789" {
+			t.Error(q, r.URL)
+		}
+		_, _ = w.Write([]byte(`{"head":9007199254740993}`))
+	}))
+	defer srv.Close()
+	var out bytes.Buffer
+	if e := run([]string{"--endpoint", srv.URL, "consumer", "ack", "--partition", "index-0000", "--stream", "graph", "--consumer", "sink", "--session", "session-123456789", "--epoch", "3", "--ack", "9007199254740993"}, &out, &out); e != nil {
+		t.Fatal(e)
+	}
+}

@@ -79,6 +79,9 @@ func (c *ClusterService) load(ctx context.Context, b PartitionBinding, entry *lo
 	var e error
 	if c.graphReplication {
 		service, e = newGraphService(ctx, &repo, c.objects, graphJournal{c.coordinator, b.Index, entry.owner})
+		if e == nil {
+			service.graphReplica.retention = c.consumerRetention
+		}
 	} else {
 		service, e = newServiceWithProgress(ctx, &repo, c.objects, func(offset uint64) {
 			restoreOffset = offset

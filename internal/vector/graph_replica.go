@@ -10,18 +10,21 @@ import (
 
 type graphBlobs interface {
 	GraphObjectAPI
+	saveTracked(context.Context, string, int, string, []byte, func(Manifest) error) (Manifest, error)
+	removeObject(context.Context, string) error
 	saveBytes(context.Context, string, int, string, []byte) (Manifest, error)
 	loadBytes(context.Context, Manifest) ([]byte, error)
 }
 type graphReplica struct {
-	viewMu   sync.RWMutex
-	journal  graphJournal
-	repo     *Repository
-	objects  graphBlobs
-	position GraphPosition
-	prepared GraphPosition
-	delta    *GraphDelta
-	reset    *IndexSnapshot
+	retention bool
+	viewMu    sync.RWMutex
+	journal   graphJournal
+	repo      *Repository
+	objects   graphBlobs
+	position  GraphPosition
+	prepared  GraphPosition
+	delta     *GraphDelta
+	reset     *IndexSnapshot
 }
 
 func newGraphService(ctx context.Context, r *Repository, o ObjectAPI, j graphJournal) (*Service, error) {
@@ -93,18 +96,30 @@ func (g *graphReplica) loadEntry(ctx context.Context, e GraphEntry) (*GraphDelta
 	err = json.Unmarshal(data, &delta)
 	return &delta, nil, err
 }
-func (g *graphReplica) apply(s *Service, d *GraphDelta, state *IndexSnapshot) error {
+
+// Decode and allocate a replacement graph while queries keep using the old
+// view. Only installation and position publication need the query-view lock.
+func (g *graphReplica) apply(s *Service, d *GraphDelta, state *IndexSnapshot, pos GraphPosition) error {
+	var fresh *HNSWIndex
+	var e error
 	if state != nil {
-		fresh, e := RestoreHNSW(*state)
+		fresh, e = RestoreHNSW(*state)
 		if e != nil {
 			return e
 		}
+	}
+	g.viewMu.Lock()
+	defer g.viewMu.Unlock()
+	if fresh != nil {
 		s.Index.mu.Lock()
 		s.Index.replaceGraphLocked(fresh)
 		s.Index.mu.Unlock()
-		return nil
+	} else if e = s.Index.ApplyDelta(*d, false); e != nil {
+		return e
 	}
-	return s.Index.ApplyDelta(*d, false)
+	g.position = pos
+	s.cursor = pos.DataOffset
+	return nil
 }
 func (g *graphReplica) catchUp(ctx context.Context, s *Service, target GraphPosition) error {
 	if g.position.Sequence > target.Sequence {
@@ -115,6 +130,13 @@ func (g *graphReplica) catchUp(ctx context.Context, s *Service, target GraphPosi
 			return e
 		}
 		entry, e := g.journal.Entry(ctx, g.position.Sequence+1)
+		if errors.Is(e, ErrLogCompacted) {
+			target, e = g.restoreCheckpoint(ctx, s)
+			if e != nil {
+				return e
+			}
+			continue
+		}
 		if e != nil {
 			return e
 		}
@@ -125,17 +147,23 @@ func (g *graphReplica) catchUp(ctx context.Context, s *Service, target GraphPosi
 		if g.prepared != entry.Position {
 			d, state, e = g.loadEntry(ctx, entry)
 			if e != nil {
+				head, err := g.journal.Head(ctx)
+				if err != nil {
+					return err
+				}
+				if g.position.Sequence < head.Floor.Sequence {
+					target, e = g.restoreCheckpoint(ctx, s)
+					if e != nil {
+						return e
+					}
+					continue
+				}
 				return e
 			}
 		}
-		g.viewMu.Lock()
-		if e = g.apply(s, d, state); e != nil {
-			g.viewMu.Unlock()
+		if e = g.apply(s, d, state, entry.Position); e != nil {
 			return e
 		}
-		g.position = entry.Position
-		s.cursor = g.position.DataOffset
-		g.viewMu.Unlock()
 		g.delta = nil
 		g.reset = nil
 		g.prepared = GraphPosition{}
@@ -230,7 +258,7 @@ func (g *graphReplica) sync(ctx context.Context, s *Service, rebuild bool) error
 			}
 			state.Offset = s.cursor
 			state.LogVersion = LogVersion
-			m, err := g.objects.SaveState(ctx, g.repo.Namespace(), state)
+			m, err := g.saveState(ctx, state)
 			if err != nil {
 				return err
 			}
@@ -261,7 +289,7 @@ func (g *graphReplica) sync(ctx context.Context, s *Service, rebuild bool) error
 			if err != nil {
 				return err
 			}
-			m, err := g.objects.saveBytes(ctx, g.repo.Namespace(), g.repo.Dimension, deltaFormat, data)
+			m, err := g.saveBlob(ctx, deltaFormat, data)
 			if err != nil {
 				return err
 			}
@@ -315,7 +343,7 @@ func (g *graphReplica) checkpoint(ctx context.Context, s *Service) (Manifest, er
 	state.Offset = s.cursor
 	state.GraphSequence = g.position.Sequence
 	state.GraphHash = g.position.Hash
-	m, e := g.objects.SaveState(ctx, g.repo.Namespace(), state)
+	m, e := g.saveState(ctx, state)
 	if e != nil {
 		return m, e
 	}
@@ -363,4 +391,45 @@ func (s *Service) syncGraphThrough(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (g *graphReplica) saveBlob(ctx context.Context, format string, data []byte) (Manifest, error) {
+	if !g.retention {
+		return g.objects.saveBytes(ctx, g.repo.Namespace(), g.repo.Dimension, format, data)
+	}
+	return g.objects.saveTracked(ctx, g.repo.Namespace(), g.repo.Dimension, format, data, func(m Manifest) error { return g.journal.stageObject(ctx, g.repo, m) })
+}
+func (g *graphReplica) saveState(ctx context.Context, state IndexSnapshot) (Manifest, error) {
+	data, e := json.Marshal(state)
+	if e != nil {
+		return Manifest{}, e
+	}
+	m, e := g.saveBlob(ctx, state.Format, data)
+	m.LogVersion = state.LogVersion
+	m.Offset = state.Offset
+	return m, e
+}
+
+func (g *graphReplica) restoreCheckpoint(ctx context.Context, s *Service) (GraphPosition, error) {
+	h, e := g.journal.Head(ctx)
+	if e != nil {
+		return GraphPosition{}, e
+	}
+	if h.Checkpoint == nil || h.CheckpointPosition.Sequence <= g.position.Sequence || h.CheckpointPosition.Sequence < h.Floor.Sequence {
+		return GraphPosition{}, errors.New("graph floor without recovery checkpoint")
+	}
+	state, e := g.objects.LoadState(ctx, *h.Checkpoint)
+	if e != nil {
+		return GraphPosition{}, e
+	}
+	if state.GraphSequence != h.CheckpointPosition.Sequence || state.GraphHash != h.CheckpointPosition.Hash || state.Offset != h.CheckpointPosition.DataOffset || len(state.GraphState) == 0 {
+		return GraphPosition{}, errors.New("recovery checkpoint position mismatch")
+	}
+	if e = g.apply(s, nil, &state, h.CheckpointPosition); e != nil {
+		return GraphPosition{}, e
+	}
+	g.delta = nil
+	g.reset = nil
+	g.prepared = GraphPosition{}
+	return h.Visible, nil
 }

@@ -612,3 +612,109 @@ func TestMigrationReportPlanConflictTiKV(t *testing.T) {
 		t.Fatal(current, e)
 	}
 }
+
+func TestConsumerAcquireCompactionConflictTiKV(t *testing.T) {
+	if os.Getenv("INTEGRATION") != "1" {
+		t.Skip("requires TiKV")
+	}
+	ctx := context.Background()
+	r, e := NewRepository([]string{"127.0.0.1:12379"}, "retention-conflict/"+uuid.NewString(), 2)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer r.Client.Close()
+	for n := 0; n < 3; n++ {
+		if _, e = r.Mutate(ctx, fmt.Sprint(n), Mutation{RequestID: fmt.Sprint(n), Vector: []float64{1, 2}}, false); e != nil {
+			t.Fatal(e)
+		}
+	}
+	service, e := NewService(ctx, r, partitionObjects())
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer service.Index.graph.Close()
+	if _, e = service.Checkpoint(ctx); e != nil {
+		t.Fatal(e)
+	}
+	layout, _ := newLayout(1)
+	p := &PartitionedService{layout: layout, data: map[DataPartitionID]*Repository{0: r}}
+	delayed, _ := r.begin()
+	defer delayed.Rollback()
+	if _, e = r.retainConsumers(ctx, delayed, "data", 3); e != nil {
+		t.Fatal(e)
+	}
+	q := ConsumerRequest{Partition: "index-0000", Stream: "data", Action: "acquire", Consumer: "reader", Session: uuid.NewString()}
+	state, e := p.manageConsumer(ctx, q, nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	_ = putJSON(delayed, []byte(r.Prefix+"log-floor"), uint64(3))
+	if e = delayed.Commit(ctx); e == nil {
+		t.Fatal("compaction ignored concurrent lease acquisition")
+	}
+	if floor, e := r.PruneEvents(ctx, 256); e != nil || floor != 0 {
+		t.Fatal(floor, e)
+	}
+	q.Action = "release"
+	q.Epoch = state.Leases["reader"].Epoch
+	if _, e = p.manageConsumer(ctx, q, nil); e != nil {
+		t.Fatal(e)
+	}
+	// Inverse race: the stale lease transaction must not resurrect a cursor which
+	// has already been removed by a committed prune.
+	acquire, _ := r.begin()
+	defer acquire.Rollback()
+	leases, e := r.consumersIn(ctx, acquire, "data")
+	if e != nil {
+		t.Fatal(e)
+	}
+	leases["late"] = ConsumerLease{Consumer: "late", Session: uuid.NewString(), Epoch: 1, Ack: 0, Expires: txnMillis(acquire) + 60000}
+	if e = putJSON(acquire, r.consumerKey("data"), leases); e != nil {
+		t.Fatal(e)
+	}
+	if floor, e := r.PruneEvents(ctx, 256); e != nil || floor != 3 {
+		t.Fatal(floor, e)
+	}
+	if e = acquire.Commit(ctx); e == nil {
+		t.Fatal("stale lease committed below compacted floor")
+	}
+}
+
+func TestObjectAdoptionGCConflictTiKV(t *testing.T) {
+	if os.Getenv("INTEGRATION") != "1" {
+		t.Skip("requires TiKV")
+	}
+	ctx := context.Background()
+	r, e := NewRepository([]string{"127.0.0.1:12379"}, "object-gc-conflict/"+uuid.NewString(), 2)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer r.Client.Close()
+	j := graphJournal{c: &Coordinator{root: r}, id: "index-0000"}
+	m := Manifest{Generation: uuid.NewString(), Key: r.Namespace() + "snapshots/object", SHA256: "digest", Size: 1}
+	tx, _ := r.begin()
+	o := trackedObject{Manifest: m, State: "staged", Expires: txnMillis(tx) + 3600000}
+	_ = putJSON(tx, j.objectKey(m), o)
+	if e = tx.Commit(ctx); e != nil {
+		t.Fatal(e)
+	}
+	adopt, _ := r.begin()
+	defer adopt.Rollback()
+	if e = j.adoptObject(ctx, adopt, m); e != nil {
+		t.Fatal(e)
+	}
+	gc, _ := r.begin()
+	o.State = "garbage"
+	_ = putJSON(gc, j.objectKey(m), o)
+	if e = gc.Commit(ctx); e != nil {
+		t.Fatal(e)
+	}
+	if e = adopt.Commit(ctx); e == nil {
+		t.Fatal("stale adoption resurrected GC tombstone")
+	}
+	fresh, _ := r.begin()
+	defer fresh.Rollback()
+	if e = j.adoptObject(ctx, fresh, m); !errors.Is(e, ErrFenced) {
+		t.Fatal(e)
+	}
+}

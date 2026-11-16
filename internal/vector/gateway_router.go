@@ -58,6 +58,9 @@ func (p *remotePartition) callOwnerThrough(ctx context.Context, op string, q Sea
 		return out, e
 	}
 	if response.StatusCode != 200 {
+		if out.Code == "fenced" {
+			return partitionReply{}, ErrFenced
+		}
 		if out.Code == "not_visible" {
 			return partitionReply{}, ErrNotVisible
 		}
@@ -94,6 +97,11 @@ func (p *remotePartition) Rebuild(ctx context.Context) error {
 func (p *remotePartition) MaybeRebuild(ctx context.Context) error { return nil }
 
 func (p *remotePartition) replicaCall(ctx context.Context, op string, q Search) (partitionReply, error) {
+	if p.cluster.graphReplication && (op == "search" || op == "sync") {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+	}
 	last := error(ErrPartitionUnavailable)
 	hot := p.cluster.hotReplicas()
 	var through uint64
@@ -104,11 +112,29 @@ func (p *remotePartition) replicaCall(ctx context.Context, op string, q Search) 
 			return partitionReply{}, e
 		}
 	}
-	// Refresh once if membership changed while an earlier route was in flight.
-	for round := 0; round < 2; round++ {
+	// Graph promotion and retirement can span more than two metadata snapshots.
+	// Retry only idempotent reads/synchronization, within a bounded routing window.
+	rounds := 2
+	if p.cluster.graphReplication && (op == "search" || op == "sync") {
+		rounds = 10
+	}
+	retryUntil := time.Now().Add(5 * time.Second)
+	for round := 0; round < rounds; round++ {
+		if round > 0 && p.cluster.graphReplication {
+			if time.Now().After(retryUntil) {
+				break
+			}
+			timer := time.NewTimer(time.Duration(min(round, 5)) * 100 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return partitionReply{}, ctx.Err()
+			case <-timer.C:
+			}
+		}
 		plan, e := p.cluster.coordinator.Plan(ctx, p.id)
 		if e != nil {
-			return partitionReply{}, fmt.Errorf("%w: %v", ErrPartitionUnavailable, e)
+			return partitionReply{}, fmt.Errorf("%w: %w", ErrPartitionUnavailable, e)
 		}
 		start := 0
 		if op == "search" && len(plan.Serving) > 1 {
