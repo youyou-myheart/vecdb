@@ -57,7 +57,7 @@ class LocalCluster:
         with urllib.request.urlopen(req, timeout=35) as response:
             return json.load(response)
 
-    def launch(self, role, slot):
+    def launch(self, role, slot, *, grpc_port=None):
         port = self.base_port + slot
         # Check before spawn; the server remains authoritative if another process races us.
         with socket.socket() as probe:
@@ -70,7 +70,7 @@ class LocalCluster:
         log = (self.directory / (node + '.log')).open('a')
         try:
             proc = subprocess.Popen([str(ROOT / '.tools/vector-server')], cwd=ROOT,
-                env=dict(self.env, GRPC_LISTEN_ADDR=(f'127.0.0.1:{self.grpc_port}' if role == 'gateway' and self.grpc_port else ''), NODE_ID=node, ROLES=role,
+                env=dict(self.env, GRPC_LISTEN_ADDR=(f'127.0.0.1:{grpc_port or self.grpc_port}' if role == 'gateway' and (grpc_port or self.grpc_port) else ''), NODE_ID=node, ROLES=role,
                          LISTEN_ADDR=f'127.0.0.1:{port}', ADVERTISE_URL=url),
                 stdout=log, stderr=log)
         finally:

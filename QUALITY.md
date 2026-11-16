@@ -33,6 +33,8 @@ bash scripts/acceptance-dispatch.sh
 
 ## 故障矩阵
 
+需要连 PD/TiKV/SeaweedFS 一起启动、暂停和强杀时，使用新增的 [整套进程 onebox 验收](ONEBOX_E2E.md)：`bash scripts/acceptance-onebox-e2e.sh`。它独立于默认 smoke，默认包含 10 分钟常稳、6 轮连续故障和原目录全栈冷恢复；以独立端口和数据目录运行。
+
 | 层级 | 场景 | 必须满足的结果 |
 |---|---|---|
 | Go UT | 完成位点不确定提交；失败事务；重复批次；源 epoch 失效；乱序/缺失/篡改事件；缓存丢失 | 不跳过日志、不错误推进进度、可重试恢复、图构造不重复 |
