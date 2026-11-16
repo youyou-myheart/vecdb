@@ -11,6 +11,7 @@ import (
 )
 
 type partitionRPC struct {
+	Delivery    *Delivery        `json:"delivery,omitempty"`
 	ReadThrough uint64           `json:"read_through,omitempty"`
 	Namespace   string           `json:"namespace"`
 	Partition   IndexPartitionID `json:"partition"`
@@ -40,7 +41,7 @@ func (c *ClusterService) InternalHandler() http.Handler {
 			return
 		}
 		var req partitionRPC
-		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
 		decoder.DisallowUnknownFields()
 		if e := decoder.Decode(&req); e != nil {
 			w.WriteHeader(400)
@@ -90,6 +91,11 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 	s := entry.service
 	var e error
 	switch req.Operation {
+	case "deliver":
+		if req.Delivery == nil || s.graphReplica == nil || s.graphReplica.input == nil {
+			return reply, ErrFenced
+		}
+		e = s.graphReplica.enqueue(ctx, *req.Delivery)
 	case "search":
 		started := time.Now()
 		defer func() { entry.queryNanos.Add(time.Since(started).Nanoseconds()) }()

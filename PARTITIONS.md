@@ -1,6 +1,8 @@
 # 两层分区第一版：Hash 数据分区 + 一一对应的索引分区
 
-本版把数据分区和索引分区建模为两个独立概念，暂时采用一一对应的索引放置策略。单进程模式仍支持全部分区同进程运行；新增多进程 Master/Gateway/Worker 模式见 [CLUSTER.md](CLUSTER.md)。向量聚类尚未实现；负载调度和在线索引副本迁移已经实现，见 [BALANCING.md](BALANCING.md) 和 [REPLICAS.md](REPLICAS.md)。当前架构、简化分区图与保留 DataPartition 的设计决策见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+本版把数据分区和索引分区建模为两个独立概念，暂时采用一一对应的索引放置策略。单进程模式仍支持全部分区同进程运行；新增多进程 Master/Gateway/Worker 模式见 [CLUSTER.md](CLUSTER.md)。动态簇拆分/合并尚未实现；负载调度和在线索引副本迁移已经实现，见 [BALANCING.md](BALANCING.md) 和 [REPLICAS.md](REPLICAS.md)。当前架构、简化分区图与保留 DataPartition 的设计决策见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+
+可选的非一一映射聚类模式已实现，见 [CLUSTER_ROUTING.md](CLUSTER_ROUTING.md)。本文描述默认 identity 布局；聚类模式的订阅分区标识、位点和数据快照协议不同。
 
 ## 路由与数据流
 

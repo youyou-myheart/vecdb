@@ -11,6 +11,7 @@ ANN_ACCEPTANCE=1 bash scripts/go.sh test -count=1 -run TestHNSWRecallAcceptance 
 INTEGRATION=1 bash scripts/go.sh test -count=1 -race -v ./... > reports/acceptance-go.log 2>&1
 bash scripts/acceptance-onebox.sh > reports/onebox-pipeline-summary.log 2>&1
 ONEBOX_ACCEPTANCE=1 bash scripts/go.sh test -count=1 -race -timeout=10m -run '^TestRetentionOneProcessPipeline$' -v ./cmd/vector-server > reports/retention-onebox-pipeline.log 2>&1
+ONEBOX_ACCEPTANCE=1 bash scripts/go.sh test -count=1 -race -timeout=10m -run '^TestClusteredOneProcessPipeline$' -v ./cmd/vector-server > reports/clustered-onebox-pipeline.log 2>&1
 bash scripts/go.sh build -o .tools/vector-server ./cmd/vector-server
 bash scripts/go.sh build -o .tools/vectorctl ./cmd/vectorctl
 python3 scripts/verify_api.py > reports/acceptance-http.log
@@ -27,6 +28,7 @@ PYTHONPATH=sdk/python .venv/bin/python -m unittest discover -s sdk/python/tests 
 .venv/bin/python scripts/verify_rpc.py > reports/rpc-http.log 2>&1
 .venv/bin/python scripts/verify_subscriptions.py > reports/subscriptions.log 2>&1
 .venv/bin/python scripts/verify_retention.py > reports/retention-processes.log 2>&1
+.venv/bin/python scripts/verify_dispatch.py > reports/dispatch-processes.log 2>&1
 .venv/bin/python scripts/verify_hnsw_crash.py > reports/hnsw-crash.log 2>&1
 .venv/bin/python -m unittest -v test_storage.py > reports/python-unit.log 2>&1
 .venv/bin/python verify.py > reports/acceptance-s3.log

@@ -107,7 +107,7 @@ func (p *PartitionedService) manageConsumer(ctx context.Context, q ConsumerReque
 	if e := validateConsumer(&q); e != nil {
 		return out, e
 	}
-	r, e := p.changeSource(ChangeRequest{Partition: q.Partition})
+	r, e := p.changeSource(ChangeRequest{Partition: q.Partition, Stream: q.Stream})
 	if e != nil {
 		return out, e
 	}

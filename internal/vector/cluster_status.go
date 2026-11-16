@@ -8,6 +8,8 @@ type ReplicaOwners struct {
 	Owners []Ownership `json:"owners"`
 }
 type ClusterStatus struct {
+	Routing           *ClusterRouting                    `json:"routing,omitempty"`
+	DataProgress      map[string]DataProgress            `json:"data_progress,omitempty"`
 	ConsumerRetention bool                               `json:"consumer_retention"`
 	IndexReplication  string                             `json:"index_replication"`
 	GraphHeads        map[IndexPartitionID]GraphHead     `json:"graph_heads,omitempty"`
@@ -32,6 +34,33 @@ type ClusterStatus struct {
 
 func (c *ClusterService) Status(ctx context.Context) (ClusterStatus, error) {
 	s := ClusterStatus{Assignments: map[IndexPartitionID]Assignment{}, LocalPartitions: []IndexPartitionID{}, Node: c.node, Owners: map[IndexPartitionID]Ownership{}, Ready: true}
+	if c.layout.Routing != nil {
+		s.Routing = c.layout.Routing
+		s.DataProgress = map[string]DataProgress{}
+		for d, r := range c.data {
+			tx, e := r.begin()
+			if e != nil {
+				return s, e
+			}
+			head, e := r.readCounter(ctx, tx, "log-head")
+			if e != nil {
+				_ = tx.Rollback()
+				return s, e
+			}
+			floor, e := r.readCounter(ctx, tx, "log-floor")
+			if e != nil {
+				_ = tx.Rollback()
+				return s, e
+			}
+			done, e := c.completedIn(ctx, tx, d)
+			_ = tx.Rollback()
+			if e != nil {
+				return s, e
+			}
+			owner, _ := c.coordinator.Resolve(ctx, sourceID(d))
+			s.DataProgress[string(sourceID(d))] = DataProgress{head, done, floor, owner}
+		}
+	}
 	s.ConsumerRetention = c.consumerRetention
 	s.IndexReplication = "independent"
 	if c.graphReplication {
@@ -139,4 +168,11 @@ func (c *ClusterService) Status(ctx context.Context) (ClusterStatus, error) {
 		s.Owners[b.Index] = o
 	}
 	return s, nil
+}
+
+type DataProgress struct {
+	Head      uint64    `json:"head"`
+	Completed uint64    `json:"completed_lsn"`
+	Floor     uint64    `json:"floor"`
+	Owner     Ownership `json:"owner"`
 }

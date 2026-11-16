@@ -35,6 +35,7 @@ type receipt struct {
 	Record Record `json:"record"`
 }
 type Repository struct {
+	DataSnapshots bool
 	Retain        func(context.Context, transactionAPI, uint64) (uint64, error)
 	Fence         func(context.Context, transactionAPI) error
 	ReceiptPrefix string
@@ -355,7 +356,7 @@ func (r *Repository) Publish(ctx context.Context, expected string, m Manifest) e
 		if err != nil {
 			return err
 		}
-		if m.LogVersion != LogVersion || m.Offset > head || m.Offset < floor || m.Format != graphFormat {
+		if m.LogVersion != LogVersion || m.Offset > head || m.Offset < floor || (m.Format != graphFormat && !(r.DataSnapshots && m.Format == "data-records-v1")) {
 			return errors.New("invalid checkpoint cursor")
 		}
 	}

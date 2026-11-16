@@ -168,6 +168,7 @@ func (s *Server) Health(context.Context, *pb.Empty) (*pb.HealthResponse, error) 
 // typed conversion without converting uint64 epochs/offsets through float64.
 func convert(value any, target proto.Message) error {
 	raw, e := json.Marshal(value)
+
 	if e == nil {
 		e = protojson.Unmarshal(raw, target)
 	}
@@ -178,7 +179,12 @@ func convert(value any, target proto.Message) error {
 }
 func (s *Server) GetLayout(context.Context, *pb.Empty) (*pb.Layout, error) {
 	out := &pb.Layout{}
-	return out, convert(s.backend.Layout(), out)
+	state := s.backend.Layout()
+	routing := state.Routing
+	state.Routing = nil
+	err := convert(state, out)
+	out.Routing = rpcRouting(routing)
+	return out, err
 }
 func (s *Server) GetCluster(ctx context.Context, _ *pb.Empty) (*pb.ClusterStatus, error) {
 	provider, ok := s.backend.(interface {
@@ -192,7 +198,11 @@ func (s *Server) GetCluster(ctx context.Context, _ *pb.Empty) (*pb.ClusterStatus
 		return nil, rpcError(e)
 	}
 	out := &pb.ClusterStatus{}
-	return out, convert(state, out)
+	routing := state.Routing
+	state.Routing = nil
+	err := convert(state, out)
+	out.Routing = rpcRouting(routing)
+	return out, err
 }
 func (s *Server) Checkpoint(ctx context.Context, _ *pb.Empty) (*pb.Manifest, error) {
 	m, e := s.backend.Checkpoint(ctx)
@@ -266,4 +276,15 @@ func (s *Server) ManageConsumer(ctx context.Context, r *pb.ConsumerRequest) (*pb
 	}
 	out := &pb.ConsumerState{}
 	return out, convert(result, out)
+}
+
+func rpcRouting(r *vector.ClusterRouting) *pb.ClusterRouting {
+	if r == nil {
+		return nil
+	}
+	out := &pb.ClusterRouting{Version: r.Version}
+	for _, v := range r.Centers {
+		out.Centers = append(out.Centers, &pb.Center{Vector: append([]float64(nil), v...)})
+	}
+	return out
 }

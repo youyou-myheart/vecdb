@@ -40,6 +40,9 @@ func validateChangeRequest(q *ChangeRequest) error {
 	return nil
 }
 func (p *PartitionedService) changeSource(q ChangeRequest) (*Repository, error) {
+	if p.layout.Routing != nil {
+		return p.clusteredSource(q)
+	}
 	for _, b := range p.layout.Bindings {
 		if b.Index == q.Partition {
 			repo := *p.data[b.Data]

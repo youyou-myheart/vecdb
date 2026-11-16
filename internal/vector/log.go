@@ -57,6 +57,9 @@ func (r *Repository) Bootstrap(ctx context.Context) ([]Record, uint64, error) {
 	return rows, head, e
 }
 func (r *Repository) ReadEvents(ctx context.Context, after, through uint64, limit int) (LogBatch, error) {
+	return r.readEvents(ctx, after, through, limit, 0)
+}
+func (r *Repository) readEvents(ctx context.Context, after, through uint64, limit, byteLimit int) (LogBatch, error) {
 	var out LogBatch
 	if limit < 1 || limit > LogBatchSize {
 		return out, errors.New("invalid log batch size")
@@ -102,6 +105,12 @@ func (r *Repository) ReadEvents(ctx context.Context, after, through uint64, limi
 		}
 		if !it.Valid() || string(it.Key()) != string(r.logKey(next)) {
 			return LogBatch{}, errors.New("log gap")
+		}
+		if byteLimit > 0 && bytes+len(it.Value()) > byteLimit {
+			if len(out.Events) == 0 {
+				return LogBatch{}, errors.New("event exceeds dispatch byte budget")
+			}
+			break
 		}
 		var event LogEvent
 		if e = json.Unmarshal(it.Value(), &event); e != nil {

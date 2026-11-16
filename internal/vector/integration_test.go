@@ -718,3 +718,87 @@ func TestObjectAdoptionGCConflictTiKV(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+
+type dispatchHookTx struct {
+	transactionAPI
+	beforeCommit func() error
+}
+
+func (t dispatchHookTx) Commit(ctx context.Context) error {
+	if e := t.beforeCommit(); e != nil {
+		return e
+	}
+	return t.transactionAPI.Commit(ctx)
+}
+
+func TestDispatchCommitSourceFenceTiKV(t *testing.T) {
+	if os.Getenv("INTEGRATION") != "1" {
+		t.Skip("requires TiKV")
+	}
+	ctx := context.Background()
+	r, e := NewRepository([]string{"127.0.0.1:12379"}, "dispatch-fence/"+uuid.NewString(), 2)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer r.Client.Close()
+	coord := &Coordinator{root: r, ttl: 60000}
+	node := ClusterNode{ID: "worker", Session: "s", URL: "http://localhost:1", Roles: []string{RoleWorker}}
+	if e = coord.Heartbeat(ctx, node); e != nil {
+		t.Fatal(e)
+	}
+	index := IndexPartitionID("index-0000")
+	replica := replicaID(index, node)
+	testAssignment(t, coord, node, replica)
+	testAssignment(t, coord, node, sourceID(0))
+	owner, e := coord.Acquire(ctx, replica, node)
+	if e != nil {
+		t.Fatal(e)
+	}
+	owner, e = coord.Update(ctx, owner, true, false)
+	if e != nil {
+		t.Fatal(e)
+	}
+	source, e := coord.Acquire(ctx, sourceID(0), node)
+	if e != nil {
+		t.Fatal(e)
+	}
+	source, e = coord.Update(ctx, source, true, false)
+	if e != nil {
+		t.Fatal(e)
+	}
+	tx, _ := r.begin()
+	if e = putJSON(tx, coord.planKey(index), ReplicaPlan{Publisher: replica}); e != nil {
+		t.Fatal(e)
+	}
+	if e = tx.Commit(ctx); e != nil {
+		t.Fatal(e)
+	}
+	l, _ := newLayout(1)
+	l.Routing = &ClusterRouting{Version: 1, Centers: [][]float64{{0, 0}}}
+	c := &ClusterService{root: r, coordinator: coord, PartitionedService: &PartitionedService{layout: l, router: IdentityPartitionRouter{l}, data: map[DataPartitionID]*Repository{0: r}, dimension: 2}}
+	j := graphJournal{coord, index, owner}
+	head, e := j.Claim(ctx)
+	if e != nil {
+		t.Fatal(e)
+	}
+	q := Delivery{Source: 0, Owner: source, RouteVersion: 1, Through: 1, Events: []LogEvent{{Sequence: 1, Record: Record{ID: "x", Revision: 1, Vector: []float64{0, 0}}}}}
+	base := *r
+	other := *coord
+	other.root = &base
+	r.beginTxn = func() (transactionAPI, error) {
+		tx, e := base.begin()
+		return dispatchHookTx{tx, func() error { _, e := other.Update(ctx, source, false, true); return e }}, e
+	}
+	_, e = j.commit(ctx, head, 1, "delta", Manifest{Generation: "object", Key: "object", SHA256: "checksum"}, &q, c)
+	r.beginTxn = nil
+	if e == nil {
+		t.Fatal("graph and source watermark committed after dispatcher was fenced")
+	}
+	h, e := j.Head(ctx)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if h.Committed.Sequence != 0 || h.Sources["0"] != 0 {
+		t.Fatal("partial source progress escaped", h)
+	}
+}

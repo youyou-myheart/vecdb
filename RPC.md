@@ -194,3 +194,7 @@ Go Client 内嵌的 `ManageConsumer(ctx, *vectorv1.ConsumerRequest)` 提供同�
 有效租约不能被另一 session 抢占。冲突返回 Aborted/HTTP 409；过期、已释放或旧 epoch 返回 FailedPrecondition/409；从已清理位置 acquire 返回 FailedPrecondition/410；无效参数为 InvalidArgument/400。遇到过期应查询最新 floor，必要时恢复检查点，并使用新 session acquire。
 
 启用保留模式后，`Prune` / `POST /v1/log/prune` 同时执行数据日志清理、图日志清理与登记对象 sweep。原有返回值仍是数据日志 floor；图 floor 在 GetCluster 的 graph_heads 中查看，consumer_retention 表示是否开启。清理失败可能已完成某些分片或阶段，可检查状态后重新执行；操作有界且可继续推进。
+
+## 聚类布局扩展
+
+Layout.routing 和 ClusterStatus.routing 描述固定中心，protobuf 为 ClusterRouting(version, centers)，每个 Center 包含 vector。聚类布局 Binding.data_partition 为 -1（字段类型扩展为 int32，原非负值编码不变），表示索引没有唯一数据绑定。ClusterStatus.data_progress 返回各 data-NNNN 的 head/completed_lsn/floor/owner，GraphHead.sources 的键为来源数据分区十进制编号。data 订阅和租约请求使用 data-NNNN，graph 使用 index-NNNN；两种 LSN 不可混用。数据 reset 快照为 data-records-v1 的 JSON Record 数组，完整协议见 [CLUSTER_ROUTING.md](CLUSTER_ROUTING.md)。Python/Go SDK 生成类型已更新。

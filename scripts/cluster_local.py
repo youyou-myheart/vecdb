@@ -122,7 +122,7 @@ class LocalCluster:
                 while True:
                     state = self.status()
                     plans = state.get('replica_plans', {})
-                    if state['ready'] and len(plans) == self.partitions and all(
+                    if state['ready'] and len(plans) == (len(state['routing']['centers']) if state.get('routing') else self.partitions) and all(
                             all(a['node'] != node for a in p['serving']) for p in plans.values()):
                         break
                     if time.monotonic() >= deadline:
@@ -150,7 +150,7 @@ class LocalCluster:
                 plans = last.get('replica_plans', {})
                 replicas = last.get('replica_owners', {})
                 if (self.workers and last['ready'] and last['master_available']
-                    and len(plans) == self.partitions
+                    and len(plans) == (len(last['routing']['centers']) if last.get('routing') else self.partitions)
                     and all(len(p['desired']) == min(self.replicas,len(self.workers))
                             and {a['partition'] for a in p['serving']} == {a['partition'] for a in p['desired']}
                             and all(a['node'] in self.workers for a in p['desired']) for p in plans.values())

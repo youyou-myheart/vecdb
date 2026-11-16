@@ -118,7 +118,13 @@ func (c *Coordinator) ScheduleReplicas(ctx context.Context, leader Ownership, la
 			if layout.DataPartitions > 1 {
 				data.Prefix = fmt.Sprintf("%sdata/%04d/", c.root.Prefix, b.Data)
 			}
-			next.Barrier, e = data.readCounter(ctx, tx, "log-head")
+			if layout.Routing != nil {
+				h, err := (graphJournal{c: c, id: b.Index}).headIn(ctx, tx)
+				e = err
+				next.Barrier = h.Committed.DataOffset
+			} else {
+				next.Barrier, e = data.readCounter(ctx, tx, "log-head")
+			}
 			if e != nil {
 				return e
 			}

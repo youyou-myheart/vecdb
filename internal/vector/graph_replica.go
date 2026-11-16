@@ -16,6 +16,7 @@ type graphBlobs interface {
 	loadBytes(context.Context, Manifest) ([]byte, error)
 }
 type graphReplica struct {
+	input     *routedInput
 	retention bool
 	viewMu    sync.RWMutex
 	journal   graphJournal
@@ -266,6 +267,10 @@ func (g *graphReplica) sync(ctx context.Context, s *Service, rebuild bool) error
 				return err
 			}
 			builtReset = true
+		} else if g.input != nil {
+			if e = g.commitRouted(ctx, s, head); e != nil {
+				return e
+			}
 		} else {
 			batch, err := g.repo.ReadEvents(ctx, head.Committed.DataOffset, 0, LogBatchSize)
 			if err != nil {
@@ -352,6 +357,9 @@ func (g *graphReplica) checkpoint(ctx context.Context, s *Service) (Manifest, er
 
 func (s *Service) searchGraphLocal(ctx context.Context, q Search) ([]Hit, GraphPosition, error) {
 	g := s.graphReplica
+	if g.input != nil {
+		return s.searchRouted(ctx, q)
+	}
 	if q.MinVisible != nil {
 		s.syncMu.Lock()
 		head, e := g.journal.Head(ctx)
@@ -372,6 +380,9 @@ func (s *Service) searchGraphLocal(ctx context.Context, q Search) ([]Hit, GraphP
 // syncGraphThrough preserves the explicit Sync contract: consume a finite data
 // head captured at entry. Background Sync remains bounded to one graph batch.
 func (s *Service) syncGraphThrough(ctx context.Context) error {
+	if s.graphReplica.input != nil {
+		return s.Sync(ctx)
+	}
 	tx, e := s.graphReplica.repo.begin()
 	if e != nil {
 		return e

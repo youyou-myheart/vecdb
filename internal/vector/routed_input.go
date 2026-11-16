@@ -1,0 +1,186 @@
+package vector
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync"
+)
+
+// One bounded in-flight batch per source. Only the graph leader drains it;
+// enqueue never waits for construction, object uploads or graph publication.
+type routedInput struct {
+	cluster     *ClusterService
+	mu          sync.Mutex
+	queue       map[DataPartitionID]*Delivery
+	bytes       int
+	lastSource  int
+	scrubCursor string
+}
+
+func (g *graphReplica) enqueue(ctx context.Context, q Delivery) error {
+	in := g.input
+	tx, e := g.repo.begin()
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	if e = g.journal.c.ReplicaFence(g.journal.id, g.journal.owner)(ctx, tx); e != nil {
+		return e
+	}
+	h, e := g.journal.headIn(ctx, tx)
+	if e != nil {
+		return e
+	}
+	if e = in.cluster.validateDelivery(ctx, tx, g.journal.id, q, h.Sources[fmt.Sprint(q.Source)]); e != nil {
+		return e
+	}
+	if q.Through <= h.Sources[fmt.Sprint(q.Source)] {
+		return nil
+	}
+	raw, e := json.Marshal(q)
+	if e != nil {
+		return e
+	}
+	if len(raw) > dispatchBytes+(64<<10) {
+		return errors.New("delivery exceeds byte budget")
+	}
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if old := in.queue[q.Source]; old != nil {
+		if sameOwner(old.Owner, q.Owner) && old.Previous == q.Previous && old.Through == q.Through {
+			return nil
+		}
+		return ErrConflict
+	}
+	if in.bytes+len(raw) > 4<<20 {
+		return errors.New("index input queue full")
+	}
+	// Queue ownership checks are repeated in the durable commit transaction.
+	in.queue[q.Source] = &q
+	in.bytes += len(raw)
+	return nil
+}
+func (in *routedInput) take() *Delivery {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	for n := 0; n < in.cluster.layout.DataPartitions; n++ {
+		d := DataPartitionID((in.lastSource + 1 + n) % in.cluster.layout.DataPartitions)
+		if q := in.queue[d]; q != nil {
+			delete(in.queue, d)
+			raw, _ := json.Marshal(q)
+			in.bytes -= len(raw)
+			in.lastSource = int(d)
+			return q
+		}
+	}
+	return nil
+}
+func (g *graphReplica) commitRouted(ctx context.Context, s *Service, h GraphHead) error {
+	q := g.input.take()
+	if q == nil {
+		return nil
+	}
+	tx, e := g.repo.begin()
+	if e != nil {
+		return e
+	}
+	e = g.input.cluster.validateDelivery(ctx, tx, g.journal.id, *q, h.Sources[fmt.Sprint(q.Source)])
+	_ = tx.Rollback()
+	if e != nil {
+		return e
+	}
+	if q.Through <= h.Sources[fmt.Sprint(q.Source)] {
+		return nil
+	}
+	records := make([]Record, 0, len(q.Events))
+	for _, event := range q.Events {
+		records = append(records, event.Record)
+	}
+	return g.commitRecords(ctx, s, h, records, q)
+}
+func (g *graphReplica) commitRecords(ctx context.Context, s *Service, h GraphHead, records []Record, q *Delivery) error {
+	// Multiple revisions of one ID in a single unpublished batch collapse to
+	// the last revision; native deltas contain one new active node per ID.
+	latest := map[string]int{}
+	for i, r := range records {
+		if n, ok := latest[r.ID]; !ok || r.Revision >= records[n].Revision {
+			latest[r.ID] = i
+		}
+	}
+	compact := make([]Record, 0, len(latest))
+	for i, r := range records {
+		if latest[r.ID] == i {
+			compact = append(compact, r)
+		}
+	}
+	delta, e := s.Index.GenerateDelta(compact)
+	if e != nil {
+		return e
+	}
+	raw, e := json.Marshal(delta)
+	if e != nil {
+		return e
+	}
+	m, e := g.saveBlob(ctx, deltaFormat, raw)
+	if e != nil {
+		return e
+	}
+	_, e = g.journal.commit(ctx, h, h.Committed.DataOffset+1, "delta", m, q, g.input.cluster)
+	return e
+}
+
+// Scan authoritative records in bounded pages. Only remove stale local versions
+// when the latest revision is deleted or belongs elsewhere. Changes are serialized
+// with ingestion and replicated as graph deltas, never edited on one replica only.
+func (g *graphReplica) scrub(ctx context.Context, s *Service) error {
+	c := g.input.cluster
+	h, e := g.journal.Head(ctx)
+	if e != nil {
+		return e
+	}
+	plan, e := g.journal.c.Plan(ctx, g.journal.id)
+	if e != nil {
+		return e
+	}
+	if plan.Publisher != g.journal.owner.Partition {
+		return nil
+	}
+	if e = g.sync(ctx, s, false); e != nil {
+		return e
+	}
+	h, e = g.journal.Head(ctx)
+	if e != nil {
+		return e
+	}
+	if h.Committed != h.Visible {
+		return nil
+	}
+	page, e := c.ListRecords(ctx, ListOptions{Limit: 128, Cursor: g.input.scrubCursor, IncludeDeleted: true})
+	if e != nil {
+		return e
+	}
+	var removes []Record
+	s.Index.mu.RLock()
+	for _, r := range page.Records {
+		old, ok := s.Index.records[r.ID]
+		if !ok || old.Deleted || old.Revision >= r.Revision {
+			continue
+		}
+		if r.Deleted || c.layout.Routing.target(r.Vector) != g.journal.id {
+			removes = append(removes, Record{ID: r.ID, Revision: r.Revision, Deleted: true})
+		}
+	}
+	s.Index.mu.RUnlock()
+	if len(removes) > 0 {
+		if e = g.commitRecords(ctx, s, h, removes, nil); e != nil {
+			return e
+		}
+		if e = g.sync(ctx, s, false); e != nil {
+			return e
+		}
+	}
+	g.input.scrubCursor = page.NextCursor
+	return nil
+}

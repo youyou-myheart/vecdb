@@ -48,6 +48,10 @@ func (c *ClusterService) routingHealth() map[string]int64 {
 	return out
 }
 func (c *ClusterService) partitionHead(ctx context.Context, id IndexPartitionID) (uint64, error) {
+	if c.layout.Routing != nil {
+		h, e := (graphJournal{c: c.coordinator, id: id}).Head(ctx)
+		return h.Committed.DataOffset, e
+	}
 	for _, b := range c.layout.Bindings {
 		if b.Index != id {
 			continue

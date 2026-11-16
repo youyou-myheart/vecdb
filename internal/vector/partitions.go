@@ -22,6 +22,7 @@ type PartitionBinding struct {
 	Index IndexPartitionID `json:"index_partition"`
 }
 type PartitionLayout struct {
+	Routing        *ClusterRouting    `json:"routing,omitempty"`
 	Version        int                `json:"version"`
 	Epoch          uint64             `json:"epoch"`
 	Hash           string             `json:"hash"`
@@ -181,6 +182,14 @@ func OpenPartitionedService(ctx context.Context, root *Repository, objects Objec
 func (p *PartitionedService) Layout() PartitionLayout {
 	l := p.layout
 	l.Bindings = append([]PartitionBinding(nil), l.Bindings...)
+	if l.Routing != nil {
+		r := *l.Routing
+		r.Centers = make([][]float64, len(l.Routing.Centers))
+		for i, v := range l.Routing.Centers {
+			r.Centers[i] = append([]float64(nil), v...)
+		}
+		l.Routing = &r
+	}
 	return l
 }
 func (p *PartitionedService) Get(ctx context.Context, id string) (Record, error) {
@@ -246,7 +255,14 @@ func (p *PartitionedService) SearchContext(ctx context.Context, q Search) ([]Hit
 	var visibilityIndex IndexPartitionID
 	if q.MinVisible != nil {
 		var e error
-		visibilityIndex, e = p.router.IndexForRecord(p.router.DataForID(q.MinVisible.ID), Record{ID: q.MinVisible.ID})
+		record := Record{ID: q.MinVisible.ID}
+		if p.layout.Routing != nil {
+			record, e = p.Get(ctx, q.MinVisible.ID)
+			if e != nil {
+				return nil, e
+			}
+		}
+		visibilityIndex, e = p.router.IndexForRecord(p.router.DataForID(q.MinVisible.ID), record)
 		if e != nil {
 			return nil, e
 		}

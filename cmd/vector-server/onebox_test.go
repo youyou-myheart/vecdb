@@ -24,7 +24,14 @@ import (
 func TestOneProcessPipeline(t *testing.T)          { oneProcessPipeline(t, false, false) }
 func TestGraphOneProcessPipeline(t *testing.T)     { oneProcessPipeline(t, true, false) }
 func TestRetentionOneProcessPipeline(t *testing.T) { oneProcessPipeline(t, true, true) }
-func oneProcessPipeline(t *testing.T, graph, retention bool) {
+func TestClusteredOneProcessPipeline(t *testing.T) { oneProcessPipeline(t, true, true, true) }
+func oneProcessPipeline(t *testing.T, graph, retention bool, clustered ...bool) {
+	var routing *vector.ClusterRouting
+	dataCount, indexCount := 32, 32
+	if len(clustered) > 0 && clustered[0] {
+		routing = &vector.ClusterRouting{Version: 1, Centers: [][]float64{{0, 0, 0}, {48, 0, 0}, {96, 0, 0}}}
+		dataCount, indexCount = 4, 3
+	}
 	if os.Getenv("ONEBOX_ACCEPTANCE") != "1" {
 		t.Skip("set ONEBOX_ACCEPTANCE=1; requires TiKV/PD/SeaweedFS")
 	}
@@ -38,6 +45,9 @@ func oneProcessPipeline(t *testing.T, graph, retention bool) {
 	}
 	if retention {
 		reportName = "retention-onebox-pipeline.json"
+	}
+	if routing != nil {
+		reportName = "clustered-onebox-pipeline.json"
 	}
 	started := time.Now()
 	lastStep := started
@@ -109,7 +119,7 @@ func oneProcessPipeline(t *testing.T, graph, retention bool) {
 			t.Fatal(e)
 		}
 		url := "http://" + listener.Addr().String()
-		service, e := vector.OpenClusterService(ctx, repo, objects, 32, vector.ClusterConfig{ConsumerRetention: retention, IndexReplication: replication, NodeID: id, Roles: role, AdvertiseURL: url, Token: "onebox-pipeline-peer-token", LeaseTTL: 6 * time.Second, Replicas: 2, Scheduler: "load", BalanceCooldown: time.Second})
+		service, e := vector.OpenClusterService(ctx, repo, objects, dataCount, vector.ClusterConfig{Routing: routing, ConsumerRetention: retention, IndexReplication: replication, NodeID: id, Roles: role, AdvertiseURL: url, Token: "onebox-pipeline-peer-token", LeaseTTL: 6 * time.Second, Replicas: 2, Scheduler: "load", BalanceCooldown: time.Second})
 		if e != nil {
 			listener.Close()
 			cancel()
@@ -207,7 +217,7 @@ func oneProcessPipeline(t *testing.T, graph, retention bool) {
 				return false
 			}
 		}
-		return len(s.ReplicaPlans) == 32
+		return len(s.ReplicaPlans) == indexCount
 	}
 	wait("seven instances ready", ready)
 	tasksComplete := func() bool {
@@ -227,7 +237,7 @@ func oneProcessPipeline(t *testing.T, graph, retention bool) {
 				return false
 			}
 		}
-		return len(state.ReplicaPlans) == 32
+		return len(state.ReplicaPlans) == indexCount
 	}
 	wait("initial migration tasks completed", tasksComplete)
 	var preview vector.BalancePreview
@@ -235,7 +245,7 @@ func oneProcessPipeline(t *testing.T, graph, retention bool) {
 	if err := json.Unmarshal(previewJSON, &preview); err != nil {
 		t.Fatal(err)
 	}
-	if len(preview.Partitions) != 32 {
+	if len(preview.Partitions) != indexCount {
 		t.Fatal(preview)
 	}
 	for _, ex := range preview.Partitions {
@@ -256,7 +266,7 @@ func oneProcessPipeline(t *testing.T, graph, retention bool) {
 			t.Fatal("non-worker loaded an index")
 		}
 	}
-	check("seven_instances_one_PID_roles_and_32_shards_ready")
+	check(fmt.Sprintf("seven_instances_one_PID_%d_data_%d_index_shards_ready", dataCount, indexCount))
 	expectedOffsets := map[vector.IndexPartitionID]uint64{}
 	shard := func(id string) vector.IndexPartitionID {
 		h := sha256.Sum256([]byte(id))
@@ -295,6 +305,25 @@ func oneProcessPipeline(t *testing.T, graph, retention bool) {
 	expectedOffsets[shard("item-000")]++
 	wait("all replicas consume fixture writes", func() bool {
 		state := status(g0)
+		if routing != nil {
+			for _, d := range state.DataProgress {
+				if d.Completed != d.Head {
+					return false
+				}
+			}
+			for id, h := range state.GraphHeads {
+				owners := state.ReplicaOwners[id].Owners
+				if len(owners) != 2 {
+					return false
+				}
+				for _, o := range owners {
+					if state.GraphPositions[o.Partition] != h.Visible || h.Visible != h.Committed {
+						return false
+					}
+				}
+			}
+			return true
+		}
 		for id, want := range expectedOffsets {
 			owners := state.ReplicaOwners[id].Owners
 			if len(owners) != 2 {

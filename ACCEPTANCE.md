@@ -261,3 +261,18 @@ AC-58：`.venv/bin/python scripts/verify_hnsw_crash.py`，已加入普通一键�
 - AC120：启用保留模式的 32 分片七服务流水线覆盖 CRUD、迁移、主备切换、checkpoint/prune、重建和重启；读取类请求在路由切换时有界刷新，维护操作不自动重试。
 
 执行 `bash scripts/acceptance-retention.sh`。该脚本包含全量 Go race/真实 TiKV 集成、vet、七服务流水线、Python SDK 和真实 S3/进程故障验收。报告位于 reports/retention-*.log/json，测试子进程负责清理。仍未覆盖物理多主机掉电或 TiKV/SeaweedFS 自身高可用故障。
+
+## 聚类路由与来源完成水位
+
+运行 `bash scripts/acceptance-dispatch.sh`；配置及报告见 [CLUSTER_ROUTING.md](CLUSTER_ROUTING.md)。
+
+| Case | 预期与覆盖 |
+|---|---|
+| AC-121 | 4 数据分区到 3 聚类索引，稳定选簇、平局规则、拒绝原地修改布局 |
+| AC-122 | 全部 Worker 暂停时原始写入仍返回，恢复后有界窗口追赶 |
+| AC-123 | 在途重复与已提交重投不重复构图；提交失败不推进来源水位 |
+| AC-124 | 空洞阻止连续前缀推进，无关目标不阻塞；来源重启跳过已提交窗口 |
+| AC-125 | 真实 TiKV 中来源租约撤销使在途图提交冲突，图与来源水位无部分成功 |
+| AC-126 | 跨簇更新、删除、旧位置清理、回迁新版本保护、主从图一致 |
+| AC-127 | data/graph 独立订阅和 ACK、独立数据快照、GC 后来源与索引接管 |
+| AC-128 | 七服务单进程覆盖双 Gateway、主备 Master、Worker 排空/重启及重建 |

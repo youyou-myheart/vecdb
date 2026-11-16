@@ -136,7 +136,23 @@ func (m *Master) Tick(ctx context.Context, nodes []ClusterNode) error {
 		return e
 	}
 	if m.replicas > 1 {
-		return m.coordinator.ScheduleReplicas(ctx, leader, m.layout, nodes, m.replicas)
+		if e = m.coordinator.ScheduleReplicas(ctx, leader, m.layout, nodes, m.replicas); e != nil {
+			return e
+		}
+		if m.layout.Routing != nil {
+			nodes, e = m.coordinator.Nodes(ctx)
+			if e != nil {
+				return e
+			}
+			eligible := []ClusterNode{}
+			for _, n := range nodes {
+				if !n.Draining {
+					eligible = append(eligible, n)
+				}
+			}
+			return m.coordinator.Schedule(ctx, leader, sourceLayout(m.layout.DataPartitions), eligible)
+		}
+		return nil
 	}
 	return m.coordinator.Schedule(ctx, leader, m.layout, nodes)
 }

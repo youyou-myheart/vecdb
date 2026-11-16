@@ -203,6 +203,14 @@ func (s *Service) Rebuild(ctx context.Context) error {
 	return s.Index.Rebuild(ctx)
 }
 func (s *Service) MaybeRebuild(ctx context.Context) error {
+	if g := s.graphReplica; g != nil && g.input != nil {
+		s.syncMu.Lock()
+		e := g.scrub(ctx, s)
+		s.syncMu.Unlock()
+		if e != nil {
+			return e
+		}
+	}
 	if s.graphReplica != nil {
 		p, e := s.graphReplica.journal.c.Plan(ctx, s.graphReplica.journal.id)
 		if e != nil {
@@ -274,7 +282,11 @@ func (s *Service) Prune(ctx context.Context) (uint64, error) {
 	if !ok {
 		return 0, errors.New("incremental log unavailable")
 	}
-	floor, e := repo.PruneEvents(ctx, LogBatchSize)
+	var floor uint64
+	var e error
+	if s.graphReplica == nil || s.graphReplica.input == nil {
+		floor, e = repo.PruneEvents(ctx, LogBatchSize)
+	}
 	if e != nil {
 		return floor, e
 	}

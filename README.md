@@ -22,6 +22,8 @@ onebox 默认分片数现为 32；负载放置调度使用 `--replicas 2 --sched
 
 支持可选异步图复制模式：`INDEX_REPLICATION=graph REPLICAS=2`。每分片单 Leader 构图，Follower 重放持久化的图变更，允许查询进度落后；详见 [设计](DESIGN.md#异步图复制index_replicationgraph) 和 [启动方式](CLI.md#异步-hnsw-图复制)。新增验收入口为 `bash scripts/acceptance-graph.sh`。
 
+支持可选 [聚类索引与数据分片异步投递](CLUSTER_ROUTING.md)：数据按 ID hash，索引按固定簇中心路由，数量可独立配置；来源周期汇总持久化进度，支持接管恢复。通过 `CLUSTER_ROUTING_FILE` 在新 namespace 启用，验收入口 `bash scripts/acceptance-dispatch.sh`。
+
 ## 启动基础组件
 
 实测 PD/TiKV 8.5.8、SeaweedFS 4.53，macOS ARM64。安装包和 Go 缓存在 `.tools/`，数据在 `.state/`。已有本次安装包时，在三个终端分别启动，已运行的组件不要重复启动：

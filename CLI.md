@@ -196,3 +196,7 @@ CONSUMER_RETENTION=1 INDEX_REPLICATION=graph .tools/vectorctl --socket .state/re
 ```
 
 每次 prune 有界执行，不是全库一次清空；有效消费者可能使 floor 暂停。没有后台定时 sweep，需要运维继续触发 prune。过期后必须生成新 session。数据流 ACK 是数据 offset，图流 ACK 是 graph sequence，两者不可互换。
+
+## 聚类索引与独立数据分区
+
+通过 `CLUSTER_ROUTING_FILE`、`INDEX_REPLICATION=graph` 和 `--replicas 2` 在新 namespace 启用。`--partitions` 是数据分区数，JSON centers 数量是索引分区数。配置、命令示例及水位含义见 [CLUSTER_ROUTING.md](CLUSTER_ROUTING.md)。data 订阅和 consumer 命令使用 `data-0000`，graph 使用 `index-0000`。`cluster status` 展示 data_progress 和 graph_heads.sources；进程故障不会改变路由版本。

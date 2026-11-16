@@ -18,13 +18,14 @@ type GraphPosition struct {
 	Hash       string `json:"hash"`
 }
 type GraphHead struct {
-	Floor              GraphPosition `json:"floor"`
-	Term               uint64        `json:"term"`
-	Leader             Ownership     `json:"leader"`
-	Committed          GraphPosition `json:"committed"`
-	Visible            GraphPosition `json:"visible"`
-	Checkpoint         *Manifest     `json:"checkpoint,omitempty"`
-	CheckpointPosition GraphPosition `json:"checkpoint_position"`
+	Sources            map[string]uint64 `json:"sources,omitempty"`
+	Floor              GraphPosition     `json:"floor"`
+	Term               uint64            `json:"term"`
+	Leader             Ownership         `json:"leader"`
+	Committed          GraphPosition     `json:"committed"`
+	Visible            GraphPosition     `json:"visible"`
+	Checkpoint         *Manifest         `json:"checkpoint,omitempty"`
+	CheckpointPosition GraphPosition     `json:"checkpoint_position"`
 }
 type GraphEntry struct {
 	Term     uint64        `json:"term"`
@@ -126,6 +127,9 @@ func (j graphJournal) Claim(ctx context.Context) (GraphHead, error) {
 	return h, tx.Commit(ctx)
 }
 func (j graphJournal) Commit(ctx context.Context, base GraphHead, offset uint64, kind string, object Manifest) (GraphEntry, error) {
+	return j.commit(ctx, base, offset, kind, object, nil, nil)
+}
+func (j graphJournal) commit(ctx context.Context, base GraphHead, offset uint64, kind string, object Manifest, input *Delivery, cluster *ClusterService) (GraphEntry, error) {
 	var entry GraphEntry
 	tx, e := j.c.root.begin()
 	if e != nil {
@@ -144,6 +148,18 @@ func (j graphJournal) Commit(ctx context.Context, base GraphHead, offset uint64,
 	}
 	if h.Committed.Sequence == ^uint64(0) || offset < h.Committed.DataOffset || (kind != "delta" && kind != "reset") {
 		return entry, errors.New("invalid graph commit")
+	}
+	if input != nil {
+		if e = cluster.validateDelivery(ctx, tx, j.id, *input, h.Sources[fmt.Sprint(input.Source)]); e != nil {
+			return entry, e
+		}
+		if input.Through <= h.Sources[fmt.Sprint(input.Source)] {
+			return entry, ErrConflict
+		}
+		if h.Sources == nil {
+			h.Sources = map[string]uint64{}
+		}
+		h.Sources[fmt.Sprint(input.Source)] = input.Through
 	}
 	if e = j.adoptObject(ctx, tx, object); e != nil {
 		return entry, e

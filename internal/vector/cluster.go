@@ -15,6 +15,7 @@ import (
 )
 
 type ClusterConfig struct {
+	Routing                     *ClusterRouting
 	ConsumerRetention           bool
 	IndexReplication            string
 	HostID, Zone, FailureDomain string
@@ -28,6 +29,9 @@ type ClusterConfig struct {
 	Roles                       string
 }
 type ClusterService struct {
+	dispatchMu         sync.Mutex
+	dispatchers        map[DataPartitionID]*dataDispatcher
+	dispatchDone       chan struct{}
 	consumerRetention  bool
 	graphReplication   bool
 	routingMu          sync.Mutex
@@ -122,7 +126,16 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 	if e := validateNode(node); e != nil {
 		return nil, e
 	}
-	layout, e := root.ensureLayout(ctx, count)
+	var layout PartitionLayout
+	var e error
+	if cfg.Routing != nil {
+		if cfg.IndexReplication != "graph" || cfg.Replicas != 2 {
+			return nil, errors.New("cluster routing requires graph replication and two replicas")
+		}
+		layout, e = root.ensureRoutedLayout(ctx, count, cfg.Routing, cfg.Scheduler, cfg.FailureDomain, cfg.ConsumerRetention)
+	} else {
+		layout, e = root.ensureLayout(ctx, count)
+	}
 	if e != nil {
 		return nil, e
 	}
@@ -135,7 +148,9 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 	if cfg.ConsumerRetention && cfg.IndexReplication != "graph" {
 		return nil, errors.New("consumer retention requires graph replication")
 	}
-	if cfg.IndexReplication == "graph" {
+	if cfg.Routing != nil {
+		// ensureRoutedLayout already admitted the isolated protocol.
+	} else if cfg.IndexReplication == "graph" {
 		e = root.ensureGraphProtocol(ctx, cfg.Scheduler, cfg.FailureDomain, cfg.ConsumerRetention)
 	} else if cfg.FailureDomain != "node" {
 		e = root.ensureTopologyMode(ctx, cfg.Scheduler, cfg.FailureDomain)
@@ -152,6 +167,11 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	c := &ClusterService{consumerRetention: cfg.ConsumerRetention, graphReplication: cfg.IndexReplication == "graph", lastSample: time.Now(), replicas: cfg.Replicas, PartitionedService: &PartitionedService{layout: layout, router: IdentityPartitionRouter{layout}, data: map[DataPartitionID]*Repository{}, indexes: map[IndexPartitionID]PartitionIndex{}, dimension: root.Dimension}, coordinator: &Coordinator{failureDomain: cfg.FailureDomain, loadBalance: cfg.Scheduler == "load", balanceCooldown: cfg.BalanceCooldown, root: root, ttl: cfg.LeaseTTL.Milliseconds()}, node: node, objects: objects, token: cfg.Token, root: root, locals: map[IndexPartitionID]*localPartition{}, cancel: cancel, done: make(chan struct{}), client: &http.Client{Timeout: 30 * time.Second}}
+	if cfg.Routing != nil {
+		c.router = clusterRouter{IdentityPartitionRouter{layout}, layout.Routing}
+		c.dispatchers = map[DataPartitionID]*dataDispatcher{}
+		c.dispatchDone = make(chan struct{})
+	}
 	if hasRole(node, RoleMaster) {
 		c.master = &Master{replicas: cfg.Replicas, coordinator: c.coordinator, node: node, layout: layout}
 	}
@@ -161,10 +181,18 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 	if hasRole(node, RoleGateway) {
 		c.gateway = &Gateway{c.PartitionedService}
 	}
-	for _, b := range layout.Bindings {
+	dataBindings := layout.Bindings
+	if cfg.Routing != nil {
+		dataBindings = sourceLayout(count).Bindings
+		for _, b := range layout.Bindings {
+			c.indexes[b.Index] = &remotePartition{cluster: c, id: b.Index}
+		}
+	}
+	for _, b := range dataBindings {
 		data := *root
 		data.ReceiptPrefix = root.Prefix
-		if count > 1 {
+		data.DataSnapshots = cfg.Routing != nil
+		if count > 1 || cfg.Routing != nil {
 			data.Prefix = fmt.Sprintf("%sdata/%04d/", root.Prefix, b.Data)
 			if e = data.ensureSchema(ctx); e != nil {
 				cancel()
@@ -172,11 +200,16 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 			}
 		}
 		c.data[b.Data] = &data
-		c.indexes[b.Index] = &remotePartition{cluster: c, id: b.Index}
+		if cfg.Routing == nil {
+			c.indexes[b.Index] = &remotePartition{cluster: c, id: b.Index}
+		}
 	}
 	if e = c.coordinator.Heartbeat(ctx, node); e != nil {
 		cancel()
 		return nil, e
+	}
+	if cfg.Routing != nil {
+		go c.dispatchLoop(runCtx)
 	}
 	go c.run(runCtx, cfg.LeaseTTL/3)
 	return c, nil
@@ -227,6 +260,9 @@ func (c *ClusterService) reconcile(ctx context.Context) {
 func (c *ClusterService) Close() {
 	c.cancel()
 	<-c.done
+	if c.dispatchDone != nil {
+		<-c.dispatchDone
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	for _, e := range c.entries() {

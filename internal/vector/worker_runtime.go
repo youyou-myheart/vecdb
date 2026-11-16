@@ -60,7 +60,12 @@ func (c *ClusterService) remove(entry *localPartition) {
 	}()
 }
 func (c *ClusterService) load(ctx context.Context, b PartitionBinding, entry *localPartition) {
-	repo := *c.data[b.Data]
+	var repo Repository
+	if c.layout.Routing != nil {
+		repo = *c.indexRepository(b.Index)
+	} else {
+		repo = *c.data[b.Data]
+	}
 	if c.layout.DataPartitions > 1 {
 		repo.IndexPrefix = fmt.Sprintf("%sindex/%s/", c.root.Prefix, b.Index)
 	}
@@ -81,6 +86,9 @@ func (c *ClusterService) load(ctx context.Context, b PartitionBinding, entry *lo
 		service, e = newGraphService(ctx, &repo, c.objects, graphJournal{c.coordinator, b.Index, entry.owner})
 		if e == nil {
 			service.graphReplica.retention = c.consumerRetention
+			if c.layout.Routing != nil {
+				service.graphReplica.input = &routedInput{cluster: c, queue: map[DataPartitionID]*Delivery{}}
+			}
 		}
 	} else {
 		service, e = newServiceWithProgress(ctx, &repo, c.objects, func(offset uint64) {
