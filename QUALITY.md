@@ -46,9 +46,12 @@ bash scripts/acceptance-dispatch.sh
 | 多进程 | 三轮 Master 与 Worker 同时 SIGKILL，其中一轮两个 Worker 同时故障；4 路并发写入、同 ID CAS 竞争、重试、跨簇更新/删除/恢复；每轮先快照/GC | 原始数据读写成功；恰好一个 CAS 成功、一个冲突；每轮恢复后完整 oracle；接管 epoch 增长；精确结果与 ANN recall 检查 |
 | 多进程旧模式 | 消费 lease pin/ACK/release、图对象 GC、落后副本快照恢复、GC 后 Leader 故障 | 不清理被租约保护的日志；reset 可恢复；图副本可继续构建 |
 | 观测 | 鉴权、指标格式与数值、位点、队列、错误/去重计数、故障积压及恢复收敛 | 故障不能显示为零积压的假健康；指标能被 Prometheus parser 读取；RPC uint64 不经 float64 |
+| 时延诊断 | Histogram 并发采样和失败归属、重投不重置队列年龄、清空后年龄归零、实时应用位点、TiKV 失败时局部指标仍可读 | UT 校验桶/计数/累计值及接口鉴权；onebox 记录停写后图提交、发布、内存应用、心跳上报和完成位点的时间线 |
 | 脚本自测 | 非零退出、超时、缺报告、旧成功报告、cleanup=false、依赖启动失败 | 所有失败都向上传播，不能误报 passed |
 
 七服务各实例通过真实 HTTP 通信；TiKV/S3 是外部服务。独立进程场景才使用 OS SIGSTOP/SIGKILL。数据按固定簇中心、渐变偏移、跨簇更新构造，不是纯随机向量。
+
+专项时延验收可运行 `bash scripts/acceptance-onebox-e2e.sh --latency-only --steady-seconds 600`。报告使用负载前后逐进程直方图差分，拒绝混入重启计数和缺失采样，详见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md)。
 
 ## CI 与边界
 

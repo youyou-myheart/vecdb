@@ -118,7 +118,12 @@ func newServiceWithProgress(ctx context.Context, r RepositoryAPI, o ObjectAPI, o
 
 // Each call consumes a finite head captured at its first batch; writers cannot starve it.
 func (s *Service) Sync(ctx context.Context) error {
+	wait := func(*error) {}
+	if s.graphReplica != nil {
+		wait = s.graphReplica.track("graph_sync_lock_wait")
+	}
 	s.syncMu.Lock()
+	wait(nil)
 	defer s.syncMu.Unlock()
 	if s.graphReplica != nil {
 		return s.graphReplica.sync(ctx, s, false)

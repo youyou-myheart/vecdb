@@ -7,6 +7,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type localPartition struct {
@@ -119,7 +120,9 @@ func (c *ClusterService) load(ctx context.Context, b PartitionBinding, entry *lo
 		c.remove(entry)
 	}
 }
-func (c *ClusterService) SyncOwned(ctx context.Context) error {
+func (c *ClusterService) SyncOwned(ctx context.Context) (err error) {
+	c.observations.pipeline.syncStarted(time.Now())
+	defer c.observations.pipeline.track("worker_sync", "")(&err)
 	for _, entry := range c.entries() {
 		if e := c.coordinator.Check(ctx, entry.owner); e != nil {
 			continue
@@ -207,7 +210,9 @@ func (c *ClusterService) replicaTick(ctx context.Context) {
 		} else if e == nil && ready {
 			_ = c.coordinator.ReportReplica(ctx, allowed[entry.owner.Partition].Index, versions[entry.owner.Partition], entry.owner, "Ready", "", offset)
 			if journal != nil {
-				_ = journal.Report(ctx, graphPos)
+				report := c.observations.pipeline.track("graph_progress_report", string(journal.id))
+				err := journal.Report(ctx, graphPos)
+				report(&err)
 			}
 		}
 	}

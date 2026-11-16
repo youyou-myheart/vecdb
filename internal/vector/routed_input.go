@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // One bounded in-flight batch per source. Only the graph leader drains it;
@@ -21,10 +22,23 @@ type routedInput struct {
 
 type queuedDelivery struct {
 	Delivery
-	bytes int
+	bytes    int
+	admitted time.Time
+}
+
+// Caller holds in.mu. Retries retain the original admission time.
+func (in *routedInput) oldestAge(now time.Time) time.Duration {
+	var oldest time.Duration
+	for _, q := range in.queue {
+		if !q.admitted.IsZero() && now.Sub(q.admitted) > oldest {
+			oldest = now.Sub(q.admitted)
+		}
+	}
+	return oldest
 }
 
 func (g *graphReplica) enqueue(ctx context.Context, q Delivery) (err error) {
+	defer g.track("index_admission")(&err)
 	in := g.input
 	defer func() {
 		if err != nil {
@@ -79,12 +93,12 @@ func (g *graphReplica) enqueue(ctx context.Context, q Delivery) (err error) {
 	}
 	q.Events = events
 	// Queue ownership checks are repeated in the durable commit transaction.
-	in.queue[q.Source] = &queuedDelivery{Delivery: q, bytes: len(raw)}
+	in.queue[q.Source] = &queuedDelivery{Delivery: q, bytes: len(raw), admitted: time.Now()}
 	in.bytes += len(raw)
 	in.cluster.observations.admissions.Add(1)
 	return nil
 }
-func (in *routedInput) take() *Delivery {
+func (in *routedInput) take() *queuedDelivery {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	for n := 0; n < in.cluster.layout.DataPartitions; n++ {
@@ -93,21 +107,31 @@ func (in *routedInput) take() *Delivery {
 			delete(in.queue, d)
 			in.bytes -= q.bytes
 			in.lastSource = int(d)
-			return &q.Delivery
+			return q
 		}
 	}
 	return nil
 }
-func (g *graphReplica) commitRouted(ctx context.Context, s *Service, h GraphHead) error {
+func (g *graphReplica) commitRouted(ctx context.Context, s *Service, h GraphHead) (err error) {
 	q := g.input.take()
 	if q == nil {
 		return nil
 	}
+	p := &g.input.cluster.observations.pipeline
+	partition := string(g.journal.id)
+	if !q.admitted.IsZero() {
+		p.observe("index_queue_wait", partition, time.Since(q.admitted), nil)
+	}
+	defer p.track("routed_commit", partition)(&err)
+	defer func() {
+		p.init()
+		p.batch.WithLabelValues(partition, metricOutcome(err)).Observe(float64(len(q.Events)))
+	}()
 	tx, e := g.repo.begin()
 	if e != nil {
 		return e
 	}
-	e = g.input.cluster.validateDelivery(ctx, tx, g.journal.id, *q, h.Sources[fmt.Sprint(q.Source)])
+	e = g.input.cluster.validateDelivery(ctx, tx, g.journal.id, q.Delivery, h.Sources[fmt.Sprint(q.Source)])
 	_ = tx.Rollback()
 	if e != nil {
 		return e
@@ -119,7 +143,7 @@ func (g *graphReplica) commitRouted(ctx context.Context, s *Service, h GraphHead
 	for _, event := range q.Events {
 		records = append(records, event.Record)
 	}
-	return g.commitRecords(ctx, s, h, records, q)
+	return g.commitRecords(ctx, s, h, records, &q.Delivery)
 }
 func (g *graphReplica) commitRecords(ctx context.Context, s *Service, h GraphHead, records []Record, q *Delivery) error {
 	// Multiple revisions of one ID in a single unpublished batch collapse to
@@ -136,11 +160,15 @@ func (g *graphReplica) commitRecords(ctx context.Context, s *Service, h GraphHea
 			compact = append(compact, r)
 		}
 	}
+	build := g.track("graph_build")
 	delta, e := s.Index.GenerateDelta(compact)
+	build(&e)
 	if e != nil {
 		return e
 	}
+	encode := g.track("graph_encode")
 	raw, e := json.Marshal(delta)
+	encode(&e)
 	if e != nil {
 		return e
 	}
@@ -148,7 +176,9 @@ func (g *graphReplica) commitRecords(ctx context.Context, s *Service, h GraphHea
 	if e != nil {
 		return e
 	}
+	commit := g.track("graph_commit")
 	_, e = g.journal.commit(ctx, h, h.Committed.DataOffset+1, "delta", m, q, g.input.cluster)
+	commit(&e)
 	return e
 }
 

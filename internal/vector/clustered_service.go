@@ -7,6 +7,12 @@ import (
 	"time"
 )
 
+func (c *ClusterService) Mutate(ctx context.Context, id string, m Mutation, deleted bool) (_ Record, err error) {
+	partition := c.router.DataForID(id)
+	defer c.observations.pipeline.track("data_mutate", string(sourceID(partition)))(&err)
+	return c.PartitionedService.Mutate(ctx, id, m, deleted)
+}
+
 func (c *ClusterService) Sync(ctx context.Context) error {
 	if c.layout.Routing == nil {
 		return c.PartitionedService.Sync(ctx)

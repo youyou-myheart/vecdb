@@ -75,7 +75,8 @@ func newGraphService(ctx context.Context, r *Repository, o ObjectAPI, j graphJou
 	success = true
 	return s, nil
 }
-func (g *graphReplica) loadEntry(ctx context.Context, e GraphEntry) (*GraphDelta, *IndexSnapshot, error) {
+func (g *graphReplica) loadEntry(ctx context.Context, e GraphEntry) (_ *GraphDelta, _ *IndexSnapshot, err error) {
+	defer g.track("graph_load")(&err)
 	if e.Kind == "reset" {
 		state, err := g.objects.LoadState(ctx, e.Object)
 		if err != nil {
@@ -100,7 +101,8 @@ func (g *graphReplica) loadEntry(ctx context.Context, e GraphEntry) (*GraphDelta
 
 // Decode and allocate a replacement graph while queries keep using the old
 // view. Only installation and position publication need the query-view lock.
-func (g *graphReplica) apply(s *Service, d *GraphDelta, state *IndexSnapshot, pos GraphPosition) error {
+func (g *graphReplica) apply(s *Service, d *GraphDelta, state *IndexSnapshot, pos GraphPosition) (err error) {
+	defer g.track("graph_apply")(&err)
 	var fresh *HNSWIndex
 	var e error
 	if state != nil {
@@ -122,7 +124,8 @@ func (g *graphReplica) apply(s *Service, d *GraphDelta, state *IndexSnapshot, po
 	s.cursor = pos.DataOffset
 	return nil
 }
-func (g *graphReplica) catchUp(ctx context.Context, s *Service, target GraphPosition) error {
+func (g *graphReplica) catchUp(ctx context.Context, s *Service, target GraphPosition) (err error) {
+	defer g.track("graph_catchup")(&err)
 	if g.position.Sequence > target.Sequence {
 		return ErrNotVisible
 	}
@@ -174,7 +177,8 @@ func (g *graphReplica) catchUp(ctx context.Context, s *Service, target GraphPosi
 	}
 	return nil
 }
-func (g *graphReplica) prepare(ctx context.Context, s *Service, head GraphHead) error {
+func (g *graphReplica) prepare(ctx context.Context, s *Service, head GraphHead) (err error) {
+	defer g.track("graph_prepare")(&err)
 	if head.Committed == head.Visible {
 		return nil
 	}
@@ -210,7 +214,8 @@ func (g *graphReplica) prepare(ctx context.Context, s *Service, head GraphHead) 
 
 // Called under Service.syncMu. A follower consumes graph entries only. A newly
 // elected leader completes a committed entry before touching the data journal.
-func (g *graphReplica) sync(ctx context.Context, s *Service, rebuild bool) error {
+func (g *graphReplica) sync(ctx context.Context, s *Service, rebuild bool) (err error) {
+	defer g.track("graph_sync")(&err)
 	head, e := g.journal.Head(ctx)
 	if e != nil {
 		return e
@@ -312,7 +317,10 @@ func (g *graphReplica) sync(ctx context.Context, s *Service, rebuild bool) error
 			return e
 		}
 		if leader {
-			if _, e = g.journal.Publish(ctx); e != nil {
+			publish := g.track("graph_publish")
+			_, e = g.journal.Publish(ctx)
+			publish(&e)
+			if e != nil {
 				return e
 			}
 		}
@@ -404,11 +412,15 @@ func (s *Service) syncGraphThrough(ctx context.Context) error {
 	return nil
 }
 
-func (g *graphReplica) saveBlob(ctx context.Context, format string, data []byte) (Manifest, error) {
+func (g *graphReplica) saveBlob(ctx context.Context, format string, data []byte) (_ Manifest, err error) {
+	defer g.track("graph_object_save")(&err)
 	if !g.retention {
 		return g.objects.saveBytes(ctx, g.repo.Namespace(), g.repo.Dimension, format, data)
 	}
-	return g.objects.saveTracked(ctx, g.repo.Namespace(), g.repo.Dimension, format, data, func(m Manifest) error { return g.journal.stageObject(ctx, g.repo, m) })
+	return g.objects.saveTracked(ctx, g.repo.Namespace(), g.repo.Dimension, format, data, func(m Manifest) (err error) {
+		defer g.track("graph_object_intent")(&err)
+		return g.journal.stageObject(ctx, g.repo, m)
+	})
 }
 func (g *graphReplica) saveState(ctx context.Context, state IndexSnapshot) (Manifest, error) {
 	data, e := json.Marshal(state)

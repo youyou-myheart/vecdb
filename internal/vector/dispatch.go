@@ -84,6 +84,7 @@ func (c *ClusterService) releaseDispatchers() {
 	}
 }
 func (c *ClusterService) dispatchTick(ctx context.Context) {
+	defer c.observations.pipeline.track("dispatch_tick", "")(nil)
 	c.dispatchMu.Lock()
 	defer c.dispatchMu.Unlock()
 	var wg sync.WaitGroup
@@ -127,6 +128,7 @@ func (c *ClusterService) dispatchTick(ctx context.Context) {
 }
 func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID, s *dataDispatcher) (err error) {
 	started := time.Now()
+	defer c.observations.pipeline.track("dispatch_source", string(sourceID(id)))(&err)
 	defer func() {
 		c.observations.dispatches.Add(1)
 		c.observations.dispatchNanos.Add(uint64(time.Since(started)))
@@ -155,7 +157,9 @@ func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID,
 		s.window = nil
 	}
 	if len(s.window) == 0 {
+		read := c.observations.pipeline.track("dispatch_read_log", string(sourceID(id)))
 		batch, err := c.data[id].readEvents(ctx, done, 0, dispatchBatchSize, dispatchBytes)
+		read(&err)
 		if err != nil {
 			return err
 		}
@@ -164,35 +168,13 @@ func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID,
 	if len(s.window) == 0 {
 		return nil
 	}
-	commits := map[IndexPartitionID]uint64{}
-	for _, b := range c.layout.Bindings {
-		h, err := (graphJournal{c: c.coordinator, id: b.Index}).Head(ctx)
-		if err != nil {
-			return err
-		}
-		commits[b.Index] = h.Sources[fmt.Sprint(id)]
+	commits, e := c.sourceCommits(ctx, id)
+	if e != nil {
+		return e
 	}
 	next := completedPrefix(s.window, done, c.eventTargets, commits)
 	if next > done {
-		tx, e = c.root.begin()
-		if e != nil {
-			return e
-		}
-		defer tx.Rollback()
-		if e = c.coordinator.Fence(s.owner)(ctx, tx); e != nil {
-			return e
-		}
-		old, err := c.completedIn(ctx, tx, id)
-		if err != nil {
-			return err
-		}
-		if old != done {
-			return ErrConflict
-		}
-		if e = putJSON(tx, completedKey(c.data[id]), next); e != nil {
-			return e
-		}
-		if e = tx.Commit(ctx); e != nil {
+		if e = c.advanceCompleted(ctx, id, s.owner, done, next); e != nil {
 			return e
 		}
 		clear(s.window[:int(next-done)])
@@ -232,7 +214,47 @@ func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID,
 	wg.Wait()
 	return errors.Join(errs...)
 }
+func (c *ClusterService) sourceCommits(ctx context.Context, id DataPartitionID) (_ map[IndexPartitionID]uint64, err error) {
+	defer c.observations.pipeline.track("dispatch_poll_commits", string(sourceID(id)))(&err)
+	commits := map[IndexPartitionID]uint64{}
+	for _, b := range c.layout.Bindings {
+		h, err := (graphJournal{c: c.coordinator, id: b.Index}).Head(ctx)
+		if err != nil {
+			return nil, err
+		}
+		commits[b.Index] = h.Sources[fmt.Sprint(id)]
+	}
+	return commits, nil
+}
+
+func (c *ClusterService) advanceCompleted(ctx context.Context, id DataPartitionID, owner Ownership, done, next uint64) (err error) {
+	defer c.observations.pipeline.track("dispatch_advance_completed", string(sourceID(id)))(&err)
+	tx, e := c.root.begin()
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	if e = c.coordinator.Fence(owner)(ctx, tx); e != nil {
+		return e
+	}
+	old, err := c.completedIn(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if old != done {
+		return ErrConflict
+	}
+	if e = putJSON(tx, completedKey(c.data[id]), next); e != nil {
+		return e
+	}
+	if e = tx.Commit(ctx); e != nil {
+		return e
+	}
+	return nil
+}
+
 func (c *ClusterService) deliver(ctx context.Context, id IndexPartitionID, q Delivery) (err error) {
+	defer c.observations.pipeline.track("dispatch_deliver", string(id))(&err)
 	defer func() {
 		c.observations.deliveries.Add(1)
 		if err != nil {

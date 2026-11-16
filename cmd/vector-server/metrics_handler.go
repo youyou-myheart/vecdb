@@ -18,7 +18,22 @@ func registerMetricsHandler(mux *http.ServeMux, service searchAPI) {
 			reply(w, 501, map[string]string{"error": "cluster metrics unavailable"})
 			return
 		}
-		body, err := provider.Metrics(r.Context())
+		var body string
+		var err error
+		switch r.URL.Query().Get("scope") {
+		case "":
+			body, err = provider.Metrics(r.Context())
+		case "local":
+			local, ok := service.(interface{ LocalMetrics() (string, error) })
+			if !ok {
+				w.WriteHeader(http.StatusNotImplemented)
+				return
+			}
+			body, err = local.LocalMetrics()
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 		if err != nil {
 			reply(w, 503, map[string]string{"error": err.Error()})
 			return

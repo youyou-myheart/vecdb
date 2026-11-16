@@ -6,6 +6,8 @@
 
 所有逻辑角色支持 `GET /metrics`，使用现有 API Token，输出 Prometheus text 0.0.4。单机非集群服务返回 501，状态读取失败返回 503；鉴权失败返回 401。指标不输出 token、向量 ID、向量内容或错误文本。
 
+时延诊断新增 `GET /metrics?scope=local`，只读进程内指标，不依赖 TiKV。阶段 Histogram、最老队列年龄、内存实时应用位点以及 10 分钟 onebox 追平时间线见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md)。各 Worker 必须单独采集，Gateway 不汇总 Worker 的进程内时延。
+
 ```bash
 curl -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:18202/metrics
 curl -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:18202/v1/cluster
@@ -37,7 +39,7 @@ curl -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:18202/v1/cluster
 
 表中省略重复前缀的列沿用同一前缀，例如 `vecdb_data_completed_lsn`、`vecdb_index_duplicates_total`。
 
-全局 gauge 从 TiKV 状态读取，可由 Gateway 暴露；local counter/queue 只反映被抓取进程，Worker 应全部抓取。counter 重启归零，使用 `rate`/`increase`，不要当成持久化事件数。多 Gateway 和 Worker 都会重复暴露全局 gauge，汇总时使用 `max by (data_partition)` 等去重，不能直接相加。每次 scrape 会访问 TiKV，建议先采用 15 秒间隔。
+全局 gauge 从 TiKV 状态读取，可由 Gateway 暴露；local counter/queue 只反映被抓取进程，Worker 应全部抓取。counter 重启归零，使用 `rate`/`increase`，不要当成持久化事件数。多 Gateway 和 Worker 都会重复暴露全局 gauge，汇总时使用 `max by (data_partition)` 等去重，不能直接相加。默认 `/metrics` 每次 scrape 会访问 TiKV，建议先采用 15 秒间隔；`scope=local` 不读取全局状态。
 
 Graph committed、visible 和 replica applied 是不同含义：Leader 可以在 Follower 尚未追上时发布；Data completed 也不承诺所有副本已应用。Source LSN 与图 sequence 不是同一计数空间。Prometheus 浮点样本不能精确表示大于 2^53 的整数，排障涉及精确位点时使用 HTTP/gRPC 状态。
 

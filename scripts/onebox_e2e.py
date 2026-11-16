@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 from cluster_local import LocalCluster, ControlServer, ROOT
 from quality import save
 from verify_dispatch import converged
+from pipeline_probe import collect, interval, drain_summary
 sys.path.insert(0, str(ROOT/'sdk/python'))
 from vectorstore import Client
 
@@ -194,7 +195,8 @@ class Onebox:
             commit=subprocess.check_output(['git','rev-parse','HEAD'], cwd=ROOT, text=True).strip(),
             dirty=bool(subprocess.check_output(['git','status','--porcelain'],cwd=ROOT)),
             topology=dict(pd=1,tikv=1,seaweed=1,master=2,gateway=2,worker=3,data_partitions=16,index_partitions=8,replicas=2,dimension=16),
-            requested_steady_seconds=args.steady_seconds, continuous_fault_rounds=args.rounds, cases=[])
+            requested_steady_seconds=args.steady_seconds, continuous_fault_rounds=args.rounds,
+            latency_only=args.latency_only, cases=[])
         base = args.base_port
         required = [base+i for i in (0,1,2,3,10,11,12,13,100,101,102,103,104,105,135,180,181,10010,10011,10012)]
         for port in required:
@@ -311,9 +313,34 @@ class Onebox:
         with self.failure_lock:
             if self.failures: raise AssertionError(self.failures)
 
+    def local_metrics(self):
+        endpoints = {node:self.c.urls[node] for slot,node in list(self.slots.items()) if slot in (2,35,3,4,5)}
+        return collect(endpoints, self.c.env['API_TOKEN'])
+
+    def drain(self):
+        started = time.monotonic(); rows = []
+        path = self.logs/(self.measurements.phase+'-drain.jsonl')
+        with path.open('w') as output:
+            while time.monotonic()-started < 180:
+                self.check_background()
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    status = pool.submit(self.state)
+                    local = self.local_metrics()
+                    state = status.result()
+                row = dict(elapsed_seconds=round(time.monotonic()-started,6),state=state,local=local)
+                rows.append(row); output.write(json.dumps(row)+'\n'); output.flush()
+                if converged(state,DATA_PARTITIONS,INDEX_PARTITIONS):
+                    summary = drain_summary(rows)
+                    # Missing local series must not silently claim full observability.
+                    if len(summary['first_observed_seconds']) == 5:
+                        save(self.logs/(self.measurements.phase+'-latency.json'),summary)
+                        return summary
+                time.sleep(.1)
+        raise TimeoutError('all source and replica positions converge')
+
     def sample(self):
         while not self.watch_stop.is_set():
-            row=dict(time=datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),phase=self.measurements.phase,processes=self.inventory())
+            row=dict(time=datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),phase=self.measurements.phase,processes=self.inventory(),local=self.local_metrics())
             pids=[str(p.pid) for p in list(self.c.children.values())+list(self.storage.current.values()) if p.poll() is None]
             if pids:
                 result=subprocess.run(['ps','-o','pid=,rss=,%cpu=','-p',','.join(pids)],capture_output=True,text=True)
@@ -370,7 +397,8 @@ class Onebox:
     def verify(self):
         assert not self.workers, 'full oracle requires quiescent writers'
         assert all(p['exit_code'] is None for p in self.inventory().values()), ('unexpected process exit',self.inventory())
-        elapsed=self.wait('all source and replica positions converge',self.caught)
+        drain = self.drain()
+        elapsed = drain['all_converged_seconds']
         expected=self.oracle.snapshot(); found={}; cursor=''
         save(self.logs/'oracle.json',expected)
         self.report['oracle_sha256']=hashlib.sha256(json.dumps(expected,sort_keys=True).encode()).hexdigest()
@@ -409,7 +437,7 @@ class Onebox:
         for id in sorted(expected)[::47]:
             method,body,token=self.oracle.receipts[id]
             assert self.request('/v1/records/'+id,method,body)['token']==token
-        return dict(catchup_seconds=elapsed,records=len(expected),live_records=len(active),
+        return dict(catchup_seconds=elapsed,latency=drain,records=len(expected),live_records=len(active),
             source_heads={id:d['head'] for id,d in self.report['last_cluster_status']['data_progress'].items()})
 
     @contextmanager
@@ -443,13 +471,24 @@ class Onebox:
             with ThreadPoolExecutor(max_workers=8) as pool: list(pool.map(lambda n:self.oracle.mutate(n,initial=True),range(RECORDS)))
             row.update(self.verify()); self.checkpoint()
         with self.case('steady_concurrent_read_write') as row:
+            baseline = self.local_metrics()
+            save(self.logs/'steady-metrics-before.json',baseline)
             started=time.monotonic(); self.start_workload()
             for offset in range(0,self.args.steady_seconds,30):
                 self.hold(min(30,self.args.steady_seconds-offset)); self.persist()
                 print(f"steady {min(offset+30,self.args.steady_seconds)}/{self.args.steady_seconds}s",flush=True)
             self.stop_workload(); row['load_seconds']=round(time.monotonic()-started,3); row.update(self.verify())
+            after = self.local_metrics()
+            save(self.logs/'steady-metrics-after.json',after)
+            row['pipeline_stages'] = interval(baseline,after)
+            assert row['pipeline_stages'].get('index_queue_wait/success',{}).get('count',0)>0
             summary=self.measurements.summary()['steady_concurrent_read_write']
             assert 'attempt_failure' not in summary, summary.get('attempt_failure')
+        if not self.args.latency_only:
+            self.run_faults()
+        self.finish()
+
+    def run_faults(self):
         with self.case('gateway_and_master_single_failures') as row:
             self.start_workload(); self.kill([2]); self.hold(3); self.launch(2)
             before=self.state()['leader']; slot=self.slot_for(before['node']); self.kill([slot])
@@ -509,6 +548,7 @@ class Onebox:
         with self.case('post_recovery_stable_load_and_final_oracle') as row:
             self.start_workload(); self.hold(self.args.recovery_seconds); self.stop_workload()
             row.update(self.verify()); self.checkpoint()
+    def finish(self):
         self.report.update(status='passed',finished_at=datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),processes=self.inventory(),
             endpoints=dict(http=self.urls,grpc=[f'127.0.0.1:{self.args.base_port+180}',f'127.0.0.1:{self.args.base_port+181}']),
             namespace=self.c.namespace,control_socket=str(self.control))
@@ -547,6 +587,7 @@ def main():
     parser.add_argument('--rounds',type=int,default=6)
     parser.add_argument('--base-port',type=int,default=25400)
     parser.add_argument('--keep-running',action='store_true')
+    parser.add_argument('--latency-only',action='store_true',help='run boot, seed, steady load and measured drain; skip fault cases')
     args=parser.parse_args()
     if args.steady_seconds<1 or args.recovery_seconds<1 or not 1<=args.rounds<=50 or not 1024<=args.base_port<=55000:
         parser.error('positive durations, rounds 1..50, base port 1024..55000 required')

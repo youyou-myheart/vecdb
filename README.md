@@ -28,6 +28,8 @@ onebox 默认分片数现为 32；负载放置调度使用 `--replicas 2 --sched
 
 需要拉起整套真实进程并做常稳、存储暂停、连续故障和全部进程冷恢复时，运行 `bash scripts/acceptance-onebox-e2e.sh`；加 `--keep-running` 可在验收通过后保留健康 onebox。拓扑、用例和运维命令见 [ONEBOX_E2E.md](ONEBOX_E2E.md)。
 
+写入后索引追平的耗时拆解、队列等待、构图/存储 IO 指标和 10 分钟复测入口见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md)。`/metrics?scope=local` 可在 TiKV 不可用时读取进程内诊断，需分别采集各 Worker。
+
 ## 启动基础组件
 
 实测 PD/TiKV 8.5.8、SeaweedFS 4.53，macOS ARM64。安装包和 Go 缓存在 `.tools/`，数据在 `.state/`。已有本次安装包时，在三个终端分别启动，已运行的组件不要重复启动：

@@ -17,6 +17,9 @@ bash scripts/acceptance-onebox-e2e.sh --keep-running
 
 # 调整持续时间和连续故障轮数；短运行只能作为编排预检。
 bash scripts/acceptance-onebox-e2e.sh --steady-seconds 1800 --rounds 12 --recovery-seconds 120
+
+# 仅常稳 + 时延定位，跳过故障矩阵；仍启动全部 10 个进程并执行完整业务核验。
+bash scripts/acceptance-onebox-e2e.sh --latency-only --steady-seconds 600 --keep-running
 ```
 
 默认端口范围由 `--base-port 25400` 决定：PD 25400、TiKV 25402、S3 25413；Gateway HTTP 25502/25535，gRPC 25580/25581。启动前检查全部监听端口，发现占用即失败，不抢占已有进程。旧运行产生的 TIME_WAIT 连接不算存活服务。
@@ -42,6 +45,8 @@ bash scripts/acceptance-onebox-e2e.sh --steady-seconds 1800 --rounds 12 --recove
 故障阶段允许明确的瞬时连接/超时/429/5xx 错误，逐次记录且有总重试期限；4xx 业务错误、错误数据、重复结果和未收敛都直接失败。每次写入只有收到 durable token 才推进测试 oracle；不确定结果使用原 request ID 重试。测试没有把请求失败悄悄算成成功。
 
 完整 oracle 在写线程退出后运行：校验全部记录（包括墓碑）的 ID、版本、向量、属性；两个 Gateway 的全量精确检索和排序无重复/遗漏；gRPC 属性过滤精确匹配，3 个稳定锚点 ANN recall@10 ≥ 0.9；重放写请求仍返回原 token。所有来源必须 completed=head，所有图必须 committed=visible，两份图副本的 GraphPosition 一致。每次最终验证还确认本次 10 个进程都存活。
+
+每次追平还记录约 100 ms 间隔的位点轨迹，区分图提交、发布、副本内存应用、心跳上报和 source completed；常稳阶段保存各进程的 Histogram 差分。指标口径、报告文件和误差说明见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md)。
 
 ## 报告与运维
 

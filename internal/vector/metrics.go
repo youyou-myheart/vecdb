@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // Counters are process-local and reset on restart; durable cursors/epochs below
 // survive ownership changes. Never label metrics with record IDs or error text.
 type clusterObservations struct {
+	pipeline                                                    pipelineMetrics
 	scrubScanned, scrubRemoved, staleCandidates, exactFallbacks atomic.Uint64
 	acquisitions, dispatches, dispatchErrors, dispatchNanos     atomic.Uint64
 	deliveries, deliveryErrors                                  atomic.Uint64
@@ -108,6 +110,23 @@ func (c *ClusterService) Metrics(ctx context.Context) (string, error) {
 		return "", err
 	}
 	m := clusterMetrics(s)
+	if err := c.localMetrics(m); err != nil {
+		return "", err
+	}
+	return m.String(), nil
+}
+
+// LocalMetrics remains available when TiKV is slow or unavailable. Scrape every
+// Worker for local pipeline costs; a Gateway does not construct graphs.
+func (c *ClusterService) LocalMetrics() (string, error) {
+	m := &metricText{}
+	if err := c.localMetrics(m); err != nil {
+		return "", err
+	}
+	return m.String(), nil
+}
+
+func (c *ClusterService) localMetrics(m *metricText) error {
 	o := &c.observations
 	for _, v := range []struct {
 		name, help string
@@ -132,15 +151,25 @@ func (c *ClusterService) Metrics(ctx context.Context) (string, error) {
 	for _, entry := range c.entries() {
 		entry.mu.RLock()
 		if service := entry.service; service != nil && service.graphReplica != nil && service.graphReplica.input != nil {
-			in := service.graphReplica.input
+			g := service.graphReplica
+			g.viewMu.RLock()
+			sequence := g.position.Sequence
+			g.viewMu.RUnlock()
+			m.add("vecdb_graph_local_applied_sequence", "gauge", "Actual local applied sequence without waiting for the heartbeat progress report.", fmt.Sprintf("{index_partition=%q,replica=%q}", g.journal.id, entry.owner.Partition), sequence)
+			in := g.input
 			in.mu.Lock()
 			batches, bytes := len(in.queue), in.bytes
+			oldest := in.oldestAge(time.Now())
 			in.mu.Unlock()
 			labels := fmt.Sprintf("{replica=%q}", entry.owner.Partition)
 			m.add("vecdb_index_queue_batches", "gauge", "Queued batches awaiting construction; excludes active batch.", labels, batches)
 			m.add("vecdb_index_queue_bytes", "gauge", "Encoded bytes in local queued batches.", labels, bytes)
+			m.add("vecdb_index_queue_oldest_seconds", "gauge", "Oldest locally admitted batch age; excludes active batch, resets on process restart.", labels, oldest.Seconds())
 		}
 		entry.mu.RUnlock()
 	}
-	return m.String(), nil
+	if err := o.pipeline.appendTo(m); err != nil {
+		return err
+	}
+	return nil
 }

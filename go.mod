@@ -5,6 +5,8 @@ go 1.22
 require (
 	github.com/google/uuid v1.6.0
 	github.com/minio/minio-go/v7 v7.0.83
+	github.com/prometheus/client_golang v1.14.0
+	github.com/prometheus/common v0.39.0
 	github.com/tikv/client-go/v2 v2.0.7
 )
 
@@ -35,9 +37,7 @@ require (
 	github.com/pingcap/kvproto v0.0.0-20230403051650-e166ae588106 // indirect
 	github.com/pingcap/log v1.1.1-0.20221110025148-ca232912c9f3 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/prometheus/client_golang v1.14.0 // indirect
 	github.com/prometheus/client_model v0.3.0 // indirect
-	github.com/prometheus/common v0.39.0 // indirect
 	github.com/prometheus/procfs v0.9.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20200410134404-eec4a21b6bb0 // indirect
 	github.com/rs/xid v1.6.0 // indirect
