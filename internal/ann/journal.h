@@ -36,7 +36,8 @@ inline void putimage(std::string&out,const Image&i){put(out,i.level);putstr(out,
 inline Image getimage(Reader&r){Image i;i.level=r.get<int32_t>();i.base=r.str();i.upper=r.str();return i;}
 inline std::string encode(const Patch&p){std::string out;put<uint32_t>(out,0x47504431);putmeta(out,p.before);putmeta(out,p.after);put<uint64_t>(out,p.changes.size());for(auto&c:p.changes){put(out,c.id);putimage(out,c.before);putimage(out,c.after);}return out;}
 inline Patch decode(const char*b,size_t n){Reader r{b,n};if(r.get<uint32_t>()!=0x47504431)throw std::runtime_error("graph patch format");Patch p;p.before=getmeta(r);p.after=getmeta(r);auto count=r.get<uint64_t>();if(count>r.left/44)throw std::runtime_error("graph patch count");for(uint64_t i=0;i<count;i++){Change c;c.id=r.get<uint32_t>();c.before=getimage(r);c.after=getimage(r);p.changes.push_back(std::move(c));}if(r.left)throw std::runtime_error("graph patch trailing bytes");return p;}
-inline void validateMeta(Graph&g,const Meta&m){if(m.stride!=g.size_data_per_element_||m.upper!=g.size_links_per_element_||m.capacity<m.count||m.capacity> (512u<<20)/m.stride||m.count>UINT32_MAX||m.level>64||m.level< -1||m.random.size()>4096)throw std::runtime_error("graph patch metadata");if((m.count==0&&(m.level!=-1||m.entry!=UINT32_MAX))||(m.count>0&&(m.level<0||m.entry>=m.count)))throw std::runtime_error("graph patch entry");std::istringstream in(m.random);std::default_random_engine a,b;if(!(in>>a>>b))throw std::runtime_error("graph patch random state");}
+// libstdc++ engine extraction disables skipws; consume the separator explicitly.
+inline void validateMeta(Graph&g,const Meta&m){if(m.stride!=g.size_data_per_element_||m.upper!=g.size_links_per_element_||m.capacity<m.count||m.capacity> (512u<<20)/m.stride||m.count>UINT32_MAX||m.level>64||m.level< -1||m.random.size()>4096)throw std::runtime_error("graph patch metadata");if((m.count==0&&(m.level!=-1||m.entry!=UINT32_MAX))||(m.count>0&&(m.level<0||m.entry>=m.count)))throw std::runtime_error("graph patch entry");std::istringstream in(m.random);std::default_random_engine a,b;if(!(in>>a>>std::ws>>b))throw std::runtime_error("graph patch random state");}
 inline void apply(Graph&g,const Patch&p,bool reverse){
  const Meta&from=reverse?p.after:p.before;const Meta&to=reverse?p.before:p.after;
  validateMeta(g,from);validateMeta(g,to);
@@ -71,7 +72,7 @@ inline void apply(Graph&g,const Patch&p,bool reverse){
  g.cur_element_count=to.count;
  if(to.capacity<g.max_elements_)g.resizeIndex(to.capacity);
  g.maxlevel_=to.level;g.enterpoint_node_=to.entry;
- std::istringstream in(to.random);in>>g.level_generator_>>g.update_probability_generator_;
+ std::istringstream in(to.random);in>>g.level_generator_>>std::ws>>g.update_probability_generator_;
 }
 inline Patch finish(Graph&g,Capture&c){Patch p;p.before=c.before;p.after=meta(g);for(uint32_t id=c.before.count;id<g.cur_element_count;id++)c.old.emplace(id,Image{});for(auto&entry:c.old)p.changes.push_back({entry.first,entry.second,image(g,entry.first)});return p;}
 }
