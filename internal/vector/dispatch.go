@@ -107,6 +107,7 @@ func (c *ClusterService) dispatchTick(ctx context.Context) {
 				continue
 			}
 			state = &dataDispatcher{owner: o}
+			c.observations.acquisitions.Add(1)
 			c.dispatchers[id] = state
 		}
 		o, e := c.coordinator.Update(ctx, state.owner, true, false)
@@ -124,7 +125,15 @@ func (c *ClusterService) dispatchTick(ctx context.Context) {
 	}
 	wg.Wait()
 }
-func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID, s *dataDispatcher) error {
+func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID, s *dataDispatcher) (err error) {
+	started := time.Now()
+	defer func() {
+		c.observations.dispatches.Add(1)
+		c.observations.dispatchNanos.Add(uint64(time.Since(started)))
+		if err != nil {
+			c.observations.dispatchErrors.Add(1)
+		}
+	}()
 	tx, e := c.root.begin()
 	if e != nil {
 		return e
@@ -135,6 +144,16 @@ func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID,
 		return e
 	}
 	s.completed = done
+	// Commit can succeed in TiKV even when its response is lost. Reconcile the
+	// cache on every tick, including after an uncertain completion transaction.
+	for len(s.window) > 0 && s.window[0].Sequence <= done {
+		s.window[0] = LogEvent{}
+		s.window = s.window[1:]
+	}
+	if len(s.window) > 0 && s.window[0].Sequence != done+1 {
+		// The durable log is authoritative; reconstruct a discontinuous cache.
+		s.window = nil
+	}
 	if len(s.window) == 0 {
 		batch, err := c.data[id].readEvents(ctx, done, 0, dispatchBatchSize, dispatchBytes)
 		if err != nil {
@@ -176,6 +195,7 @@ func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID,
 		if e = tx.Commit(ctx); e != nil {
 			return e
 		}
+		clear(s.window[:int(next-done)])
 		s.window = s.window[int(next-done):]
 		s.completed = next
 		done = next
@@ -212,7 +232,13 @@ func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID,
 	wg.Wait()
 	return errors.Join(errs...)
 }
-func (c *ClusterService) deliver(ctx context.Context, id IndexPartitionID, q Delivery) error {
+func (c *ClusterService) deliver(ctx context.Context, id IndexPartitionID, q Delivery) (err error) {
+	defer func() {
+		c.observations.deliveries.Add(1)
+		if err != nil {
+			c.observations.deliveryErrors.Add(1)
+		}
+	}()
 	plan, e := c.coordinator.Plan(ctx, id)
 	if e != nil {
 		return e
@@ -265,7 +291,7 @@ func (c *ClusterService) validateDelivery(ctx context.Context, tx transactionAPI
 			return errors.New("source coverage gap")
 		}
 	}
-	if len(q.Events) == 0 || len(q.Events) > dispatchBatchSize || q.Through != q.Events[len(q.Events)-1].Sequence {
+	if len(q.Events) == 0 || len(q.Events) > dispatchBatchSize || q.Through <= q.Previous || q.Through-q.Previous > dispatchBatchSize || q.Through != q.Events[len(q.Events)-1].Sequence {
 		return errors.New("invalid delivery bounds")
 	}
 	last := q.Previous
@@ -281,8 +307,34 @@ func (c *ClusterService) validateDelivery(ctx context.Context, tx transactionAPI
 		}
 		last = event.Sequence
 	}
-	// The authenticated source owns routing; transport retries cannot change its
-	// immutable route version. No new per-event routing records are persisted.
+	return nil
+}
+
+// Verify coverage once on admission, at the same TiKV snapshot as the graph
+// watermark. A strictly ordered subset alone does not prove that no event for
+// this index was omitted. The immutable routing version makes replay sufficient;
+// no per-event routing journal is needed. Commit rechecks ownership and cursors.
+func (c *ClusterService) validateDeliveryEvents(ctx context.Context, tx transactionAPI, id IndexPartitionID, q Delivery) error {
+	b, e := c.data[q.Source].readEventsIn(ctx, tx, q.Previous, q.Through, dispatchBatchSize, dispatchBytes)
+	if e != nil {
+		return e
+	}
+	if len(b.Events) == 0 || b.Events[len(b.Events)-1].Sequence != q.Through {
+		return errors.New("delivery exceeds durable source range")
+	}
+	n := 0
+	for _, event := range b.Events {
+		if !event.Record.Deleted && c.layout.Routing.target(event.Record.Vector) != id {
+			continue
+		}
+		if n >= len(q.Events) || q.Events[n].Sequence != event.Sequence || !sameRecord(q.Events[n].Record, event.Record) {
+			return errors.New("delivery does not cover durable source events")
+		}
+		n++
+	}
+	if n != len(q.Events) {
+		return errors.New("delivery includes unexpected events")
+	}
 	return nil
 }
 

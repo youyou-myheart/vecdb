@@ -56,7 +56,8 @@ func TestConsumerRetentionAndEpochs(t *testing.T) {
 	}
 	request.Action = "ack"
 	request.Ack = 2
-	if _, e = c.ManageConsumer(f.ctx, request); e != nil {
+	renewed, e := c.ManageConsumer(f.ctx, request)
+	if e != nil {
 		t.Fatal(e)
 	}
 	if floor, e := a.Prune(f.ctx); e != nil || floor != 2 {
@@ -76,7 +77,9 @@ func TestConsumerRetentionAndEpochs(t *testing.T) {
 		t.Fatal("live consumer stolen", e)
 	}
 	// Advance authoritative fake TSO beyond both leases, but not Worker leases.
-	f.db.nowMillis = lease.Leases["sink"].Expires + 1
+	// ACK renews the lease. Expiring the original acquire deadline is racy when
+	// more than a millisecond elapsed before ACK; use its latest durable expiry.
+	f.db.nowMillis = renewed.Leases["sink"].Expires + 1
 	request.Ack = 2
 	current, e := c.ManageConsumer(f.ctx, request)
 	if e != nil {

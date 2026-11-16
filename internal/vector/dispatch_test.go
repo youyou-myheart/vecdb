@@ -38,7 +38,7 @@ func routedFixture(t *testing.T) (*graphFixture, *ClusterService, Ownership) {
 		t.Fatal(e)
 	}
 	for _, s := range f.services {
-		s.graphReplica.input = &routedInput{cluster: c, queue: map[DataPartitionID]*Delivery{}}
+		s.graphReplica.input = &routedInput{cluster: c, queue: map[DataPartitionID]*queuedDelivery{}}
 	}
 	return f, c, owner
 }
@@ -211,7 +211,7 @@ func TestRoutedGapEpochAndQueueLoss(t *testing.T) {
 	if e := g.enqueue(f.ctx, q); e != nil {
 		t.Fatal(e)
 	}
-	g.input.queue = map[DataPartitionID]*Delivery{}
+	g.input.queue = map[DataPartitionID]*queuedDelivery{}
 	g.input.bytes = 0 // lost memory before commit
 	if e := g.enqueue(f.ctx, q); e != nil {
 		t.Fatal(e)
@@ -276,6 +276,9 @@ func TestRoutedCleanupAndReturnToCluster(t *testing.T) {
 	if a.Index.records[r.ID].Deleted || a.Index.records[r.ID].Revision != 3 {
 		t.Fatal("cleanup deleted returned revision")
 	}
+	if c.observations.scrubScanned.Load() != 2 || c.observations.scrubRemoved.Load() != 1 {
+		t.Fatal("cleanup observation counts incorrect")
+	}
 	if e = b.Sync(f.ctx); e != nil {
 		t.Fatal(e)
 	}
@@ -309,5 +312,112 @@ func TestDispatchRecoverySkipsCommittedWindow(t *testing.T) {
 	head, _ := a.graphReplica.journal.Head(f.ctx)
 	if head.Committed.Sequence != 1 {
 		t.Fatal("recovery rebuilt committed events")
+	}
+}
+
+func TestDispatchRecoversUncertainCompletedCommit(t *testing.T) {
+	f, c, o := routedFixture(t)
+	a := f.services[0]
+	f.write(t, "first", false)
+	q := deliveryFor(t, f, o, 0)
+	if e := a.graphReplica.enqueue(f.ctx, q); e != nil {
+		t.Fatal(e)
+	}
+	if e := a.Sync(f.ctx); e != nil {
+		t.Fatal(e)
+	}
+	state := &dataDispatcher{owner: o}
+	f.db.commitErr, f.db.committedDespiteError = injected, true
+	if e := c.dispatchSource(f.ctx, 0, state); !errors.Is(e, injected) {
+		t.Fatal(e)
+	}
+	f.db.commitErr, f.db.committedDespiteError = nil, false
+	// TiKV committed, but the dispatcher's in-memory window is still stale.
+	// Further writes must progress without restarting this process.
+	f.write(t, "second", false)
+	if e := a.graphReplica.enqueue(f.ctx, deliveryFor(t, f, o, 1)); e != nil {
+		t.Fatal(e)
+	}
+	if e := a.Sync(f.ctx); e != nil {
+		t.Fatal(e)
+	}
+	if e := c.dispatchSource(f.ctx, 0, state); e != nil {
+		t.Fatal(e)
+	}
+	if state.completed != 2 || len(state.window) != 0 {
+		t.Fatalf("dispatcher stuck after uncertain commit: completed=%d window=%v", state.completed, state.window)
+	}
+}
+
+func TestRoutedRejectsIncompleteOrChangedDelivery(t *testing.T) {
+	for _, kind := range []string{"omitted", "changed", "invented"} {
+		t.Run(kind, func(t *testing.T) {
+			f, _, o := routedFixture(t)
+			f.write(t, "first", false)
+			f.write(t, "second", false)
+			q := deliveryFor(t, f, o, 0)
+			switch kind {
+			case "omitted":
+				q.Events = q.Events[1:]
+			case "changed":
+				q.Events[0].Record.Vector[0] += 10
+			case "invented":
+				q.Through++
+				q.Events = append(q.Events, LogEvent{Sequence: q.Through, Record: q.Events[0].Record})
+			}
+			g := f.services[0].graphReplica
+			if e := g.enqueue(f.ctx, q); e == nil {
+				t.Fatal("accepted delivery that does not cover the durable source log")
+			}
+			h, _ := g.journal.Head(f.ctx)
+			if len(g.input.queue) != 0 || h.Sources["0"] != 0 {
+				t.Fatal("invalid delivery advanced state")
+			}
+		})
+	}
+}
+
+func TestRoutedAdmissionOwnsValidatedRecords(t *testing.T) {
+	f, _, o := routedFixture(t)
+	f.write(t, "owned", false)
+	q := deliveryFor(t, f, o, 0)
+	g := f.services[0].graphReplica
+	if e := g.enqueue(f.ctx, q); e != nil {
+		t.Fatal(e)
+	}
+	q.Events[0].Record.Vector[0] = 999
+	if e := g.enqueue(f.ctx, q); e == nil {
+		t.Fatal("changed retry accepted")
+	}
+	if e := f.services[0].Sync(f.ctx); e != nil {
+		t.Fatal(e)
+	}
+	if f.services[0].Index.records["owned"].Vector[0] != 1 || g.input.bytes != 0 {
+		t.Fatal("queued records mutated or byte accounting leaked")
+	}
+}
+
+func TestDispatchCompletedPrefixAllWatermarks(t *testing.T) {
+	// Exhaustively compare sparse destinations and broadcast deletes against an
+	// independent per-event model. A later ACK must never bridge an earlier hole.
+	events := []LogEvent{{Sequence: 1}, {Sequence: 2}, {Sequence: 3}, {Sequence: 4}}
+	targets := func(e LogEvent) []IndexPartitionID {
+		return [][]IndexPartitionID{{"a"}, {"b"}, {"a", "b"}, {"b"}}[e.Sequence-1]
+	}
+	for a := uint64(0); a <= 4; a++ {
+		for b := uint64(0); b <= 4; b++ {
+			acks := map[IndexPartitionID]uint64{"a": a, "b": b}
+			want := uint64(4)
+			for _, event := range events {
+				for _, target := range targets(event) {
+					if acks[target] < event.Sequence {
+						want = min(want, event.Sequence-1)
+					}
+				}
+			}
+			if got := completedPrefix(events, 0, targets, acks); got != want {
+				t.Fatalf("acks=%v got=%d want=%d", acks, got, want)
+			}
+		}
 	}
 }

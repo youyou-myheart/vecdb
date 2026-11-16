@@ -16,12 +16,12 @@ func TestClusterRoutingProtoConversion(t *testing.T) {
 	if r.Centers[0][0] != -10 {
 		t.Fatal("RPC aliases immutable routing")
 	}
-	state := vector.ClusterStatus{GraphHeads: map[vector.IndexPartitionID]vector.GraphHead{"index-0000": {Sources: map[string]uint64{"0": 9007199254740993}}}, DataProgress: map[string]vector.DataProgress{"data-0000": {Head: 9007199254740994, Completed: 9007199254740993}}}
+	state := vector.ClusterStatus{GraphHeads: map[vector.IndexPartitionID]vector.GraphHead{"index-0000": {Sources: map[string]uint64{"0": 9007199254740993}}}, DataProgress: map[string]vector.DataProgress{"data-0000": {Head: 9007199254740994, Completed: 9007199254740993, OwnerAvailable: true}}}
 	wire := &pb.ClusterStatus{}
 	if e := convert(state, wire); e != nil {
 		t.Fatal(e)
 	}
-	if wire.GraphHeads["index-0000"].Sources["0"] != 9007199254740993 || wire.DataProgress["data-0000"].CompletedLsn != 9007199254740993 {
+	if wire.GraphHeads["index-0000"].Sources["0"] != 9007199254740993 || wire.DataProgress["data-0000"].CompletedLsn != 9007199254740993 || !wire.DataProgress["data-0000"].OwnerAvailable {
 		t.Fatal(wire)
 	}
 	layout := &pb.Layout{}

@@ -58,4 +58,4 @@ message ConsumerState { map<string,ConsumerLease> leases=1; uint64 floor=2; uint
 
 message Center { repeated double vector=1; }
 message ClusterRouting { uint64 version=1; repeated Center centers=2; }
-message DataProgress { uint64 head=1; uint64 completed_lsn=2; uint64 floor=3; Owner owner=4; }
+message DataProgress { uint64 head=1; uint64 completed_lsn=2; uint64 floor=3; Owner owner=4; bool owner_available=5; }

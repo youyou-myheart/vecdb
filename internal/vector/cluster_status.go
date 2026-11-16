@@ -57,8 +57,8 @@ func (c *ClusterService) Status(ctx context.Context) (ClusterStatus, error) {
 			if e != nil {
 				return s, e
 			}
-			owner, _ := c.coordinator.Resolve(ctx, sourceID(d))
-			s.DataProgress[string(sourceID(d))] = DataProgress{head, done, floor, owner}
+			owner, ownerErr := c.coordinator.Resolve(ctx, sourceID(d))
+			s.DataProgress[string(sourceID(d))] = DataProgress{Head: head, Completed: done, Floor: floor, Owner: owner, OwnerAvailable: ownerErr == nil}
 		}
 	}
 	s.ConsumerRetention = c.consumerRetention
@@ -171,8 +171,9 @@ func (c *ClusterService) Status(ctx context.Context) (ClusterStatus, error) {
 }
 
 type DataProgress struct {
-	Head      uint64    `json:"head"`
-	Completed uint64    `json:"completed_lsn"`
-	Floor     uint64    `json:"floor"`
-	Owner     Ownership `json:"owner"`
+	Head           uint64    `json:"head"`
+	Completed      uint64    `json:"completed_lsn"`
+	Floor          uint64    `json:"floor"`
+	Owner          Ownership `json:"owner"`
+	OwnerAvailable bool      `json:"owner_available"`
 }

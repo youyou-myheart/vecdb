@@ -182,6 +182,7 @@ func (s *Service) searchRouted(ctx context.Context, q Search) ([]Hit, GraphPosit
 			repo := c.data[c.router.DataForID(hit.ID)]
 			r, err := readRecord(ctx, tx, repo.key("record", hit.ID))
 			if errors.Is(err, ErrNotFound) {
+				c.observations.staleCandidates.Add(1)
 				continue
 			}
 			if err != nil {
@@ -193,10 +194,13 @@ func (s *Service) searchRouted(ctx context.Context, q Search) ([]Hit, GraphPosit
 				if len(result) == want {
 					break
 				}
+			} else {
+				c.observations.staleCandidates.Add(1)
 			}
 		}
 		_ = tx.Rollback()
 		if q.K == 1000 && len(result) < want && len(hits) == q.K {
+			c.observations.exactFallbacks.Add(1)
 			return s.searchCurrentExact(ctx, q, want)
 		}
 		if len(result) >= want || len(hits) < q.K {

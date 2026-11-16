@@ -87,7 +87,7 @@ func (c *ClusterService) load(ctx context.Context, b PartitionBinding, entry *lo
 		if e == nil {
 			service.graphReplica.retention = c.consumerRetention
 			if c.layout.Routing != nil {
-				service.graphReplica.input = &routedInput{cluster: c, queue: map[DataPartitionID]*Delivery{}}
+				service.graphReplica.input = &routedInput{cluster: c, queue: map[DataPartitionID]*queuedDelivery{}}
 			}
 		}
 	} else {

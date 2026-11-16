@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -17,6 +18,7 @@ import (
 
 	"example.com/vector-storage/internal/vector"
 	"github.com/google/uuid"
+	"github.com/prometheus/common/expfmt"
 )
 
 // All seven service instances live in this test executable. TiKV/PD/S3 are
@@ -479,4 +481,146 @@ func oneProcessPipeline(t *testing.T, graph, retention bool, clustered ...bool) 
 	check("worker_restart_and_post_snapshot_update_visible")
 	verify(g1)
 	report["live_records"] = 95
+	if routing != nil {
+		// Repeated total Worker outages: the Gateways keep accepting durable data
+		// writes while graph construction is unavailable. Each burst exceeds one
+		// 32-event dispatcher window per source on average.
+		expected := map[string]vector.Hit{}
+		baseline := call(g1, "POST", "/v1/search", map[string]any{"vector": []float64{0, 0, 0}, "k": 1000, "exact": true, "min_visible": latest}, 200)
+		var initial []vector.Hit
+		if err := json.Unmarshal(baseline["hits"], &initial); err != nil {
+			t.Fatal(err)
+		}
+		for _, hit := range initial {
+			expected[hit.ID] = hit
+		}
+		metricSum := func(name string) float64 {
+			t.Helper()
+			req, _ := http.NewRequest("GET", g1.url+"/metrics", nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != 200 {
+				t.Fatal("metrics status", resp.StatusCode)
+			}
+			var parser expfmt.TextParser
+			families, err := parser.TextToMetricFamilies(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			family := families[name]
+			if family == nil {
+				t.Fatal("missing metric", name)
+			}
+			var total float64
+			for _, value := range family.Metric {
+				total += value.GetGauge().GetValue()
+			}
+			return total
+		}
+		for round := 0; round < 2; round++ {
+			call(g1, "POST", "/v1/checkpoint", map[string]any{}, 200)
+			call(g1, "POST", "/v1/log/prune", map[string]any{}, 200)
+			for n := 0; n < 3; n++ {
+				stop(nodes[fmt.Sprintf("worker-%d", n)])
+			}
+			for n := 0; n < 144; n++ {
+				id := fmt.Sprintf("outage-%d-%03d", round, n)
+				x := []float64{0, 48, 96}[n%3] + float64(n)/1000
+				payload := map[string]string{"group": "outage"}
+				out := call(g1, "PUT", "/v1/records/"+id, map[string]any{"request_id": "new-" + id, "vector": []float64{x, 1, 0}, "payload": payload}, 200)
+				if err := json.Unmarshal(out["token"], &latest); err != nil {
+					t.Fatal(err)
+				}
+				expected[id] = vector.Hit{ID: id, Revision: 1, Distance: x*x + 1, Payload: payload}
+			}
+			moving := fmt.Sprintf("outage-%d-000", round)
+			for n, x := range []float64{48, 96} {
+				call(g1, "PUT", "/v1/records/"+moving, map[string]any{"request_id": fmt.Sprintf("move-%s-%d", moving, n), "vector": []float64{x, 1, 0}}, 200)
+			}
+			call(g1, "DELETE", "/v1/records/"+moving, map[string]any{"request_id": "remove-" + moving}, 200)
+			out := call(g1, "PUT", "/v1/records/"+moving, map[string]any{"request_id": "restore-" + moving, "vector": []float64{0, 1, 0}, "payload": map[string]string{"group": "outage"}}, 200)
+			if err := json.Unmarshal(out["token"], &latest); err != nil {
+				t.Fatal(err)
+			}
+			if latest.Revision != 5 {
+				t.Fatal(latest)
+			}
+			hit := expected[moving]
+			hit.Revision = 5
+			expected[moving] = hit
+			if raw := call(g1, "GET", "/v1/records/"+moving, nil, 200); string(raw["revision"]) != "5" {
+				t.Fatal(raw)
+			}
+			if metricSum("vecdb_data_pending_events") < 144 {
+				t.Fatal("outage backlog not observed")
+			}
+			wait("old Worker registrations disappear", func() bool {
+				for _, n := range status(g1).Nodes {
+					for _, role := range n.Roles {
+						if role == "worker" {
+							return false
+						}
+					}
+				}
+				return true
+			})
+			for n := 0; n < 3; n++ {
+				start(fmt.Sprintf("worker-%d", n), "worker")
+			}
+			wait("all sources and graph replicas recover after repeated outage", func() bool {
+				s := status(g1)
+				if !s.Ready || !s.FullyReplicated || len(s.DataProgress) != dataCount || len(s.GraphHeads) != indexCount {
+					return false
+				}
+				for _, d := range s.DataProgress {
+					if d.Floor > d.Completed || d.Completed != d.Head || d.Owner.Node == "" {
+						return false
+					}
+				}
+				for id, h := range s.GraphHeads {
+					owners := s.ReplicaOwners[id].Owners
+					if len(owners) != 2 || h.Committed != h.Visible {
+						return false
+					}
+					for _, owner := range owners {
+						if s.GraphPositions[owner.Partition] != h.Visible {
+							return false
+						}
+					}
+				}
+				return true
+			})
+			// Receipt survives checkpoints, GC and changes to this record's revision.
+			retry := call(g1, "PUT", "/v1/records/"+moving, map[string]any{"request_id": "new-" + moving, "vector": []float64{0, 1, 0}, "payload": map[string]string{"group": "outage"}}, 200)
+			var original vector.Token
+			if err := json.Unmarshal(retry["token"], &original); err != nil || original.Revision != 1 {
+				t.Fatal(original, err)
+			}
+			result := call(g1, "POST", "/v1/search", map[string]any{"vector": []float64{0, 0, 0}, "k": 1000, "exact": true, "min_visible": latest}, 200)
+			var hits []vector.Hit
+			if err := json.Unmarshal(result["hits"], &hits); err != nil {
+				t.Fatal(err)
+			}
+			if len(hits) != len(expected) {
+				t.Fatal("lost recovered records", len(hits), len(expected))
+			}
+			seen := map[string]bool{}
+			for _, hit := range hits {
+				want, ok := expected[hit.ID]
+				if !ok || seen[hit.ID] || hit.Revision != want.Revision || math.Abs(hit.Distance-want.Distance) > 1e-6 || hit.Payload["group"] != want.Payload["group"] {
+					t.Fatal("recovery oracle mismatch", hit, want)
+				}
+				seen[hit.ID] = true
+			}
+			if metricSum("vecdb_data_pending_events") != 0 || metricSum("vecdb_graph_replica_lag_entries") != 0 {
+				t.Fatal("recovery lag failed to converge")
+			}
+			check(fmt.Sprintf("repeated_outage_%d_snapshot_GC_multibatch_move_delete_restore_receipt_metrics", round+1))
+		}
+		report["live_records"] = len(expected)
+	}
 }

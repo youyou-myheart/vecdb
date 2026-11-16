@@ -24,6 +24,8 @@ onebox 默认分片数现为 32；负载放置调度使用 `--replicas 2 --sched
 
 支持可选 [聚类索引与数据分片异步投递](CLUSTER_ROUTING.md)：数据按 ID hash，索引按固定簇中心路由，数量可独立配置；来源周期汇总持久化进度，支持接管恢复。通过 `CLUSTER_ROUTING_FILE` 在新 namespace 启用，验收入口 `bash scripts/acceptance-dispatch.sh`。
 
+最新 review 修复、重复/叠加故障矩阵与自动化门禁见 [QUALITY.md](QUALITY.md)。该入口现在包含所有 Go race/UT、真实存储、四种七服务流水线和多进程故障回归。聚类投递与图复制的 `/metrics`、HTTP/gRPC 位点和诊断说明见 [OBSERVABILITY.md](OBSERVABILITY.md)。
+
 ## 启动基础组件
 
 实测 PD/TiKV 8.5.8、SeaweedFS 4.53，macOS ARM64。安装包和 Go 缓存在 `.tools/`，数据在 `.state/`。已有本次安装包时，在三个终端分别启动，已运行的组件不要重复启动：

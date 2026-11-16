@@ -18,10 +18,9 @@ python3 scripts/verify_api.py > reports/acceptance-http.log
 python3 scripts/verify_partitions.py > reports/partitions-http.log 2>&1
 python3 scripts/verify_cluster.py > reports/cluster-http.log 2>&1
 python3 scripts/verify_roles.py > reports/roles-http.log 2>&1
-python3 -m unittest discover -s scripts -p test_cluster_local.py -v > reports/multiworker-unit.log 2>&1
+.venv/bin/python -m unittest discover -s scripts -p 'test_*.py' -v > reports/harness-unit.log 2>&1
 python3 scripts/verify_multiworker.py > reports/multiworker-http.log 2>&1
 python3 scripts/verify_replicas.py > reports/replicas-http.log 2>&1
-python3 -m unittest discover -s scripts -p test_verify_balance.py -v > reports/balance-harness-unit.log 2>&1
 python3 scripts/verify_balance.py > reports/balance-http.log 2>&1
 python3 scripts/verify_cli.py > reports/cli-http.log 2>&1
 PYTHONPATH=sdk/python .venv/bin/python -m unittest discover -s sdk/python/tests -v > reports/python-sdk-unit.log 2>&1

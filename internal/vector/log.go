@@ -69,6 +69,12 @@ func (r *Repository) readEvents(ctx context.Context, after, through uint64, limi
 		return out, e
 	}
 	defer tx.Rollback()
+	return r.readEventsIn(ctx, tx, after, through, limit, byteLimit)
+}
+
+func (r *Repository) readEventsIn(ctx context.Context, tx transactionAPI, after, through uint64, limit, byteLimit int) (LogBatch, error) {
+	var out LogBatch
+	var e error
 	out.Head, e = r.readCounter(ctx, tx, "log-head")
 	if e != nil {
 		return out, e

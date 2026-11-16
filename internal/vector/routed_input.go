@@ -13,14 +13,24 @@ import (
 type routedInput struct {
 	cluster     *ClusterService
 	mu          sync.Mutex
-	queue       map[DataPartitionID]*Delivery
+	queue       map[DataPartitionID]*queuedDelivery
 	bytes       int
 	lastSource  int
 	scrubCursor string
 }
 
-func (g *graphReplica) enqueue(ctx context.Context, q Delivery) error {
+type queuedDelivery struct {
+	Delivery
+	bytes int
+}
+
+func (g *graphReplica) enqueue(ctx context.Context, q Delivery) (err error) {
 	in := g.input
+	defer func() {
+		if err != nil {
+			in.cluster.observations.rejections.Add(1)
+		}
+	}()
 	tx, e := g.repo.begin()
 	if e != nil {
 		return e
@@ -37,7 +47,11 @@ func (g *graphReplica) enqueue(ctx context.Context, q Delivery) error {
 		return e
 	}
 	if q.Through <= h.Sources[fmt.Sprint(q.Source)] {
+		in.cluster.observations.duplicates.Add(1)
 		return nil
+	}
+	if e = in.cluster.validateDeliveryEvents(ctx, tx, g.journal.id, q); e != nil {
+		return e
 	}
 	raw, e := json.Marshal(q)
 	if e != nil {
@@ -50,6 +64,7 @@ func (g *graphReplica) enqueue(ctx context.Context, q Delivery) error {
 	defer in.mu.Unlock()
 	if old := in.queue[q.Source]; old != nil {
 		if sameOwner(old.Owner, q.Owner) && old.Previous == q.Previous && old.Through == q.Through {
+			in.cluster.observations.duplicates.Add(1)
 			return nil
 		}
 		return ErrConflict
@@ -57,9 +72,16 @@ func (g *graphReplica) enqueue(ctx context.Context, q Delivery) error {
 	if in.bytes+len(raw) > 4<<20 {
 		return errors.New("index input queue full")
 	}
+	// Own the validated data until commit; callers cannot modify a queued batch.
+	events := make([]LogEvent, len(q.Events))
+	for n, event := range q.Events {
+		events[n] = LogEvent{Sequence: event.Sequence, Record: cloneRecord(event.Record)}
+	}
+	q.Events = events
 	// Queue ownership checks are repeated in the durable commit transaction.
-	in.queue[q.Source] = &q
+	in.queue[q.Source] = &queuedDelivery{Delivery: q, bytes: len(raw)}
 	in.bytes += len(raw)
+	in.cluster.observations.admissions.Add(1)
 	return nil
 }
 func (in *routedInput) take() *Delivery {
@@ -69,10 +91,9 @@ func (in *routedInput) take() *Delivery {
 		d := DataPartitionID((in.lastSource + 1 + n) % in.cluster.layout.DataPartitions)
 		if q := in.queue[d]; q != nil {
 			delete(in.queue, d)
-			raw, _ := json.Marshal(q)
-			in.bytes -= len(raw)
+			in.bytes -= q.bytes
 			in.lastSource = int(d)
-			return q
+			return &q.Delivery
 		}
 	}
 	return nil
@@ -162,6 +183,7 @@ func (g *graphReplica) scrub(ctx context.Context, s *Service) error {
 		return e
 	}
 	var removes []Record
+	c.observations.scrubScanned.Add(uint64(len(page.Records)))
 	s.Index.mu.RLock()
 	for _, r := range page.Records {
 		old, ok := s.Index.records[r.ID]
@@ -177,6 +199,7 @@ func (g *graphReplica) scrub(ctx context.Context, s *Service) error {
 		if e = g.commitRecords(ctx, s, h, removes, nil); e != nil {
 			return e
 		}
+		c.observations.scrubRemoved.Add(uint64(len(removes)))
 		if e = g.sync(ctx, s, false); e != nil {
 			return e
 		}

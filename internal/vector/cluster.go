@@ -29,6 +29,7 @@ type ClusterConfig struct {
 	Roles                       string
 }
 type ClusterService struct {
+	observations       clusterObservations
 	dispatchMu         sync.Mutex
 	dispatchers        map[DataPartitionID]*dataDispatcher
 	dispatchDone       chan struct{}

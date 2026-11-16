@@ -10,6 +10,8 @@
 
 TiKV、PD、SeaweedFS 仍是外部依赖。**单进程是指七个向量服务实例，不包含存储组件。** 流水线不会启动 vector-server/cluster_local 子进程。
 
+聚类模式 `TestClusteredOneProcessPipeline` 使用 4 个 DataPartition、3 个固定簇 IndexPartition；增加两轮全 Worker 停止期间持续写入、跨簇修改/删除/恢复、GC 后再恢复和指标收敛。完整门禁 `bash scripts/acceptance-dispatch.sh` 同时覆盖四种模式，并附加真实进程反复 SIGSTOP/SIGKILL 场景。用例和报告规则见 [QUALITY.md](QUALITY.md)。
+
 ## 运行
 
 在仓库根目录执行：

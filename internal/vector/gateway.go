@@ -21,7 +21,7 @@ func (c *ClusterService) WrapHandler(public http.Handler) http.Handler {
 			return
 		}
 		switch r.URL.Path {
-		case "/v1/cluster/tasks", "/v1/cluster/task", "/v1/cluster/balance", "/v1/cluster/explain", "/v1/drain", "/healthz", "/v1/cluster", "/v1/layout":
+		case "/metrics", "/v1/cluster/tasks", "/v1/cluster/task", "/v1/cluster/balance", "/v1/cluster/explain", "/v1/drain", "/healthz", "/v1/cluster", "/v1/layout":
 			public.ServeHTTP(w, r)
 			return
 		}
