@@ -17,6 +17,12 @@ services:
     image: pingcap/tikv:v8.5.8
     network_mode: host
     depends_on: [pd]
+    # Match the reduced RocksDB file budget in tikv-local.toml, including
+    # hosts whose hard limit cannot accommodate TiKV's default file budget.
+    ulimits:
+      nofile:
+        soft: 16384
+        hard: 16384
     command: [--config=/etc/tikv.toml, --addr=127.0.0.1:12160, --advertise-addr=127.0.0.1:12160, --status-addr=127.0.0.1:12180, --pd=127.0.0.1:12379, --data-dir=/data]
     volumes:
       - tikv-ci:/data
