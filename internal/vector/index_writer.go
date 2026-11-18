@@ -18,6 +18,7 @@ type indexWriter struct {
 	deadline        time.Time
 	replicaDeadline time.Time
 	publisher       IndexPartitionID
+	publisherRoute  Assignment
 	head            GraphHead
 	known           bool
 	retired         bool
@@ -93,6 +94,13 @@ func (g *graphReplica) refreshLease(ctx context.Context, plan ReplicaPlan, repli
 	}
 	w.mu.Lock()
 	w.publisher = plan.Publisher
+	w.publisherRoute = Assignment{}
+	for _, a := range plan.Serving {
+		if a.Partition == plan.Publisher {
+			w.publisherRoute = a
+			break
+		}
+	}
 	w.replicaDeadline = leaseDeadline(replicaStart, time.Duration(g.journal.c.ttl)*time.Millisecond)
 	w.mu.Unlock()
 	defer g.input.notify()

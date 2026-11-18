@@ -148,6 +148,7 @@ class Oracle:
         self.id_locks = [threading.Lock() for _ in range(capacity)]
         self.receipts = {}
         self.acknowledged = {}
+        self.last_ack = 0.0
 
     def mutate(self, n, *, initial=False, deleted=None):
         id = f'v-{n:04d}'
@@ -168,6 +169,7 @@ class Oracle:
             with self.lock:
                 self.records[id] = record
                 self.receipts[id] = (method, request, response['token'])
+                self.last_ack = max(self.last_ack, acknowledged)
                 self.acknowledged[id] = dict(revision=revision,request_id=request['request_id'],monotonic=acknowledged)
             actual = self.transport('/v1/records/'+id)
             self.check_record(actual, record)

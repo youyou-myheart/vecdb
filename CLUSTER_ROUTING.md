@@ -1,20 +1,66 @@
 # 数据分片异步投递与聚类索引
 
-状态：已实现固定簇中心路由、数据与索引分区数量独立、来源完成水位、接管恢复和旧位置清理。split/merge、在线重新训练簇中心尚未实现。此模式使用 `v14-cluster-routing-lease-*`，必须使用新 namespace，不能将已有一一映射布局原地切换。
+状态：已实现固定簇中心路由、数据与索引分区数量独立、来源完成水位、接管恢复和旧位置清理。split/merge、在线重新训练簇中心尚未实现。聚类布局使用带 `-owner-append-v1` 后缀的写入协议。一一映射布局使用独立的 namespace。升级已有 v14 聚类布局时，先停止所有旧进程并等待节点租约过期，再启动新版。已有数据和幂等凭证可继续使用。
 
 ## 部署和数据流
 
 ```mermaid
 flowchart LR
-    D["TiKV 数据分区<br/>记录与有序数据日志"] --> P["数据分片处理器<br/>有界窗口、聚类路由"]
+    SDK["SDK"] -->|按 ID 定位并直连| W["DataPartition owner<br/>内存末尾 LSN"]
+    GW["HTTP / 旧版客户端"] -->|Gateway 转发| W
+    W -->|原子提交| D["TiKV 记录、数据日志、幂等凭证"]
+    D --> P["同一 owner 异步投递<br/>有界窗口、聚类路由"]
     P --> I["目标索引 Leader<br/>内存队列、串行批量构图"]
     I --> G["持久化图日志<br/>TiKV 图结构 + 数据日志引用"]
     G --> F["索引 Follower<br/>重放图变更"]
 ```
 
-业务写入只等待原始记录、数据日志、幂等凭证的 TiKV 事务，不等待处理器、构图、进度轮询或 Follower。Gateway 可以在全部 Worker 暂停时继续写入和按 ID 读取。
+DataPartition 按向量 ID 的 SHA-256 哈希划分。Master 将每个分片分配到一个 Worker。该 Worker 同时负责追加日志和异步投递，两者各自推进。一次业务写入在 TiKV 提交成功时返回 durable ACK，后续构图与图复制独立进行。
 
-DataPartition 仍按 ID hash 划分。每个数据分区新增一个可接管的处理器，由 Master 分配到 Worker，以 `data-NNNN` 的租约和 epoch 管理。它是异步日志处理者，不是权威数据写入的入口或主副本。IndexPartition 的副本计划、构图 Leader 和图复制仍独立管理。
+| 时机 | 末尾 LSN 的来源与更新 |
+|---|---|
+| 接管 | 拿到分片新 epoch 后，反向只读一个 `log/` 尾键。日志已全部回收时使用 `log-floor`，新分片从 0 开始。加载完成后发布 ready。 |
+| 正常写入 | 分片内串行提交批次，从内存末尾给新事件连续编号。重复请求返回原始 revision，CAS 冲突不分配 LSN。不同分片可同时提交。 |
+| 提交确认 | 原始记录、事件、namespace 级幂等凭证与分片 epoch 校验在一个事务内完成。成功后推进内存末尾，唤醒投递。 |
+| 回包丢失 | 结果不确定的 owner 停止追加，交回租约并走恢复流程。客户端用原 request_id 重试。 |
+| 旧节点恢复 | 旧 epoch 的写入会被拒绝。先开始、后提交的旧事务与接管事务写同一个 `cluster/write-epochs/data-NNNN` 键，TiKV 将冲突事务回滚。该键的值只表示任期。 |
+
+例：内存末尾为 900，批内两个新事件取得 901、902。TiKV 确认后，下一批从 903 开始。如果提交响应丢失，新 owner 从持久化日志恢复到 900 或 902，重试通过幂等凭证判定原事务是否成功。
+
+这个协议区分三个位置。末尾 LSN 表示已持久化的数据，`completed_lsn` 表示已完成索引投递的连续前缀，`log-floor` 表示已回收前缀。按 ID 读、运维状态、订阅和检查点使用 TiKV 的事务快照。分片写入在 owner 接管期间可能短暂不可用，其他就绪数据分片可独立写入。
+
+## TiKV 元数据访问清单
+
+以下统计适用于聚类布局、DataPartition 单写入 owner 和 Index 图复制。计数单位为代码路径上的逻辑键、事务或反向扫描，一次 BatchGet 在 TiKV 内部可能跨多个 Region。
+
+**正常追加有两个固定的元数据写入点，分别位于两笔独立事务中。** DataPartition 每个有新事件的批次读写一次 `cluster/write-epochs/data-NNNN`。Index Leader 的租约快速路径每个普通图批次读写一次 `cluster/index-guards/index-NNNN`。两个键都用来让迟到的事务与接管发生写冲突，值只在任期变化时改变。当前数据末尾和图末尾均由日志承载，稳态追加单独更新最大 LSN 键的次数为 **0**。
+
+举例来说，32 个不同 ID 各成功写入一次，DataPartition 事务写 32 条记录、32 条事件、32 个请求凭证和 1 个 epoch 键，共 97 个逻辑键。请求凭证按 request_id 保存首次结果，客户端在回包丢失后仍可取回原 revision。普通图增量事务追加图条目及其载荷分块，条目保存累计来源 ACK。接收新来源 epoch、发布快照、推进完成位点和 GC 各有单独的事务。
+
+| 路径 | 原有操作 | 当前操作 |
+|---|---|---|
+| 1. 来源唤醒 | 每次查 assignment 并续租，续租中再校验 owner 和 assignment | 健康 owner 在本地租约期限内处理唤醒。控制巡检负责获取和续租，未知写入结果触发恢复。 |
+| 2. 来源窗口 | 每轮重读 `dispatch-completed`，已追平的空窗口也读取 `log-floor` | 接管及完成事务失败后重新读持久化位置。已有窗口和已追平的空窗口各开 0 个读取事务。推进持久化位置仍校验旧值。 |
+| 3. 来源状态 | 每轮另开事务读 owner，完成位置变化时再写 owner.offset | 完成位置在既有续租中顺带上报。状态接口从同一数据快照的 `completed_lsn` 填充 offset。 |
+| 4. 来源 ACK | 每窗口读取全部 I 个图控制头，再反查 I 次图尾 | 只读本窗口涉及的 T 个 Index，每个图尾反查一次。单簇写入 T=1，含广播删除时 T=I。 |
+| 5. 图副本进度 | 每次已就绪心跳后，分别提交副本状态和 `progress/<replica>` | 位置、计划版本或已上报状态变化时合并为 1 个事务，稳定时额外事务数为 0。首次上报、进程重启或上次提交未确认会重新上报。 |
+| 6. 集群状态 | 同一次状态请求为 graph_heads 和 log_heads 分别读同一图头及尾记录 | 从一次图头读取同时生成两个字段。 |
+| 7. 图订阅 | 一页 N 条成功返回的事件，正常路径反查图尾 N+1 次，还为带载荷事件另开事务 | 每页在同一个 MVCC 快照定位图尾 1 次，再按序号读取条目和分块、校验哈希。并发 GC 后，新页可用检查点重置。 |
+| 8. 图检查点 | 同一事务写图头内的检查点描述和 `index/<id>/manifest` 镜像 | 聚类布局只更新图头内的描述，旧镜像可留存。数据流使用自己的 data manifest。一一映射布局仍写入供数据订阅和清理使用的 manifest。 |
+| 9. 数据检查点巡检 | 每秒每个 Worker 对全部 D 个数据分片查询归属 | 各 Worker 只验证本地持有且写入结果确定的分片。在归属稳定、每片一个 owner 时，全组从 D×W 次降至 D 次，发布和 GC 保留事务内 fencing。 |
+
+### 接管、回收和进度判断需要的持久状态
+
+| 状态 | 保留依据 |
+|---|---|
+| `log-floor` | 记录已经回收的连续前缀。整段日志删空后用于恢复下一 LSN，也决定订阅何时需要重置。 |
+| `dispatch-completed` | 是跨 Index 的连续完成证明。数据 owner 接管、允许跳过已完成区间、数据 GC 都依赖它。单个 Index 的最大来源 ACK 无法证明中间事件已全部完成。 |
+| `cluster/graph/<index>/head` | 保存图任期、快照、回收边界及其来源覆盖。普通数据增量的最新位置和累计 ACK 来自不可变图条目。尾条目回收后控制头仍提供恢复依据。 |
+| 图副本的 `progress/<replica>` | 记录指定 owner 实际应用的图序号、哈希和数据位点，用于跨进程状态观测。图提交成功时 Follower 还可能落后。 |
+| 数据 manifest、消费者 lease/ACK、对象登记 | 分别定位恢复对象、保护活跃订阅所需日志、协调对象发布与回收。消费者数量和 ACK 由订阅方决定。 |
+| assignment、owner、replica-plan、lease、guard 和迁移任务 | 决定当前服务者及切换边界。可以缓存路由提示，持久化写入仍需与接管或回收在 TiKV 中互斥。 |
+
+剩余值得单独测量的读取是来源向实际目标投递前解析其 replica-plan 和 publisher owner，以及 Index 通知来源时解析 DataPartition owner。将这些地址改成路由缓存需要在旧地址、旧 session 和租约过期时重新发现。来源侧还能继续减少对实际目标的 ACK 查询，但必须区分入队成功与图日志已提交，并保留丢通知后的持久化校准。
 
 ## 固定聚类路由
 
@@ -32,7 +78,7 @@ DataPartition 仍按 ID hash 划分。每个数据分区新增一个可接管的
 
 ## 投递窗口与完成水位
 
-- 数据事务提交后，Gateway 异步通知对应来源处理器；图事务结束后，Index 也通知来源重新读取持久化水位。来源按实际目标推进连续完成前缀，一个窗口完成后立即读取下一窗口。通知合并且不承担 ACK，失败或丢失由 500 ms 控制巡检兜底；正常处理不等待该定时器。
+- 数据事务提交后，owner 就地唤醒该分片的投递队列；图事务结束后，Index 也通知来源重新读取持久化水位。来源按实际目标推进连续完成前缀，一个窗口完成后立即读取下一窗口。通知合并且不承担 ACK，失败或丢失由 500 ms 控制巡检兜底；正常处理不等待该定时器。
 - 每个来源窗口最多 32 条、2 MiB 的编码事件；达到限制停止加载，积压保留在 TiKV。
 - 索引队列每个来源最多一批，排队编码载荷预算 4 MiB；另有当前正在处理的一批。处理批次按来源轮转。投递接口不等待构图；首次接受更高 epoch 时先写小型控制日志，普通同 epoch 请求校验后入队。
 - 入队通过可合并通知唤醒该索引的独立消费者，Leader 连续处理到队列为空再阻塞等待；不再依赖 500 ms 或 10 ms 队列轮询。计划变更、失败重试和启动恢复同样可以触发处理。
@@ -76,7 +122,7 @@ MinVisible 先等待一个有限的来源数据头完成投递与提交，再同
 
 图快照保存完整 HNSW、记录/属性/墓碑、图位置，以及捕获时的 sources/source_epochs/log_bytes；每片 30 MB 或 3 分钟触发，上传期间可以继续追加。此模式下 GraphPosition.data_offset 是索引内部的单调构图批次进度，用于副本屏障；来源 LSN 必须读取 sources，不能与该字段比较。副本搬迁屏障取当前图提交位置，不再读取某个绑定的数据日志头。
 
-数据快照单独从一个 TiKV 事务快照读取记录和 log-head，保存为 `data-records-v1` 的 JSON Record 数组。检查点响应包含 index-NNNN 图快照和 data-NNNN 数据快照。数据订阅 reset 使用自己的数据快照，不再借用某个 HNSW 快照。
+数据快照单独从一个 TiKV 事务快照读取记录并从日志尾键确定快照 LSN，保存为 `data-records-v1` 的 JSON Record 数组。检查点响应包含 index-NNNN 图快照和 data-NNNN 数据快照。数据订阅 reset 使用自己的数据快照，不再借用某个 HNSW 快照。
 
 - data 流：以 `data-NNNN` 寻址；graph 流：以 `index-NNNN` 寻址。
 - 消费租约、ACK、cursor 继续按流独立管理。
@@ -85,7 +131,7 @@ MinVisible 先等待一个有限的来源数据头完成投递与提交，再同
 - 后台自动运行有界清理；`cluster prune` 也可显式触发；本模式返回 data-NNNN 的 floor。图 floor 在 cluster status 中查看。
 - 数据快照暂不回收；历史图快照和永久对象回收标记的既有保留边界不变。
 
-`vectorctl cluster status`、HTTP `/v1/cluster` 和 gRPC GetCluster 提供 `data_progress`：每个数据分区的 head、completed_lsn、floor、处理器 ownership；`graph_heads[*].sources` 展示来源完成水位，`source_epochs` 展示该 Index 已接受的来源 epoch。来源 owner 的 offset 也上报 completed_lsn，last_error 记录处理错误。状态是观测信息，不是全局原子快照。
+`vectorctl cluster status`、HTTP `/v1/cluster` 和 gRPC GetCluster 提供 `data_progress`：每个数据分区的 head、completed_lsn、floor、处理器 ownership；`graph_heads[*].sources` 展示来源完成水位，`source_epochs` 展示该 Index 已接受的来源 epoch。响应中的来源 owner.offset 取该数据快照的 completed_lsn。owner 续租时同时上报 offset 与最近一次处理错误。状态是观测信息，不是全局原子快照。
 
 ## 启动与验收
 

@@ -99,7 +99,7 @@ func (r *Repository) ensureLayout(ctx context.Context, n int) (PartitionLayout, 
 		}
 		hasRecords := it.Valid()
 		it.Close()
-		head, err := r.readCounter(ctx, tx, "log-head")
+		head, err := r.logHead(ctx, tx)
 		if err != nil {
 			return wanted, err
 		}
@@ -113,7 +113,7 @@ func (r *Repository) ensureLayout(ctx context.Context, n int) (PartitionLayout, 
 		}
 	}
 	if n > 1 {
-		if e = tx.Set([]byte(r.Prefix+"schema"), []byte(fmt.Sprintf("v3:dimension=%d:metric=l2:partition-layout=1", r.Dimension))); e != nil {
+		if e = tx.Set([]byte(r.Prefix+"schema"), []byte(fmt.Sprintf("v3:dimension=%d:metric=l2:partition-layout=1", r.Dimension)+dataLogSchemaSuffix)); e != nil {
 			return wanted, e
 		}
 	}

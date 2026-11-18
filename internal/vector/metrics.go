@@ -49,7 +49,7 @@ func clusterMetrics(s ClusterStatus) *metricText {
 		}
 		return 0
 	}
-	m.add("vecdb_cluster_ready", "gauge", "At least one serving replica per index.", "", flag(s.Ready))
+	m.add("vecdb_cluster_ready", "gauge", "At least one serving replica per index and every routed data writer ready.", "", flag(s.Ready))
 	m.add("vecdb_cluster_fully_replicated", "gauge", "Configured serving replica count and failure domains available.", "", flag(s.FullyReplicated))
 	m.add("vecdb_master_available", "gauge", "Master lease resolves successfully.", "", flag(s.MasterAvailable))
 	m.add("vecdb_master_epoch", "gauge", "Current resolved Master fencing epoch.", "", s.Leader.Epoch)
@@ -170,7 +170,11 @@ func (c *ClusterService) localMetrics(m *metricText) error {
 			g := service.graphReplica
 			g.viewMu.RLock()
 			sequence := g.position.Sequence
+			followerQueue := g.followerReads
 			g.viewMu.RUnlock()
+			if followerQueue != nil {
+				followerQueue.metrics(m, fmt.Sprintf("{index_partition=%q,replica=%q}", g.journal.id, entry.owner.Partition))
+			}
 			m.add("vecdb_graph_local_applied_sequence", "gauge", "Actual local applied sequence without waiting for the heartbeat progress report.", fmt.Sprintf("{index_partition=%q,replica=%q}", g.journal.id, entry.owner.Partition), sequence)
 			m.add("vecdb_graph_local_owner_epoch", "gauge", "Owner epoch of the local graph, paired with its applied sequence.", fmt.Sprintf("{index_partition=%q,replica=%q}", g.journal.id, entry.owner.Partition), entry.owner.Epoch)
 			if w := g.writer; w != nil {

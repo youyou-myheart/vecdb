@@ -63,7 +63,7 @@ func (r *Repository) ensureLoadMode(ctx context.Context) error {
 	if e = tx.Set(key, []byte("v6-load-tasks-2")); e != nil {
 		return e
 	}
-	if e = tx.Set([]byte(r.Prefix+"schema"), []byte(fmt.Sprintf("v9:dimension=%d:metric=l2:load=1:tasks=1", r.Dimension))); e != nil {
+	if e = tx.Set([]byte(r.Prefix+"schema"), []byte(fmt.Sprintf("v9:dimension=%d:metric=l2:load=1:tasks=1", r.Dimension)+dataLogSchemaSuffix)); e != nil {
 		return e
 	}
 	return tx.Commit(ctx)
@@ -92,7 +92,7 @@ func (r *Repository) ensureClusterMode(ctx context.Context, count int) error {
 	if e = tx.Set(key, []byte("v5-replica-tasks-2")); e != nil {
 		return e
 	}
-	if e = tx.Set([]byte(r.Prefix+"schema"), []byte(fmt.Sprintf("v8:dimension=%d:metric=l2:replicas=2:tasks=1", r.Dimension))); e != nil {
+	if e = tx.Set([]byte(r.Prefix+"schema"), []byte(fmt.Sprintf("v8:dimension=%d:metric=l2:replicas=2:tasks=1", r.Dimension)+dataLogSchemaSuffix)); e != nil {
 		return e
 	}
 	return tx.Commit(ctx)
@@ -128,7 +128,7 @@ func (r *Repository) ensureGraphProtocol(ctx context.Context, scheduler, domain 
 		return e
 	}
 	// Existing replica/task storage schema remains compatible; cluster-mode is the fence.
-	if e = tx.Set([]byte(r.Prefix+"schema"), []byte(fmt.Sprintf("v8:dimension=%d:metric=l2:replicas=2:tasks=1", r.Dimension))); e != nil {
+	if e = tx.Set([]byte(r.Prefix+"schema"), []byte(fmt.Sprintf("v8:dimension=%d:metric=l2:replicas=2:tasks=1", r.Dimension)+dataLogSchemaSuffix)); e != nil {
 		return e
 	}
 	return tx.Commit(ctx)

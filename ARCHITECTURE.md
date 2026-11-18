@@ -1,6 +1,6 @@
 # 当前架构与分区设计
 
-本文整理截至 2026-11-17 的实现及设计取舍，是理解仓库的架构入口。重点描述 `CLUSTER_MODE=1 REPLICAS=2 INDEX_REPLICATION=graph`；默认 `INDEX_REPLICATION=independent` 仍保留，各副本独立构图。消费保留与图日志回收需另设 `CONSUMER_RETENTION=1`，所有角色配置一致并使用新 namespace。具体启动参数见 [CLI.md](CLI.md)。
+本文整理截至 2026-11-18 的实现及设计取舍，是理解仓库的架构入口。重点描述 `CLUSTER_MODE=1 REPLICAS=2 INDEX_REPLICATION=graph`；默认 `INDEX_REPLICATION=independent` 仍保留，各副本独立构图。消费保留与图日志回收需另设 `CONSUMER_RETENTION=1`，所有角色配置一致并使用新 namespace。具体启动参数见 [CLI.md](CLI.md)。
 
 本文下述一一映射是默认布局。现已增加可选聚类布局，数据/索引分区数量独立：见 [CLUSTER_ROUTING.md](CLUSTER_ROUTING.md)。该模式不保存逐事件路由计划，使用固定簇中心、来源处理器和持久化完成水位；split/merge 仍未实现。
 
@@ -39,7 +39,7 @@ flowchart LR
 | 索引副本 | IndexPartition 在某个 Worker 上的内存实例，有自己的已应用位置 |
 | Worker | 容纳多个索引副本的进程；主备身份按分片区分 |
 
-DataPartition 没有应用层 Leader/Follower，也不等于 TiKV Region。底层数据复制由 TiKV 承担。只有索引副本需要应用层放置、构图选主和迁移。
+底层数据复制由 TiKV 承担。聚类布局的 DataPartition 在应用层有一名可接管的写入 owner，IndexPartition 另外选举构图 Leader。
 
 当前数据路由为 `bigEndianUint64(SHA256(ID)[:8]) % DataPartitions`，使用 ID 的 UTF-8 字节，与向量、属性无关。分区数支持 1～64，持久化后不可直接修改。索引映射保存在 layout 中，当前 `data 0 → index-0000`，依此类推。
 
@@ -57,7 +57,7 @@ A 不直接向 B 复制进程内存。B 读取 TiKV 中的已持久化图日志�
 
 详细提交顺序：
 
-1. 任意 Gateway 将记录、数据日志、分区 log-head 和幂等凭证写入同一个 TiKV 事务。支持 expected_revision 条件更新；提交结果不确定时用原 request_id 重试。
+1. 聚类布局下，SDK 按 ID 直连 DataPartition owner，Gateway 收到的写入也转给该 owner。owner 仅在恢复时读取持久化日志末尾，正常批次按内存 LSN 连续编号。当前记录、日志事件和幂等凭证在同一个 TiKV 事务提交。支持 expected_revision 条件更新；提交结果不确定时用原 request_id 重试。
 2. 一一对应模式下，Leader 每 500 ms 从上次数据 offset 增量读取，每批最多 256 条。聚类投递模式改由来源处理器投递到队列，入队唤醒 Leader 连续消费，见第 6 节。
 3. Leader 在写锁内构图，捕获修改过的节点和记录等状态，再回退推测修改，避免查询提前看到未提交结果。
 4. Leader 先验证图变更可重放，再拆出向量、属性的数据日志引用。
@@ -91,7 +91,7 @@ Leader A 故障后的流程：
 3. B 从 Committed.DataOffset 继续消费数据日志，构图并追加图日志。
 4. 旧 A 的追加受到事务内 ownership、Publisher 与 fencing 检查约束，不能凭旧身份继续修改权威状态。
 
-Gateway 与 TiKV 可用时，接管不要求停止原始数据读写。有效的可服务副本可继续查询旧视图；没有可服务副本时搜索暂时不可用。路由重试有时间上限，不承诺任意故障下零中断。
+按 ID 读取只依赖 Gateway 与 TiKV。聚类布局的写入还要求目标 DataPartition owner 就绪。有效的可服务副本可继续查询旧视图；没有可服务副本时搜索暂时不可用。路由重试有时间上限，不承诺任意故障下零中断。
 
 Master 维护的 ReplicaPlan 区分 Desired、Serving、Publisher、Barrier 和 Version。迁移先恢复目标、追赶屏障，再原子切换服务集合，最后退休源副本；任务持久化在 TiKV，Master 更换后可以续跑。负载策略使用内存估算、查询耗时与容量权重，预算不是 RSS 硬限制。细节见 [DESIGN.md](DESIGN.md)、[BALANCING.md](BALANCING.md)。
 
@@ -107,15 +107,17 @@ Master 维护的 ReplicaPlan 区分 Desired、Serving、Publisher、Barrier 和 
 
 ## 6. 设计决策：保留 DataPartition，支持可选聚类布局
 
-**保留数据分区与索引分区两个概念。默认布局一一对应；可选聚类模式中数据分区数和索引分区数独立。DataPartition 是稳定的数据与日志边界，新增的处理器仅负责异步投递，不接管原始数据写入。**
+**保留数据分区与索引分区两个概念。默认布局一一对应；可选聚类模式中数据分区数和索引分区数独立。DataPartition 是稳定的数据与日志边界，聚类布局的来源处理器持有独占写租约，负责追加原始日志并异步投递。**
 
-保留数据分区的原因：按 ID 的 Get/更新/删除不依赖索引，分区日志分散 head 竞争，数据订阅与保留范围不随索引位置变化。同一数据分区的 head 仍是竞争点，不能据此宣称消除全部写热点。
+保留数据分区的原因：按 ID 的 Get/更新/删除不依赖索引，各数据分片可以独立提交，数据订阅与保留范围不随索引位置变化。同一数据分片的提交保持有序，热点 ID 仍受单分片吞吐限制。
 
 选定的解耦方式是来源直接投递：
 
 ```mermaid
 flowchart LR
-    D["DataPartition 日志"] --> R["来源处理器<br/>固定版本聚类路由"]
+    C["SDK 或 Gateway"] --> W["DataPartition owner<br/>内存分配 LSN"]
+    W -->|提交确认| D["DataPartition 日志"]
+    D --> R["来源处理器<br/>固定版本聚类路由"]
     R --> I["IndexPartition Leader<br/>入队唤醒，连续消费"]
     I --> G["图变更日志<br/>原子提交来源完成水位"]
 ```

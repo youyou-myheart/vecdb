@@ -16,17 +16,21 @@ export VECTOR_CONTROL_SOCKET="$PWD/.state/rpc-control.sock"
   --workers 2 --partitions 8 --dimension 3 --grpc-port 18250
 ```
 
-该示例需要 TiKV/PD/SeaweedFS 已启动：HTTP Gateway 在 18202，gRPC 在 18250。只给 Gateway 开启 gRPC，不给每个 Worker 绑定同一端口。省略 `--grpc-port` 时保持原 HTTP-only 启动方式。管理器预留 base-port 到 base-port+34 给 HTTP 节点，RPC 端口必须在该范围外。
+该示例需要 TiKV/PD/SeaweedFS 已启动：HTTP Gateway 在 18202，gRPC 在 18250。此示例为一一映射布局，`--grpc-port` 指定 Gateway 的 gRPC 端口。管理器预留 base-port 到 base-port+34 给 HTTP 节点，RPC 端口必须在该范围外。
 
-独立启动服务可以设置 `GRPC_LISTEN_ADDR=127.0.0.1:18250`。同一进程若有 Master/Worker 但无 Gateway 角色，只允许 Health/GetLayout/GetCluster，拒绝业务及维护 RPC。Gateway 到 Worker 的内部通信目前仍是原有 HTTP RPC，本次只增加对外 gRPC。
+独立启动服务可以设置 `GRPC_LISTEN_ADDR=127.0.0.1:18250`。聚类布局下，Worker 还提供带路由凭证的 Put / Delete。默认绑定 HTTP 监听地址的主机和一个空闲 TCP 端口，使用 ADVERTISE_URL 的主机名发布地址。跨机器部署可设置每个 Worker 的 `GRPC_LISTEN_ADDR` 与 `GRPC_ADVERTISE_ADDR=host:port`，地址须能从 SDK 访问，TLS 证书须覆盖该主机名。Worker 校验 API_TOKEN、namespace、ID 所属分片、epoch 与 session。
+
+Go/Python SDK 首次写某数据分片时从 Gateway 获取路由，随后复用到 Worker 的 gRPC 连接。明确收到过期路由时重新发现一次。结果不确定时，调用方用原 request_id 重试。HTTP 和旧版 gRPC 客户端通过 Gateway 转发至同一 owner。
 
 ## 接口与认证
 
 | RPC | 功能 |
 |---|---|
+| ResolveWriteRoute | 按 ID 查询数据分片、Worker gRPC 地址与写入任期 |
 | Put / Get / Delete | 写入、读取、删除记录 |
 | List | 分片顺序分页，默认隐藏墓碑 |
 | Search | 全局 Top-K、属性过滤、HNSW 或精确搜索 |
+| FollowerSearch | Follower 合批获取 Leader applied LSN，等待本地应用后查询；返回各分片位点和耗时 |
 | Health | 进程状态和 namespace，不等同于分片全部 ready |
 | GetCluster / GetLayout | 主节点、节点列表、分片归属与布局 |
 | Checkpoint / Rebuild / Prune | 快照、重建及安全日志清理 |
@@ -39,6 +43,8 @@ List 的 limit=0 使用默认 100，最大 1000。可能出现空 records 但仍
 
 Search 的 k 必须为 1..1000。min_visible 使用写入响应 token，同步索引并检查指定记录版本；不是跨记录事务快照。
 
+FollowerSearch 的协议、队列上限、SDK 和监控见 [FOLLOWER_READ.md](FOLLOWER_READ.md)。最长 5 秒，客户端更短的 deadline 优先；不能与 min_visible 组合，不回退 Leader，不保证 Leader 已索引全部已持久化写入。
+
 错误使用标准 gRPC code：
 
 | Code | 含义 |
@@ -49,7 +55,8 @@ Search 的 k 必须为 1..1000。min_visible 使用写入响应 token，同步�
 | ABORTED | 版本或幂等内容冲突 |
 | UNAVAILABLE | 分片不可用、索引尚不可见或存储失败 |
 | DEADLINE_EXCEEDED / CANCELLED | 请求超时或取消 |
-| RESOURCE_EXHAUSTED | 消息超过 gRPC 大小限制 |
+| RESOURCE_EXHAUSTED | 消息超过 gRPC 大小限制，或 Follower Read 队列已满 |
+| FAILED_PRECONDITION | 部署未启用 Follower Read 所需模式 |
 | UNIMPLEMENTED | 单机模式未提供集群状态 |
 
 服务端每次 RPC 最长 30 秒，客户端更短的 deadline 优先生效。SDK 默认连接/调用超时 30 秒；Go 使用 context 取消，Python 同步调用可通过每次调用的 timeout 设置截止时间。超过 RPC 超时不保证底层原生 HNSW 计算立即停止。请求上限 1 MiB，响应上限 64 MiB，列表体积过大时减小 limit。

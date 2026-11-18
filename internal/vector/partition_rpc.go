@@ -13,6 +13,11 @@ import (
 )
 
 type partitionRPC struct {
+	ID          string           `json:"id,omitempty"`
+	Mutation    *Mutation        `json:"mutation,omitempty"`
+	Deleted     bool             `json:"deleted,omitempty"`
+	Session     string           `json:"session,omitempty"`
+	TimeoutMS   int64            `json:"timeout_ms,omitempty"`
 	Source      *DataPartitionID `json:"source,omitempty"`
 	Delivery    *Delivery        `json:"delivery,omitempty"`
 	ReadThrough uint64           `json:"read_through,omitempty"`
@@ -23,6 +28,8 @@ type partitionRPC struct {
 	Query       Search           `json:"query"`
 }
 type partitionReply struct {
+	Record        *Record           `json:"record,omitempty"`
+	FollowerRead  *FollowerReadInfo `json:"follower_read,omitempty"`
 	SourceEpoch   *SourceEpochError `json:"source_epoch,omitempty"`
 	GraphPosition *GraphPosition    `json:"graph_position,omitempty"`
 	AppliedOffset uint64            `json:"applied_offset,omitempty"`
@@ -56,7 +63,11 @@ func (c *ClusterService) InternalHandler() http.Handler {
 			w.WriteHeader(400)
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		budget := 30 * time.Second
+		if req.TimeoutMS > 0 && req.TimeoutMS < budget.Milliseconds() {
+			budget = time.Duration(req.TimeoutMS) * time.Millisecond
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), budget)
 		defer cancel()
 		// Opt-in diagnostics for acceptance probes. Never log the authorization
 		// header, query vectors, or payload. A fixed-size hex ID is log-safe.
@@ -73,6 +84,18 @@ func (c *ClusterService) InternalHandler() http.Handler {
 		if e != nil {
 			response.Error = e.Error()
 			response.Code = "unavailable"
+			if errors.Is(e, context.DeadlineExceeded) {
+				response.Code = "deadline_exceeded"
+			}
+			if errors.Is(e, context.Canceled) {
+				response.Code = "canceled"
+			}
+			if errors.Is(e, ErrFollowerQueueFull) {
+				response.Code = "resource_exhausted"
+			}
+			if req.Operation == "mutate" && errors.Is(e, ErrConflict) {
+				response.Code = "conflict"
+			}
 			if errors.Is(e, ErrNotVisible) {
 				response.Code = "not_visible"
 			}
@@ -97,6 +120,16 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 	if req.Namespace != c.root.Prefix {
 		return reply, ErrFenced
 	}
+	if req.Operation == "mutate" {
+		if req.Source == nil || req.Partition != sourceID(*req.Source) || req.Mutation == nil {
+			return reply, ErrFenced
+		}
+		record, err := c.MutateOwned(ctx, req.Namespace, *req.Source, req.Epoch, req.Session, req.ID, *req.Mutation, req.Deleted)
+		if err == nil {
+			reply.Record = &record
+		}
+		return reply, err
+	}
 	if req.Operation == "wake_source" {
 		if !c.EventDrivenIndexing() || c.worker == nil || req.Source == nil || *req.Source < 0 || int(*req.Source) >= c.layout.DataPartitions || req.Partition != sourceID(*req.Source) {
 			return reply, ErrFenced
@@ -107,8 +140,26 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 	c.mu.Lock()
 	entry := c.locals[req.Partition]
 	c.mu.Unlock()
-	if entry == nil || entry.owner.Epoch != req.Epoch {
+	if entry == nil {
 		return reply, ErrFenced
+	}
+	if req.Operation == "applied_position" {
+		if req.Session == "" || req.Session != entry.owner.Session {
+			return reply, ErrFenced
+		}
+		entry.mu.RLock()
+		defer entry.mu.RUnlock()
+		if entry.service == nil || entry.service.graphReplica == nil {
+			return reply, ErrPartitionUnavailable
+		}
+		pos, err := entry.service.graphReplica.leaderApplied()
+		return partitionReply{GraphPosition: &pos}, err
+	}
+	if entry.owner.Epoch != req.Epoch {
+		return reply, ErrFenced
+	}
+	if req.Operation == "follower_search" {
+		return c.executeFollowerRead(ctx, entry, req.Query)
 	}
 	if !(c.coordinator.leaseReads && req.Operation == "deliver") {
 		if e := c.coordinator.Check(ctx, entry.owner); e != nil {

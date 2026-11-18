@@ -10,6 +10,9 @@ import (
 func (c *ClusterService) Mutate(ctx context.Context, id string, m Mutation, deleted bool) (_ Record, err error) {
 	partition := c.router.DataForID(id)
 	defer c.observations.pipeline.track("data_mutate", string(sourceID(partition)))(&err)
+	if c.layout.Routing != nil {
+		return c.routeMutation(ctx, partition, id, m, deleted)
+	}
 	if group := c.mutationGroups[partition]; group != nil {
 		return group.mutate(ctx, id, m, deleted)
 	}
@@ -31,7 +34,7 @@ func (c *ClusterService) Sync(ctx context.Context) error {
 		return e
 	}
 	for d, r := range c.data {
-		targets[d], e = r.readCounter(ctx, tx, "log-head")
+		targets[d], e = r.logHead(ctx, tx)
 		if e != nil {
 			_ = tx.Rollback()
 			return e

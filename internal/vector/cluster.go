@@ -15,6 +15,7 @@ import (
 )
 
 type ClusterConfig struct {
+	WriteEndpoint               string
 	GraphCheckpointBytes        uint64
 	GraphCheckpointAge          time.Duration
 	Routing                     *ClusterRouting
@@ -34,6 +35,10 @@ type ClusterService struct {
 	checkpointBytes    uint64
 	checkpointAge      time.Duration
 	maintenanceDone    chan struct{}
+	runCtx             context.Context
+	writerMu           sync.RWMutex
+	writers            map[DataPartitionID]*mutationGroup
+	writeRoutes        map[DataPartitionID]Ownership
 	mutationGroups     map[DataPartitionID]*mutationGroup
 	observations       clusterObservations
 	dispatchMu         sync.Mutex
@@ -141,7 +146,7 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 			}
 		}
 	}
-	node := ClusterNode{HostID: cfg.HostID, Zone: cfg.Zone, MemoryBudgetBytes: cfg.MemoryBudgetBytes, Capacity: cfg.Capacity, Roles: roles, ID: cfg.NodeID, Session: uuid.NewString(), URL: cfg.AdvertiseURL}
+	node := ClusterNode{WriteEndpoint: cfg.WriteEndpoint, HostID: cfg.HostID, Zone: cfg.Zone, MemoryBudgetBytes: cfg.MemoryBudgetBytes, Capacity: cfg.Capacity, Roles: roles, ID: cfg.NodeID, Session: uuid.NewString(), URL: cfg.AdvertiseURL}
 	if e := validateNode(node); e != nil {
 		return nil, e
 	}
@@ -185,9 +190,11 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 		return nil, e
 	}
 	runCtx, cancel := context.WithCancel(ctx)
-	c := &ClusterService{consumerRetention: cfg.ConsumerRetention, graphReplication: cfg.IndexReplication == "graph", lastSample: time.Now(), replicas: cfg.Replicas, PartitionedService: &PartitionedService{layout: layout, router: IdentityPartitionRouter{layout}, data: map[DataPartitionID]*Repository{}, indexes: map[IndexPartitionID]PartitionIndex{}, dimension: root.Dimension}, coordinator: &Coordinator{leaseReads: cfg.Routing != nil, failureDomain: cfg.FailureDomain, loadBalance: cfg.Scheduler == "load", balanceCooldown: cfg.BalanceCooldown, root: root, ttl: cfg.LeaseTTL.Milliseconds()}, node: node, objects: objects, token: cfg.Token, root: root, locals: map[IndexPartitionID]*localPartition{}, cancel: cancel, done: make(chan struct{}), client: &http.Client{Timeout: 30 * time.Second}}
+	c := &ClusterService{runCtx: runCtx, consumerRetention: cfg.ConsumerRetention, graphReplication: cfg.IndexReplication == "graph", lastSample: time.Now(), replicas: cfg.Replicas, PartitionedService: &PartitionedService{layout: layout, router: IdentityPartitionRouter{layout}, data: map[DataPartitionID]*Repository{}, indexes: map[IndexPartitionID]PartitionIndex{}, dimension: root.Dimension}, coordinator: &Coordinator{leaseReads: cfg.Routing != nil, failureDomain: cfg.FailureDomain, loadBalance: cfg.Scheduler == "load", balanceCooldown: cfg.BalanceCooldown, root: root, ttl: cfg.LeaseTTL.Milliseconds()}, node: node, objects: objects, token: cfg.Token, root: root, locals: map[IndexPartitionID]*localPartition{}, cancel: cancel, done: make(chan struct{}), client: &http.Client{Timeout: 30 * time.Second}}
 	if cfg.Routing != nil {
 		c.router = clusterRouter{IdentityPartitionRouter{layout}, layout.Routing}
+		c.writers = make(map[DataPartitionID]*mutationGroup)
+		c.writeRoutes = make(map[DataPartitionID]Ownership)
 		c.dispatchers = map[DataPartitionID]*dataDispatcher{}
 		c.dispatchDone = make(chan struct{})
 		c.dispatchSignals = newSourceSignals()
@@ -229,11 +236,13 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 	c.coordinator.referenceLogs = c.graphReplication
 	c.coordinator.data = c.data
 	c.checkpointBytes, c.checkpointAge = cfg.GraphCheckpointBytes, cfg.GraphCheckpointAge
-	c.mutationGroups = make(map[DataPartitionID]*mutationGroup, len(c.data))
-	for id, repo := range c.data {
-		group := newMutationGroup(runCtx, repo, &c.observations.pipeline, string(sourceID(id)))
-		group.onCommit = func() { c.signalSource(id, "write", false) }
-		c.mutationGroups[id] = group
+	if cfg.Routing == nil {
+		c.mutationGroups = make(map[DataPartitionID]*mutationGroup, len(c.data))
+		for id, repo := range c.data {
+			group := newMutationGroup(runCtx, repo, &c.observations.pipeline, string(sourceID(id)))
+			group.onCommit = func() { c.signalSource(id, "write", false) }
+			c.mutationGroups[id] = group
+		}
 	}
 	if e = c.coordinator.Heartbeat(ctx, node); e != nil {
 		cancel()

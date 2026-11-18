@@ -65,7 +65,7 @@ func (c *ClusterService) partitionHead(ctx context.Context, id IndexPartitionID)
 			return 0, e
 		}
 		defer tx.Rollback()
-		return repo.readCounter(ctx, tx, "log-head")
+		return repo.logHead(ctx, tx)
 	}
 	return 0, fmt.Errorf("%w: unknown data binding %s", ErrPartitionUnavailable, id)
 }

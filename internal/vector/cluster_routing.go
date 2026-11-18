@@ -95,7 +95,7 @@ func (r *Repository) ensureRoutedLayout(ctx context.Context, n int, route *Clust
 	} else if !tikverr.IsErrNotFound(e) {
 		return l, e
 	} else {
-		head, err := r.readCounter(ctx, tx, "log-head")
+		head, err := r.logHead(ctx, tx)
 		if err != nil {
 			return l, err
 		}
@@ -106,11 +106,21 @@ func (r *Repository) ensureRoutedLayout(ctx context.Context, n int, route *Clust
 			return l, e
 		}
 	}
-	mode := fmt.Sprintf("v14-cluster-routing-lease-%s-%s-retention=%t", scheduler, domain, retention)
+	previous := fmt.Sprintf("v14-cluster-routing-lease-%s-%s-retention=%t", scheduler, domain, retention)
+	mode := previous + "-owner-append-v1"
 	key = []byte(r.Prefix + "cluster-mode")
 	raw, e = tx.Get(ctx, key)
 	if e == nil && string(raw) != mode {
-		return l, errors.New("incompatible cluster routing protocol")
+		if string(raw) != previous {
+			return l, errors.New("incompatible cluster routing protocol")
+		}
+		nodes, err := (&Coordinator{root: r}).nodesIn(ctx, tx)
+		if err != nil {
+			return l, err
+		}
+		if len(nodes) > 0 {
+			return l, errors.New("stop all old cluster processes and wait for node leases to expire before upgrading data writers")
+		}
 	}
 	if e != nil && !tikverr.IsErrNotFound(e) {
 		return l, e

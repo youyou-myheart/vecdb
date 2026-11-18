@@ -1,5 +1,7 @@
 """Real-process fault matrix: fixed clusters, repeated failures, exact state oracle."""
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import grpc
 import json
 import math
 import os
@@ -12,6 +14,7 @@ import uuid
 from cluster_local import LocalCluster, ROOT
 sys.path.insert(0, str(ROOT/'sdk/python'))
 from vectorstore import Client, messages
+from vectorstore.v1.vector_pb2_grpc import VectorStoreStub
 
 
 def converged(state, data_count=4, index_count=3):
@@ -25,6 +28,11 @@ def converged(state, data_count=4, index_count=3):
     for index, head in heads.items():
         owners = state.get('replica_owners', {}).get(index, {}).get('owners', [])
         if len(owners) != 2 or head['visible'] != head['committed']:
+            return False
+        publisher = state.get('replica_plans', {}).get(index, {}).get('publisher')
+        owner = next((o for o in owners if o['partition'] == publisher), None)
+        leader = head.get('leader', {})
+        if not owner or any(leader.get(k) != owner.get(k) for k in ('partition', 'node', 'session', 'epoch')):
             return False
         if any(state.get('graph_positions', {}).get(o['partition']) != head['visible'] for o in owners):
             return False
@@ -82,13 +90,29 @@ def main():
     def caught():
         return converged(state())
 
+    def retry_put(id, vector, key):
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                return c.request('/v1/records/'+id, 'PUT', dict(request_id=key, vector=vector))['token']
+            except urllib.error.HTTPError as exc:
+                if exc.code != 503 or time.monotonic() >= deadline:
+                    raise
+                time.sleep(.1)
+
     def put(id, vector, request=None):
-        token = c.request('/v1/records/'+id, 'PUT', dict(request_id=request or uuid.uuid4().hex, vector=vector))['token']
+        token = retry_put(id, vector, request or uuid.uuid4().hex)
         expected[id] = dict(vector=vector, revision=token['revision'])
         return token
 
     def delete(id, client):
-        client.delete(id, request_id=uuid.uuid4().hex)
+        request_id = uuid.uuid4().hex
+        try:
+            client.delete(id, request_id=request_id)
+        except grpc.RpcError as exc:
+            if exc.code() != grpc.StatusCode.UNAVAILABLE:
+                raise
+            client.delete(id, request_id=request_id)
         expected.pop(id, None)
 
     def metrics(url=None):
@@ -136,16 +160,22 @@ def main():
         with Client('127.0.0.1:19080', env['API_TOKEN'], timeout=60) as client:
             layout = client.layout()
             assert layout.data_partitions == 4 and len(layout.bindings) == 3 and len(layout.routing.centers) == 3
+            client.put('offline', [-10, 0], request_id='before-stop')
+            expected['offline'] = dict(vector=[-10, 0], revision=1)
             for node in c.workers:
                 os.kill(c.children[node].pid, signal.SIGSTOP); paused.add(node)
-            started = time.monotonic(); put('offline', [-10, 0])
-            assert time.monotonic()-started < 3 and client.get('offline').revision == 1
-            assert metric_sum(metrics(), 'vecdb_data_pending_events') == 1
+            try:
+                client.put('offline', [-10, 1], request_id='during-stop', timeout=.4)
+                raise AssertionError('write ACK with every data owner paused')
+            except grpc.RpcError as exc:
+                assert exc.code() in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED), exc
+            assert client.get('offline').revision == 1
             for node in paused:
                 os.kill(c.children[node].pid, signal.SIGCONT)
             paused.clear()
+            put('offline', [-10, 1], request='during-stop')
             wait('dispatcher resumes from durable data', caught)
-            check('business_writes_continue_without_workers_and_backlog_is_observable')
+            check('owner_unavailable_no_write_ack_raw_read_available_retry_once')
             for i in range(90):
                 center = centers[i%3]
                 put(str(i), [center[0]+(i//3)*.001, center[1]])
@@ -171,12 +201,23 @@ def main():
             # never overwrite newer graph or source progress.
             before = state()
             old = before['data_progress']['data-0000']['owner']
+            stale_id = next(id for id in sorted(expected) if int.from_bytes(hashlib.sha256(id.encode()).digest()[:8], 'big') % 4 == 0)
+            route = client.stub.ResolveWriteRoute(messages.GetRequest(id=stale_id), metadata=client.metadata, timeout=3)
+            assert route.endpoint and route.partition == 0 and route.epoch == old['epoch']
             victim = old['node']
             os.kill(c.children[victim].pid, signal.SIGSTOP); paused.add(victim)
+            wait('expired source lease replaced', lambda: state()['data_progress']['data-0000']['owner']['epoch'] > old['epoch'])
             for i in range(12):
                 put('stale-'+str(i), [10, i*.001])
-            wait('expired source lease replaced', lambda: state()['data_progress']['data-0000']['owner']['epoch'] > old['epoch'])
             os.kill(c.children[victim].pid, signal.SIGCONT); paused.remove(victim)
+            with grpc.insecure_channel(route.endpoint) as channel:
+                try:
+                    VectorStoreStub(channel).Put(messages.PutRequest(id=stale_id, vector=[0, 0],
+                        request_id='old-owner-write', route=route), metadata=client.metadata, timeout=5)
+                    raise AssertionError('stale writer acknowledged')
+                except grpc.RpcError as exc:
+                    assert exc.code() == grpc.StatusCode.FAILED_PRECONDITION, exc
+            assert client.get(stale_id).revision == expected[stale_id]['revision']
             verify(client)
             check('SIGSTOP_lease_expiry_takeover_and_stale_owner_resume')
 
@@ -194,8 +235,7 @@ def main():
                 def write_new(i):
                     id = f'round-{round}-{i}'
                     center = centers[i%3]
-                    return id, [center[0]+i*.001, center[1]], c.request('/v1/records/'+id, 'PUT',
-                        dict(request_id='new-'+id, vector=[center[0]+i*.001, center[1]]))['token']
+                    return id, [center[0]+i*.001, center[1]], retry_put(id, [center[0]+i*.001, center[1]], 'new-'+id)
                 with ThreadPoolExecutor(max_workers=4) as pool:
                     for id, vector, token in pool.map(write_new, range(48)):
                         expected[id] = dict(vector=vector, revision=token['revision'])

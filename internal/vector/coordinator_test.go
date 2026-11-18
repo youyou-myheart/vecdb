@@ -107,7 +107,7 @@ func TestCoordinatorPlacementAndMode(t *testing.T) {
 	if e := root.ensureMode(ctx, false); e == nil {
 		t.Fatal("single process bypass")
 	}
-	if string(db.data[root.Prefix+"schema"]) != "v5:dimension=2:metric=l2:cluster-master=1" {
+	if string(db.data[root.Prefix+"schema"]) != "v5:dimension=2:metric=l2:cluster-master=1"+dataLogSchemaSuffix {
 		t.Fatal("old binary not excluded")
 	}
 	c := &Coordinator{root: root, ttl: 3000}

@@ -1,5 +1,6 @@
 """Real-process acceptance for automatic checkpoints and reference-safe GC."""
 import argparse
+import grpc
 import hashlib
 import json
 import os
@@ -52,7 +53,14 @@ def run(mode):
         for n in range(start, end):
             center = [[-10, 0], [0, 10], [10, 0]][n % 3]
             v = [center[0]+(n % 11)/100, center[1]+(n % 7)/100]
-            client.put(str(n), v, request_id=f'initial-{n}', payload={'cluster': str(n % 3)})
+            # Retry a lost transport response with the original request identity.
+            for attempt in range(2):
+                try:
+                    client.put(str(n), v, request_id=f'initial-{n}', payload={'cluster': str(n % 3)})
+                    break
+                except grpc.RpcError as exc:
+                    if attempt or exc.code() != grpc.StatusCode.UNAVAILABLE:
+                        raise
             expected[str(n)] = v
 
     try:
@@ -95,15 +103,16 @@ def run(mode):
             assert before == after
             report['checks'].append('idle_graph_does_not_repeat_checkpoints')
             # Kill all workers after both streams have been compacted. TiKV
-            # point reads/writes remain independent of worker availability.
+            # point reads stay available. Recovered writers resume at the GC floor.
             for node in list(c.workers):
                 c.children[node].kill()
                 c.children[node].wait(timeout=10)
             c.workers.clear()
             assert client.get('0').id == '0'
-            write(client, 120, 135)
             c.scale(3)
             c.wait_ready()
+            wait('all source writers recover after GC', lambda: all(d['owner_available'] for d in c.status()['data_progress'].values()))
+            write(client, 120, 135)
             client.search([0, 0], k=1, min_visible=messages.Token(id=str(max(map(int, expected))), revision=1), timeout=60)
             wait('restored_query_replicas_reach_the_durable_graph_tail', lambda: converged(c.status(), 4, 3))
             result = client.search([0, 0], k=1000, exact=True, timeout=60)

@@ -124,7 +124,7 @@ func (c *Coordinator) ScheduleReplicas(ctx context.Context, leader Ownership, la
 				e = err
 				next.Barrier = h.Committed.DataOffset
 			} else {
-				next.Barrier, e = data.readCounter(ctx, tx, "log-head")
+				next.Barrier, e = data.logHead(ctx, tx)
 			}
 			if e != nil {
 				return e

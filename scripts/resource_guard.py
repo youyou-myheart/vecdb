@@ -99,7 +99,9 @@ class ResourceGuard:
                     self.stop.wait(2)
                     continue
                 row = self.sample()
-                reason = limit_reason(row)
+                reason = limit_reason(dict(row, elapsed_seconds=0))
+                if row.get("elapsed_seconds", 0) >= getattr(getattr(self.fixture, "args", None), "max_seconds", 240):
+                    reason = reason or "trial reached configured runtime budget"
                 busy = busy+1 if row['system_cpu_percent'] > row['logical_cpus']*80 else 0
                 slow = slow+1 if time.monotonic()-start > 3 else 0
                 reason = reason or ('system CPU above 80% for three samples' if busy>=3 else None)

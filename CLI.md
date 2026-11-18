@@ -2,6 +2,8 @@
 
 `vectorctl` 提供集群状态、维护操作、记录读写及最近邻搜索。业务和状态命令通过 HTTP(S) 调用 Gateway，可用于已有远程集群；启动、扩缩容和停止通过本机 Unix socket 调用进程管理器，只管理该管理器启动的进程。
 
+`vectorctl search --follower --vector '[1,2,3]' --k 10` 使用 Follower Read，输出各分片的目标/已应用位点和排队、捕获、等待 apply、查询耗时。不能与 `--visible-id` 组合，详见 [FOLLOWER_READ.md](FOLLOWER_READ.md)。
+
 ## 编译与配置
 
 在仓库根目录执行：

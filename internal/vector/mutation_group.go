@@ -1,10 +1,12 @@
 package vector
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	tikverr "github.com/tikv/client-go/v2/error"
@@ -26,8 +28,18 @@ type mutationRequest struct {
 
 // One short-lived drainer per local DataPartition. The first request starts
 // immediately; subsequent commits combine only already queued work. No timer
-// delays an ACK to fill a batch. Different partitions/gateways remain concurrent.
+// delays an ACK to fill a batch. Different DataPartitions drain independently.
+type appendLease struct {
+	owner   Ownership
+	guard   []byte
+	token   []byte
+	head    atomic.Uint64
+	expires atomic.Int64
+	// An ambiguous commit stops admission until the dispatcher recovers a new epoch.
+	uncertain atomic.Bool
+}
 type mutationGroup struct {
+	lease     *appendLease
 	ctx       context.Context
 	repo      *Repository
 	metrics   *pipelineMetrics
@@ -62,6 +74,9 @@ func (b *mutationGroup) mutate(ctx context.Context, id string, m Mutation, delet
 		b.mu.Lock()
 		if b.closed || b.ctx.Err() != nil {
 			b.mu.Unlock()
+			if b.lease != nil {
+				return Record{}, ErrFenced
+			}
 			return Record{}, context.Canceled
 		}
 		if err = ctx.Err(); err != nil {
@@ -145,7 +160,7 @@ func (b *mutationGroup) drain() {
 		// retrying the same request ID, just like an ordinary mutation.
 		ctx, cancel := context.WithTimeout(b.ctx, 10*time.Second)
 		measure := b.metrics.track("data_group_commit", b.partition)
-		results, err := b.repo.mutateGroup(ctx, active)
+		results, err := b.repo.appendGroup(ctx, active, b.lease)
 		measure(&err)
 		cancel()
 		b.metrics.observeBatch("data_commit", b.partition, len(active), err)
@@ -160,8 +175,11 @@ func (b *mutationGroup) drain() {
 }
 
 func (r *Repository) mutateGroup(ctx context.Context, batch []*mutationRequest) ([]mutationResult, error) {
+	return r.appendGroup(ctx, batch, nil)
+}
+func (r *Repository) appendGroup(ctx context.Context, batch []*mutationRequest, lease *appendLease) ([]mutationResult, error) {
 	for attempt := 0; ; attempt++ {
-		results, err := r.mutateGroupOnce(ctx, batch)
+		results, err := r.mutateGroupOnce(ctx, batch, lease)
 		if !tikverr.IsErrWriteConflict(errors.Unwrap(err)) || attempt >= 15 {
 			return results, err
 		}
@@ -175,7 +193,7 @@ func (r *Repository) mutateGroup(ctx context.Context, batch []*mutationRequest) 
 	}
 }
 
-func (r *Repository) mutateGroupOnce(ctx context.Context, batch []*mutationRequest) (results []mutationResult, err error) {
+func (r *Repository) mutateGroupOnce(ctx context.Context, batch []*mutationRequest, lease *appendLease) (results []mutationResult, err error) {
 	results = make([]mutationResult, len(batch))
 	defer func() {
 		if err != nil {
@@ -189,7 +207,15 @@ func (r *Repository) mutateGroupOnce(ctx context.Context, batch []*mutationReque
 		return results, err
 	}
 	defer tx.Rollback()
-	keys := [][]byte{[]byte(r.Prefix + "log-head")}
+	var keys [][]byte
+	if lease != nil {
+		if lease.uncertain.Load() || txnMillis(tx) >= lease.expires.Load() {
+			return results, ErrFenced
+		}
+		keys = append(keys, lease.guard)
+	} else {
+		keys = append(keys, []byte(r.Prefix+"log-floor"))
+	}
 	for _, q := range batch {
 		keys = append(keys, r.key("record", q.id), r.key("request", q.mutation.RequestID))
 	}
@@ -199,8 +225,15 @@ func (r *Repository) mutateGroupOnce(ctx context.Context, batch []*mutationReque
 	}
 	cached := prefetchedTransaction{transactionAPI: tx, values: values}
 	changed := false
+	var tail appendCursor
+	if lease != nil {
+		if !bytes.Equal(values[string(lease.guard)], lease.token) {
+			return results, ErrFenced
+		}
+		tail = appendCursor{lsn: lease.head.Load(), known: true}
+	}
 	for n, q := range batch {
-		rec, wrote, e := r.mutateIn(ctx, cached, q.preparedMutation)
+		rec, wrote, e := r.mutateIn(ctx, cached, q.preparedMutation, &tail)
 		if e != nil && !errors.Is(e, ErrConflict) {
 			return results, e
 		}
@@ -208,8 +241,19 @@ func (r *Repository) mutateGroupOnce(ctx context.Context, batch []*mutationReque
 		changed = changed || wrote
 	}
 	if changed {
+		if lease != nil {
+			if err = tx.Set(lease.guard, lease.token); err != nil {
+				return results, err
+			}
+		}
 		if err = tx.Commit(ctx); err != nil {
+			if lease != nil && !tikverr.IsErrWriteConflict(err) {
+				lease.uncertain.Store(true)
+			}
 			return results, fmt.Errorf("commit not confirmed; retry same request_id: %w", err)
+		}
+		if lease != nil {
+			lease.head.Store(tail.lsn)
 		}
 	}
 	return results, nil

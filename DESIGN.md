@@ -57,7 +57,7 @@ namespace 编码为十六进制前缀，避免路径分隔符造成键范围碰�
 |---|---|---|
 | schema | 格式版本、维度、距离函数 | 首次创建后不可变；配置不一致拒绝启动 |
 | record/id | vector、payload、revision、deleted | revision 对同一 ID 严格递增 |
-| log/sequence、log-head | 连续序号事件，完整写后镜像或墓碑 | 和 record 同事务；序号键冲突重试 |
+| log/sequence | 连续序号事件，完整写后镜像或墓碑 | 和 record 同事务；序号键冲突重试 |
 | log-floor | 已清理前缀 | 和分批删除同事务；不能超过快照 offset |
 | request/request_id | 请求内容摘要、原始成功结果 | 同一个 ID 重试不能改变请求含义 |
 | manifest | generation、对象路径、大小、SHA-256、维度 | 读旧代际后条件更新 |
@@ -76,15 +76,17 @@ namespace 编码为十六进制前缀，避免路径分隔符造成键范围碰�
 ```mermaid
 sequenceDiagram
     participant C as 客户端
-    participant A as 服务
+    participant A as DataPartition owner（聚类模式）
     participant T as TiKV事务
     C->>A: PUT/DELETE + request_id + 可选 expected_revision
     A->>T: 读取幂等凭证
     Note over A,T: 已存在且摘要相同：返回原始结果
     A->>T: 读取记录，校验 expected_revision
-    A->>T: 读取 log-head，写下一个序号、记录、事件和幂等凭证
+    A->>A: 从内存末尾分配下一 LSN
+    A->>T: 校验写入 epoch，追加事件并写记录和幂等凭证
     A->>T: Commit
     T-->>A: 已提交
+    A->>A: 推进内存末尾并唤醒投递
     A-->>C: durable=true + id/revision token
 ```
 

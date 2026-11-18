@@ -9,15 +9,39 @@ import (
 )
 
 func (t tikvTransaction) Last(ctx context.Context, start, end []byte) ([]byte, []byte, error) {
+	return t.edge(ctx, start, end, true, false)
+}
+
+func (t tikvTransaction) LastKey(ctx context.Context, start, end []byte) ([]byte, error) {
+	key, _, err := t.edge(ctx, start, end, true, true)
+	return key, err
+}
+
+func (t tikvTransaction) FirstKey(ctx context.Context, start, end []byte) ([]byte, error) {
+	key, _, err := t.edge(ctx, start, end, false, true)
+	return key, err
+}
+
+func (t tikvTransaction) edge(ctx context.Context, start, end []byte, reverse, keyOnly bool) ([]byte, []byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
 	snapshot := t.GetSnapshot()
+	if keyOnly {
+		snapshot.SetKeyOnly(true)
+		defer snapshot.SetKeyOnly(false)
+	}
 	// The SDK treats a size <= 1 as the default (256). Two is the smallest
-	// supported reverse-scan batch; consume only the first pair, then close.
+	// supported scan batch; consume only the first pair, then close.
 	snapshot.SetScanBatchSize(2)
 	defer snapshot.SetScanBatchSize(txnsnapshot.DefaultScanBatchSize)
-	it, err := snapshot.IterReverse(end)
+	var it iteratorAPI
+	var err error
+	if reverse {
+		it, err = snapshot.IterReverse(end)
+	} else {
+		it, err = snapshot.Iter(start, end)
+	}
 	if err != nil {
 		return nil, nil, err
 	}

@@ -54,6 +54,7 @@ func TestRejectInvalidInputsBeforeNetwork(t *testing.T) {
 		{"record", "upsert", "--id", "a", "--request-id", "key", "--vector", "[1e999]"},
 		{"record", "insert", "--id", "a", "--request-id", "key", "--vector", "[]"},
 		{"search", "--vector", "[1]", "--visible-id", "a"},
+		{"search", "--vector", "[1]", "--follower", "--visible-id", "a", "--visible-revision", "1"},
 		{"search", "--vector", "[1]", "--k", "0"},
 		{"cluster", "scale", "--workers", "-1"},
 		{"cluster", "status", "--workers", "2"},
@@ -80,6 +81,24 @@ func TestSearchAndServerErrors(t *testing.T) {
 	err := run([]string{"--endpoint", srv.URL, "search", "--vector", "[1,2]", "--k", "3", "--exact", "--filter", `{"tag":"a"}`, "--visible-id", "a", "--visible-revision", "2"}, &out, &out)
 	if err == nil || !strings.Contains(err.Error(), "HTTP 503") || out.Len() != 0 {
 		t.Fatalf("error=%v output=%s", err, out.String())
+	}
+}
+
+func TestFollowerSearchRoute(t *testing.T) {
+	t.Setenv("API_TOKEN", "test-token")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/follower-search" || r.Method != "POST" {
+			t.Error(r.Method, r.URL)
+		}
+		_, _ = w.Write([]byte(`{"hits":[],"follower_reads":[{"replica":"b"}]}`))
+	}))
+	defer srv.Close()
+	var out bytes.Buffer
+	if err := run([]string{"--endpoint", srv.URL, "search", "--follower", "--vector", "[1,2]"}, &out, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "follower_reads") {
+		t.Fatal(out.String())
 	}
 }
 func TestClusterStatusPreservesLargeEpoch(t *testing.T) {

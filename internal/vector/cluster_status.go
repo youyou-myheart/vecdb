@@ -42,7 +42,7 @@ func (c *ClusterService) Status(ctx context.Context) (ClusterStatus, error) {
 			if e != nil {
 				return s, e
 			}
-			head, e := r.readCounter(ctx, tx, "log-head")
+			head, e := r.logHead(ctx, tx)
 			if e != nil {
 				_ = tx.Rollback()
 				return s, e
@@ -58,6 +58,13 @@ func (c *ClusterService) Status(ctx context.Context) (ClusterStatus, error) {
 				return s, e
 			}
 			owner, ownerErr := c.coordinator.Resolve(ctx, sourceID(d))
+			// Show the durable prefix even between owner renewals.
+			if owner.Epoch != 0 {
+				owner.Offset = done
+			}
+			if ownerErr != nil {
+				s.Ready = false
+			}
 			s.DataProgress[string(sourceID(d))] = DataProgress{Head: head, Completed: done, Floor: floor, Owner: owner, OwnerAvailable: ownerErr == nil}
 		}
 	}
@@ -116,9 +123,13 @@ func (c *ClusterService) Status(ctx context.Context) (ClusterStatus, error) {
 			}
 			var head uint64
 			if c.hotReplicas() {
-				head, e = c.partitionHead(ctx, b.Index)
-				if e != nil {
-					return s, e
+				if c.layout.Routing != nil && c.graphReplication {
+					head = s.GraphHeads[b.Index].Committed.DataOffset
+				} else {
+					head, e = c.partitionHead(ctx, b.Index)
+					if e != nil {
+						return s, e
+					}
 				}
 				s.LogHeads[b.Index] = head
 			}

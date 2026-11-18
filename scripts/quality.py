@@ -108,6 +108,8 @@ def stages_for(lane, python, directory):
                   timeout=780, env={'ONEBOX_ACCEPTANCE': '1'}, artifacts=tuple('reports/'+p+'onebox-pipeline.json' for p in ('', 'graph-', 'retention-', 'clustered-'))),
             Stage('build-server', go + ['build', '-o', '.tools/vector-server', './cmd/vector-server']),
             Stage('build-cli', go + ['build', '-o', '.tools/vectorctl', './cmd/vectorctl']),
+            Stage('build-writebench', go + ['build', '-o', '.tools/writebench', './scripts/writebench']),
+            Stage('performance-smoke', [python, 'scripts/verify_performance.py'], timeout=240, artifacts=('reports/performance-smoke.json',)),
             Stage('dispatch-faults', [python, 'scripts/verify_dispatch.py'], artifacts=('reports/dispatch-processes.json',)),
             Stage('retention-faults', [python, 'scripts/verify_retention.py'], timeout=300, artifacts=('reports/retention-processes.json',)),
             Stage('reference-checkpoints', [python, 'scripts/verify_reference_checkpoint.py'], timeout=300, artifacts=('reports/reference-checkpoint.json',)),

@@ -41,7 +41,7 @@ Output: JSON on stdout; errors on stderr and nonzero exit. Global options preced
   record get --id ID
   record delete --id ID --revision N --request-id KEY
   search --vector '[1,2,3]' --k 10 [--filter '{"tag":"a"}'] [--exact]
-         [--visible-id ID --visible-revision N] [--ef-search N]
+         [--visible-id ID --visible-revision N] [--ef-search N] [--follower]
 JSON arguments support @file. update replaces the whole vector and payload.
 search means nearest neighbors by squared L2 distance, not most recently inserted records.
 `
@@ -321,6 +321,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		k := sf.Int("k", 10, "nearest N (1..1000)")
 		filter := sf.String("filter", "{}", "attribute equality filters")
 		exact := sf.Bool("exact", false, "exact search")
+		follower := sf.Bool("follower", false, "wait for leader applied position on a follower, then search")
 		ef := sf.Int("ef-search", 0, "HNSW ef (0=default, max 4096)")
 		id := sf.String("visible-id", "", "read-your-write token ID")
 		rev := sf.Uint64("visible-revision", 0, "read-your-write token revision")
@@ -346,11 +347,17 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return errors.New("visible-id and positive visible-revision must be supplied together")
 		}
 		if *id != "" {
+			if *follower {
+				return errors.New("--follower cannot be combined with --visible-id")
+			}
 			q["min_visible"] = map[string]any{"id": *id, "revision": *rev}
 		}
 		body = q
 		method = "POST"
 		path = "/v1/search"
+		if *follower {
+			path = "/v1/follower-search"
+		}
 	default:
 		return fmt.Errorf("unknown command %q; use --help", args[0])
 	}

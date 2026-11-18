@@ -27,8 +27,12 @@ type Delivery struct {
 	Events       []LogEvent      `json:"events"`
 }
 type dataDispatcher struct {
+	deadline  time.Time
+	lastError string
+	writer    *mutationGroup
 	owner     Ownership
 	completed uint64
+	recovered bool
 	window    []LogEvent
 }
 
@@ -80,7 +84,7 @@ func (c *ClusterService) dispatchLoop(ctx context.Context) {
 			}
 		case <-c.dispatchSignals.wake:
 			ids := c.dispatchSignals.take()
-			if c.worker != nil && c.dispatchSelected(ctx, ids) {
+			if c.worker != nil && c.dispatchSelected(ctx, ids, false) {
 				if !waitIndexRetry(ctx, retry) {
 					c.releaseDispatchers()
 					return
@@ -95,7 +99,8 @@ func (c *ClusterService) dispatchLoop(ctx context.Context) {
 func (c *ClusterService) releaseDispatchers() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	for _, d := range c.dispatchers {
+	for id, d := range c.dispatchers {
+		c.retireWriter(id)
 		_, _ = c.coordinator.Update(ctx, d.owner, false, true)
 	}
 }
@@ -104,10 +109,10 @@ func (c *ClusterService) dispatchTick(ctx context.Context) {
 	for i := range ids {
 		ids[i] = DataPartitionID(i)
 	}
-	c.dispatchSelected(ctx, ids)
+	c.dispatchSelected(ctx, ids, true)
 }
 
-func (c *ClusterService) dispatchSelected(ctx context.Context, ids []DataPartitionID) bool {
+func (c *ClusterService) dispatchSelected(ctx context.Context, ids []DataPartitionID, control bool) bool {
 	defer c.observations.pipeline.track("dispatch_tick", "")(nil)
 	c.dispatchMu.Lock()
 	defer c.dispatchMu.Unlock()
@@ -115,38 +120,20 @@ func (c *ClusterService) dispatchSelected(ctx context.Context, ids []DataPartiti
 	failed := make([]bool, len(ids))
 	for n, id := range ids {
 		state := c.dispatchers[id]
-		a, e := c.coordinator.Assignment(ctx, sourceID(id))
-		if e != nil {
+		if control || (state != nil && state.writer.lease.uncertain.Load()) {
+			state = c.reconcileDispatcher(ctx, id, state)
+		}
+		// A wake is a hint. Only the control loop grants or extends authority.
+		if state == nil || c.draining.Load() || !time.Now().Before(state.deadline) {
 			continue
 		}
-		if a.Node != c.node.ID || a.Session != c.node.Session || c.draining.Load() {
-			if state != nil {
-				_, _ = c.coordinator.Update(ctx, state.owner, false, true)
-				delete(c.dispatchers, id)
-			}
-			continue
-		}
-		if state == nil {
-			o, err := c.coordinator.Acquire(ctx, sourceID(id), c.node)
-			if err != nil {
-				continue
-			}
-			state = &dataDispatcher{owner: o}
-			c.observations.acquisitions.Add(1)
-			c.dispatchers[id] = state
-		}
-		o, e := c.coordinator.Update(ctx, state.owner, true, false)
-		if e != nil {
-			delete(c.dispatchers, id)
-			continue
-		}
-		state.owner = o
 		wg.Add(1)
 		go func(n int, id DataPartitionID, s *dataDispatcher) {
 			defer wg.Done()
 			err := c.dispatchSource(ctx, id, s)
-			c.reportDispatch(ctx, s, err)
+			s.lastError = ""
 			if err != nil {
+				s.lastError = err.Error()
 				failed[n] = true
 				c.signalSource(id, "retry", true)
 			}
@@ -160,6 +147,59 @@ func (c *ClusterService) dispatchSelected(ctx context.Context, ids []DataPartiti
 	}
 	return false
 }
+
+// Each source has exactly one dispatcher goroutine in a round. Reconciliation
+// runs under dispatchMu between rounds, so status and lease observations agree.
+func (c *ClusterService) reconcileDispatcher(ctx context.Context, id DataPartitionID, s *dataDispatcher) *dataDispatcher {
+	a, err := c.coordinator.Assignment(ctx, sourceID(id))
+	if err != nil {
+		return nil
+	}
+	assigned := a.Node == c.node.ID && a.Session == c.node.Session && !c.draining.Load()
+	if s != nil && (!assigned || s.writer.lease.uncertain.Load()) {
+		c.retireWriter(id)
+		_, _ = c.coordinator.Update(ctx, s.owner, false, true)
+		delete(c.dispatchers, id)
+		s = nil
+	}
+	if !assigned {
+		return nil
+	}
+	if s == nil {
+		o, err := c.coordinator.Acquire(ctx, sourceID(id), c.node)
+		if err != nil {
+			return nil
+		}
+		c.observations.acquisitions.Add(1)
+		writer, err := c.recoverWriter(ctx, id, o)
+		if err != nil {
+			_, _ = c.coordinator.update(ctx, o, false, true, func(o *Ownership) { o.LastError = err.Error() })
+			return nil
+		}
+		s = &dataDispatcher{owner: o, writer: writer}
+	}
+	started := time.Now()
+	o, err := c.coordinator.update(ctx, s.owner, true, false, func(o *Ownership) {
+		if s.recovered {
+			o.Offset = s.completed
+		}
+		o.Phase = "Dispatching"
+		o.LastError = s.lastError
+	})
+	if err != nil {
+		c.retireWriter(id)
+		delete(c.dispatchers, id)
+		return nil
+	}
+	s.owner = o
+	s.deadline = leaseDeadline(started, time.Duration(c.coordinator.ttl)*time.Millisecond)
+	s.writer.lease.expires.Store(o.Expires)
+	c.dispatchers[id] = s
+	c.writerMu.Lock()
+	c.writers[id] = s.writer
+	c.writerMu.Unlock()
+	return s
+}
 func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID, s *dataDispatcher) (err error) {
 	started := time.Now()
 	defer c.observations.pipeline.track("dispatch_source", string(sourceID(id)))(&err)
@@ -170,45 +210,37 @@ func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID,
 			c.observations.dispatchErrors.Add(1)
 		}
 	}()
-	tx, e := c.root.begin()
-	if e != nil {
-		return e
+	if err = c.loadDispatchWindow(ctx, id, s); err != nil {
+		return err
 	}
-	done, e := c.completedIn(ctx, tx, id)
-	_ = tx.Rollback()
-	if e != nil {
-		return e
-	}
-	s.completed = done
-	// Commit can succeed in TiKV even when its response is lost. Reconcile the
-	// cache on every tick, including after an uncertain completion transaction.
-	for len(s.window) > 0 && s.window[0].Sequence <= done {
-		s.window[0] = LogEvent{}
-		s.window = s.window[1:]
-	}
-	if len(s.window) > 0 && s.window[0].Sequence != done+1 {
-		// The durable log is authoritative; reconstruct a discontinuous cache.
-		s.window = nil
-	}
-	if len(s.window) == 0 {
-		read := c.observations.pipeline.track("dispatch_read_log", string(sourceID(id)))
-		batch, err := c.data[id].readEvents(ctx, done, 0, dispatchBatchSize, dispatchBytes)
-		read(&err)
-		if err != nil {
-			return err
-		}
-		s.window = batch.Events
-	}
+	done := s.completed
 	if len(s.window) == 0 {
 		return nil
 	}
-	commits, e := c.sourceCommits(ctx, id)
+	// Each graph tail carries cumulative ACKs only for the events routed there.
+	// A delete broadcasts to all indexes, so its proof still requires all of them.
+	byIndex := make(map[IndexPartitionID][]LogEvent)
+	for _, event := range s.window {
+		for _, target := range c.eventTargets(event) {
+			byIndex[target] = append(byIndex[target], event)
+		}
+	}
+	targets := make([]IndexPartitionID, 0, len(byIndex))
+	for _, binding := range c.layout.Bindings {
+		if len(byIndex[binding.Index]) != 0 {
+			targets = append(targets, binding.Index)
+		}
+	}
+	commits, e := c.sourceCommits(ctx, id, targets)
 	if e != nil {
 		return e
 	}
 	next := completedPrefix(s.window, done, c.eventTargets, commits)
 	if next > done {
 		if e = c.advanceCompleted(ctx, id, s.owner, done, next); e != nil {
+			// Reconstruct the bounded window at the durable cursor on the next attempt.
+			s.recovered = false
+			s.window = nil
 			return e
 		}
 		clear(s.window[:int(next-done)])
@@ -222,24 +254,17 @@ func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID,
 		}
 	}
 	var wg sync.WaitGroup
-	errs := make([]error, len(c.layout.Bindings))
-	for n, b := range c.layout.Bindings {
-		q := Delivery{Source: id, Owner: s.owner, RouteVersion: c.layout.Epoch, Previous: max(commits[b.Index], done)}
-		for _, event := range s.window {
-			if event.Sequence <= q.Previous {
-				continue
-			}
-			for _, target := range c.eventTargets(event) {
-				if target == b.Index {
-					q.Events = append(q.Events, event)
-					q.Through = event.Sequence
-					break
-				}
-			}
+	errs := make([]error, len(targets))
+	for n, target := range targets {
+		previous := max(commits[target], done)
+		events := byIndex[target]
+		for len(events) > 0 && events[0].Sequence <= previous {
+			events = events[1:]
 		}
-		if len(q.Events) == 0 {
+		if len(events) == 0 {
 			continue
 		}
+		q := Delivery{Source: id, Owner: s.owner, RouteVersion: c.layout.Epoch, Previous: previous, Through: events[len(events)-1].Sequence, Events: events}
 		wg.Add(1)
 		go func(n int, target IndexPartitionID, q Delivery) {
 			defer wg.Done()
@@ -248,24 +273,83 @@ func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID,
 			if e := c.deliver(callCtx, target, q); e != nil {
 				errs[n] = fmt.Errorf("%s: %w", target, e)
 			}
-		}(n, b.Index, q)
+		}(n, target, q)
 	}
 	wg.Wait()
 	return errors.Join(errs...)
 }
-func (c *ClusterService) sourceCommits(ctx context.Context, id DataPartitionID) (_ map[IndexPartitionID]uint64, err error) {
+func (c *ClusterService) loadDispatchWindow(ctx context.Context, id DataPartitionID, s *dataDispatcher) error {
+	var head uint64
+	if s.writer != nil {
+		head = s.writer.lease.head.Load()
+	}
+	if s.recovered && (len(s.window) > 0 || (s.writer != nil && s.completed == head)) {
+		return nil
+	}
+	tx, e := c.root.begin()
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	done := s.completed
+	if !s.recovered {
+		done, e = c.completedIn(ctx, tx, id)
+		if e != nil {
+			return e
+		}
+		s.completed = done
+	}
+	// Commit can succeed in TiKV even when its response is lost. Reconcile the
+	// cached window against the durable prefix during recovery.
+	for len(s.window) > 0 && s.window[0].Sequence <= done {
+		s.window[0] = LogEvent{}
+		s.window = s.window[1:]
+	}
+	if len(s.window) > 0 && s.window[0].Sequence != done+1 {
+		// The durable log is authoritative; reconstruct a discontinuous cache.
+		s.window = nil
+	}
+	if len(s.window) == 0 {
+		read := c.observations.pipeline.track("dispatch_read_log", string(sourceID(id)))
+		repo := c.data[id]
+		var batch LogBatch
+		var err error
+		if s.writer != nil {
+			batch, err = repo.readEventsAtHead(ctx, tx, done, 0, head, dispatchBatchSize, dispatchBytes)
+		} else {
+			batch, err = repo.readEventsIn(ctx, tx, done, 0, dispatchBatchSize, dispatchBytes)
+		}
+		if err == nil && !s.recovered && batch.Head > batch.Floor {
+			// On takeover also verify the first retained key, even if completed
+			// is already far ahead. Both endpoints and the cursor share one snapshot.
+			var first []byte
+			first, err = tx.FirstKey(ctx, []byte(repo.Prefix+"log/"), []byte(repo.Prefix+"log0"))
+			if err == nil && !bytes.Equal(first, repo.logKey(batch.Floor+1)) {
+				err = fmt.Errorf("data log gap at retained lower bound %d", batch.Floor+1)
+			}
+		}
+		read(&err)
+		if err != nil {
+			return err
+		}
+		s.recovered = true
+		s.window = batch.Events
+	}
+	return nil
+}
+func (c *ClusterService) sourceCommits(ctx context.Context, id DataPartitionID, targets []IndexPartitionID) (_ map[IndexPartitionID]uint64, err error) {
 	defer c.observations.pipeline.track("dispatch_poll_commits", string(sourceID(id)))(&err)
 	defer func() {
-		c.observations.pipeline.observeBatch("source_heads", string(sourceID(id)), len(c.layout.Bindings), err)
+		c.observations.pipeline.observeBatch("source_heads", string(sourceID(id)), len(targets), err)
 	}()
 	tx, err := c.root.begin()
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	keys := make([][]byte, 0, len(c.layout.Bindings))
-	for _, b := range c.layout.Bindings {
-		keys = append(keys, (graphJournal{c: c.coordinator, id: b.Index}).key("head"))
+	keys := make([][]byte, 0, len(targets))
+	for _, target := range targets {
+		keys = append(keys, (graphJournal{c: c.coordinator, id: target}).key("head"))
 	}
 	values, err := batchGet(ctx, tx, keys)
 	if err != nil {
@@ -273,12 +357,12 @@ func (c *ClusterService) sourceCommits(ctx context.Context, id DataPartitionID) 
 	}
 	cached := prefetchedTransaction{transactionAPI: tx, values: values}
 	commits := map[IndexPartitionID]uint64{}
-	for _, b := range c.layout.Bindings {
-		h, err := (graphJournal{c: c.coordinator, id: b.Index}).headIn(ctx, cached)
+	for _, target := range targets {
+		h, err := (graphJournal{c: c.coordinator, id: target}).headIn(ctx, cached)
 		if err != nil {
 			return nil, err
 		}
-		commits[b.Index] = h.Sources[fmt.Sprint(id)]
+		commits[target] = h.Sources[fmt.Sprint(id)]
 	}
 	return commits, nil
 }
@@ -405,7 +489,7 @@ func (c *ClusterService) validateDeliveryBounds(ctx context.Context, tx transact
 // no per-event routing journal is needed. Commit rechecks the Index-local epoch
 // and cursors; its Index fence rejects a stale snapshot after concurrent append/GC.
 func (c *ClusterService) validateDeliveryEvents(ctx context.Context, tx transactionAPI, id IndexPartitionID, q Delivery) error {
-	b, e := c.data[q.Source].readEventsIn(ctx, tx, q.Previous, q.Through, dispatchBatchSize, dispatchBytes)
+	b, e := c.data[q.Source].readEventsAtHead(ctx, tx, q.Previous, q.Through, q.Through, dispatchBatchSize, dispatchBytes)
 	if e != nil {
 		return e
 	}
@@ -426,29 +510,4 @@ func (c *ClusterService) validateDeliveryEvents(ctx context.Context, tx transact
 		return errors.New("delivery includes unexpected events")
 	}
 	return nil
-}
-
-func (c *ClusterService) reportDispatch(ctx context.Context, s *dataDispatcher, cause error) {
-	tx, e := c.root.begin()
-	if e != nil {
-		return
-	}
-	defer tx.Rollback()
-	o, e := c.coordinator.readOwner(ctx, tx, s.owner.Partition)
-	if e != nil || !sameOwner(o, s.owner) || o.Expires <= txnMillis(tx) {
-		return
-	}
-	message := ""
-	if cause != nil {
-		message = cause.Error()
-	}
-	if o.Offset == s.completed && o.LastError == message {
-		return
-	}
-	o.Offset = s.completed
-	o.LastError = message
-	o.Phase = "Dispatching"
-	if e = putJSON(tx, c.coordinator.ownerKey(o.Partition), o); e == nil {
-		_ = tx.Commit(ctx)
-	}
 }

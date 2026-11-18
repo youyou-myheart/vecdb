@@ -17,20 +17,21 @@ type graphBlobs interface {
 	loadBytes(context.Context, Manifest) ([]byte, error)
 }
 type graphReplica struct {
-	writer       *indexWriter
-	fastAppend   bool // Under Service.syncMu and writer.op.
-	input        *routedInput
-	retention    bool
-	checkpointMu sync.Mutex
-	viewMu       sync.RWMutex
-	journal      graphJournal
-	repo         *Repository
-	objects      graphBlobs
-	position     GraphPosition
-	prepared     GraphPosition
-	delta        *GraphDelta
-	reset        *IndexSnapshot
-	leader       bool // Last authoritative plan read; guarded by Service.syncMu.
+	followerReads *followerReadQueue // Under viewMu; position publication wakes waiters.
+	writer        *indexWriter
+	fastAppend    bool // Under Service.syncMu and writer.op.
+	input         *routedInput
+	retention     bool
+	checkpointMu  sync.Mutex
+	viewMu        sync.RWMutex
+	journal       graphJournal
+	repo          *Repository
+	objects       graphBlobs
+	position      GraphPosition
+	prepared      GraphPosition
+	delta         *GraphDelta
+	reset         *IndexSnapshot
+	leader        bool // Last authoritative plan read; guarded by Service.syncMu.
 }
 
 func newGraphService(ctx context.Context, r *Repository, o ObjectAPI, j graphJournal) (*Service, error) {
@@ -146,6 +147,9 @@ func (g *graphReplica) apply(s *Service, d *GraphDelta, state *IndexSnapshot, po
 	}
 	g.position = pos
 	s.cursor = pos.DataOffset
+	if g.followerReads != nil {
+		g.followerReads.applied(pos)
+	}
 	return nil
 }
 func (g *graphReplica) catchUp(ctx context.Context, s *Service, target GraphPosition) (err error) {
@@ -353,16 +357,20 @@ func (g *graphReplica) checkpoint(ctx context.Context, s *Service) (Manifest, er
 	if e != nil {
 		return m, e
 	}
+	var dataManifestKey []byte
+	if g.input == nil {
+		dataManifestKey = []byte(g.repo.Namespace() + "manifest")
+	}
 	if g.journal.c.referenceLogs {
 		// Upload is outside syncMu, so ongoing ingestion can conflict on the
 		// ownership fence. Retry only definite transaction aborts, reusing S and
 		// the validated object; never repeat the upload or guess an unknown commit.
 		e = retryIndexCommit(ctx, func() error {
-			return g.journal.saveCheckpoint(ctx, head.Committed, m, g.repo, &head)
+			return g.journal.saveCheckpoint(ctx, head.Committed, m, dataManifestKey, &head)
 		}, func() {})
 		return m, e
 	}
-	return m, g.journal.SaveCheckpoint(ctx, head.Committed, m, g.repo)
+	return m, g.journal.saveCheckpoint(ctx, head.Committed, m, dataManifestKey, nil)
 }
 
 func (s *Service) searchGraphLocal(ctx context.Context, q Search) ([]Hit, GraphPosition, error) {
@@ -398,7 +406,7 @@ func (s *Service) syncGraphThrough(ctx context.Context) error {
 	if e != nil {
 		return e
 	}
-	target, e := s.graphReplica.repo.readCounter(ctx, tx, "log-head")
+	target, e := s.graphReplica.repo.logHead(ctx, tx)
 	_ = tx.Rollback()
 	if e != nil {
 		return e

@@ -8,6 +8,8 @@
 
 时延诊断新增 `GET /metrics?scope=local`，只读进程内指标，不依赖 TiKV。阶段 Histogram、最老队列年龄、内存实时应用位点以及 10 分钟 onebox 追平时间线见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md)。各 Worker 必须单独采集，Gateway 不汇总 Worker 的进程内时延。
 
+Follower Read 提供请求级 queue_ms、leader_capture_ms、wait_apply_ms、query_ms，并暴露队列长度、最老等待、目标差距、超时/取消/拒绝计数和捕获批量大小，见 [FOLLOWER_READ.md](FOLLOWER_READ.md)。wait_apply_ms 是收到目标后剩余的本地等待，不包含查询验证，也不代表 Leader 已索引全部已确认写入。
+
 聚类 Index Leader 使用入队通知驱动连续消费，空队列阻塞等待。Follower 每轮成功回放使图位点前进后，立即继续读取最新图日志；直到一次读取没有推进位点才等待 100 ms，再轮询。`vecdb_index_consumer_cycles_total{index_partition,reason}` 中 `continue` 为 Leader 连续处理，`follower_continue` 为 Follower 回放后的立即重读，`follower_poll` 仅为空闲等待后的轮询，`retry` 为失败退避后的重试；另有启动与通知唤醒。`vecdb_index_consumer_waiting` 显示是否正在等待，`index_consumer_work` / `index_consumer_idle` 阶段记录工作与等待时间。正常空闲 Leader 不应持续产生周期消费；Follower 不会因残留的 Leader 输入队列而空转。
 
 `vecdb_graph_commit_conflict_retries_total{index_partition}` 记录复用已持久化对象的确定写冲突重试。`graph_commit_attempt` 阶段的 error 表示单次事务冲突等错误，`graph_commit` 的 error 才表示整批提交最终失败；业务请求成功率另行观察，不能将这两种错误计数相加。
@@ -103,3 +105,11 @@ Graph committed 与 visible 在新协议中相等，均表示持久化可回放�
 - `index_queue_wait`：入队到取出；`index_queue_to_build`：入队到完成校验及版本合并、调用 HNSW GenerateDelta。后者包含前者，不能相加。直方图增加 0.25、0.75 ms 桶，保留原有 1 ms 门槛。
 
 本地指标走 `/metrics?scope=local`，TiKV 不可用时仍可查询。Follower 的 Publisher lease 指标为 0 是正常状态。续期失败不会延长 lease；必须同时查看有效性、缓存可用性和恢复阶段错误。
+
+
+### 数据分片写入 owner
+
+聚类布局下，Worker 的 `vecdb_pipeline_stage_seconds` 按分片记录三个阶段。通过 `stage="data_writer_recover"` 的 `_count` 和 `_sum` 查看恢复次数和耗时，这个阶段读取一次日志尾键。连续写入时观察 `data_owner_mutate` 的请求数和 `data_group_commit` 的批次数。SDK 直连的写入计入 Worker 指标。Gateway 的 `data_mutate` 只统计从 Gateway 转发的调用。运维查询 `data_progress` 可以在 owner 离线时从 TiKV 快照读取持久化 head、floor、completed_lsn。
+
+
+在 Worker 指标中，`vecdb_pipeline_batch_items{stage="source_heads"}` 记录每个来源窗口实际读取的 Index 数量。用同一时间段的 `_sum` 增量除以 `_count` 增量，可以区分单簇窗口与多目标窗口的平均读取量。`vecdb_pipeline_stage_seconds_count{stage="graph_progress_report"}` 统计尝试提交图副本状态的次数，已确认且连续无变化的心跳跳过该事务。各阶段对应的键和计数见 [TiKV 元数据访问清单](CLUSTER_ROUTING.md#tikv-元数据访问清单)。

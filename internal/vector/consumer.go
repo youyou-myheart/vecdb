@@ -131,7 +131,7 @@ func (p *PartitionedService) manageConsumer(ctx context.Context, q ConsumerReque
 		if e != nil {
 			return out, e
 		}
-		out.Head, e = r.readCounter(ctx, tx, "log-head")
+		out.Head, e = r.logHead(ctx, tx)
 		if e != nil {
 			return out, e
 		}

@@ -79,7 +79,7 @@ func TestHotReplicaWatermarkAndCircuit(t *testing.T) {
 	plan := ReplicaPlan{Serving: []Assignment{{Partition: "a"}, {Partition: "b"}}}
 	raw, _ := json.Marshal(plan)
 	db.data[string(coord.planKey(id))] = raw
-	db.data[root.Prefix+"log-head"] = []byte("7")
+	seed(db, root.logKey(7), LogEvent{Sequence: 7})
 	for _, name := range []string{"a", "b"} {
 		raw, _ = json.Marshal(Ownership{Partition: IndexPartitionID(name), Node: name, Session: "s", URL: "http://" + name, Ready: true, Expires: 10000})
 		db.data[string(coord.ownerKey(IndexPartitionID(name)))] = raw
@@ -92,7 +92,7 @@ func TestHotReplicaWatermarkAndCircuit(t *testing.T) {
 		calls = append(calls, r.URL.Host)
 		through = append(through, req.ReadThrough)
 		if r.URL.Host == "b" {
-			db.data[root.Prefix+"log-head"] = []byte("8")
+			seed(db, root.logKey(8), LogEvent{Sequence: 8})
 			return nil, errors.New("host disconnected")
 		}
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(fmt.Sprintf(`{"applied_offset":%d}`, req.ReadThrough))), Header: make(http.Header)}, nil

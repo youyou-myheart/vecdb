@@ -28,6 +28,8 @@ flowchart TB
     W2 --> S
 ```
 
+本节描述默认的一一对应布局。设置 `CLUSTER_ROUTING_FILE` 后，SDK 写入直达持有数据分片租约的 Worker，Gateway 为 HTTP 和旧客户端转发。聚类布局的写入依赖目标分片 owner 就绪，按 ID 读取仍可通过 Gateway 访问 TiKV。详见 [聚类布局的写入和接管](CLUSTER_ROUTING.md)。
+
 数据分区和索引分区继续保持一一对应。数据由 TiKV 承担持久化，任意 Gateway 可以按 ID hash 直接写正确的数据分区；不需要先把写请求转给 Worker。Worker 仅持有被分配索引的内存视图，消费对应来源日志。
 
 | 角色 | 职责 | 不承担的工作 |
@@ -174,7 +176,7 @@ quit
 - `scale N` 支持 0..32 个 Worker。只改变 Worker 数量，数据分区和索引分区数量保持固定。存活节点增加后，Master 按 rendezvous hash 重新分配受影响的索引分区；不需要重启 Gateway 或 Master。
 - 非零扩缩容会等待节点注册、Master 分配和实际 ready owner 收敛后返回。超时会显示当前状态，进程仍由启动器管理，可用 `status` 查看。
 - 缩容先停止末尾 Worker，等待 Master 重新分配，再从 SeaweedFS 快照和 TiKV 日志恢复。当前不是无损在线迁移，涉及迁移分区的查询可能暂时失败。
-- `scale 0` 停止所有 Worker，查询不能返回完整结果；Gateway 仍可持久化写入 TiKV。再 `scale 2` 时恢复所有分区及期间的写入。
+- 默认一一对应布局下，`scale 0` 停止所有 Worker，查询不能返回完整结果；Gateway 仍可持久化写入 TiKV。再 `scale 2` 时恢复所有分区及期间的写入。
 - `quit`、输入结束、Ctrl-C 或 SIGTERM 统一回收子进程。它是交互式本机工具，不是生产守护进程；不自动重启异常退出的子进程，也不管理远程主机。
 
 每次 Worker 启动采用新的节点身份，避免旧注册租期尚未到期时重用 Node ID。旧注册会等租期失效，但当前服务尚未清理历史注册；长时间反复扩缩容仍受上文 1024 条注册扫描上限约束。一个 namespace 应由一个本机启动器管理；跨主机部署仍使用上文的独立角色配置。

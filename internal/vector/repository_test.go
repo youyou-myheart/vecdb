@@ -133,6 +133,26 @@ func (f *fakeTx) Last(ctx context.Context, start, end []byte) ([]byte, []byte, e
 	return []byte(last), f.db.data[last], nil
 }
 
+func (f *fakeTx) FirstKey(ctx context.Context, start, end []byte) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	it, err := f.Iter(start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	if !it.Valid() {
+		return nil, tikverr.ErrNotExist
+	}
+	return it.Key(), nil
+}
+
+func (f *fakeTx) LastKey(ctx context.Context, start, end []byte) ([]byte, error) {
+	key, _, err := f.Last(ctx, start, end)
+	return key, err
+}
+
 type fakeIter struct {
 	keys   []string
 	values [][]byte
@@ -168,7 +188,7 @@ func TestRepositorySchema(t *testing.T) {
 			if e := r.ensureSchema(ctx); (e != nil) != tc.wantErr {
 				t.Fatal(e)
 			}
-			if !tc.wantErr && string(d.data["test/schema"]) != "v2:dimension=2:metric=l2:log=1" {
+			if !tc.wantErr && string(d.data["test/schema"]) != "v2:dimension=2:metric=l2:log=1"+dataLogSchemaSuffix {
 				t.Fatal("schema missing")
 			}
 		})
@@ -191,7 +211,7 @@ func TestRepositoryLifecycle(t *testing.T) {
 	if e != nil || first.Revision != 1 {
 		t.Fatal(first, e)
 	}
-	if len(d.data) != 4 || d.commits != 1 {
+	if len(d.data) != 3 || d.commits != 1 {
 		t.Fatal("record/event/receipt not committed together")
 	}
 	got, e := r.Get(ctx, "a/b")

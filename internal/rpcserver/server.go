@@ -37,6 +37,8 @@ type Server struct {
 }
 
 func New(b Backend, token, namespace string, gateway bool, options ...grpc.ServerOption) *grpc.Server {
+	roles, ok := b.(interface{ HasRole(string) bool })
+	worker := ok && roles.HasRole(vector.RoleWorker)
 	options = append(options, grpc.MaxRecvMsgSize(1<<20), grpc.MaxSendMsgSize(64<<20), grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		values := metadata.ValueFromIncomingContext(ctx, "authorization")
 		if len(token) < 16 || len(values) != 1 || subtle.ConstantTimeCompare([]byte(values[0]), []byte("Bearer "+token)) != 1 {
@@ -44,6 +46,14 @@ func New(b Backend, token, namespace string, gateway bool, options ...grpc.Serve
 		}
 		switch info.FullMethod {
 		case pb.VectorStore_Health_FullMethodName, pb.VectorStore_GetCluster_FullMethodName, pb.VectorStore_GetLayout_FullMethodName:
+		case pb.VectorStore_Put_FullMethodName:
+			if !gateway && (!worker || req.(*pb.PutRequest).GetRoute() == nil) {
+				return nil, status.Error(codes.PermissionDenied, "direct data route required")
+			}
+		case pb.VectorStore_Delete_FullMethodName:
+			if !gateway && (!worker || req.(*pb.DeleteRequest).GetRoute() == nil) {
+				return nil, status.Error(codes.PermissionDenied, "direct data route required")
+			}
 		default:
 			if !gateway {
 				return nil, status.Error(codes.PermissionDenied, "gateway role required")
@@ -72,6 +82,10 @@ func rpcError(err error) error {
 		return status.Error(codes.Aborted, err.Error())
 	case errors.Is(err, vector.ErrInvalidList):
 		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, vector.ErrFollowerQueueFull):
+		return status.Error(codes.ResourceExhausted, err.Error())
+	case errors.Is(err, vector.ErrFollowerReadUnsupported):
+		return status.Error(codes.FailedPrecondition, err.Error())
 	default:
 		return status.Error(codes.Unavailable, err.Error())
 	}
@@ -88,6 +102,44 @@ func mutation(r vector.Record, e error) (*pb.MutationResponse, error) {
 	}
 	return &pb.MutationResponse{Durable: true, Token: &pb.Token{Id: r.ID, Revision: r.Revision}}, nil
 }
+
+type dataWriter interface {
+	ResolveWriteOwner(context.Context, string) (vector.DataPartitionID, vector.Ownership, error)
+	WriteNamespace() string
+	MutateOwned(context.Context, string, vector.DataPartitionID, uint64, string, string, vector.Mutation, bool) (vector.Record, error)
+}
+
+func (s *Server) ResolveWriteRoute(ctx context.Context, r *pb.GetRequest) (*pb.WriteRoute, error) {
+	if !validID(r.Id) {
+		return nil, status.Error(codes.InvalidArgument, "invalid id")
+	}
+	w, ok := s.backend.(dataWriter)
+	if !ok {
+		return &pb.WriteRoute{}, nil
+	}
+	part, o, err := w.ResolveWriteOwner(ctx, r.Id)
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	if o.Partition == "" {
+		return &pb.WriteRoute{}, nil
+	}
+	return &pb.WriteRoute{Partition: uint32(part), Partitions: uint32(s.backend.Layout().DataPartitions), Namespace: w.WriteNamespace(), Endpoint: o.WriteEndpoint, Epoch: o.Epoch, Session: o.Session}, nil
+}
+func (s *Server) applyMutation(ctx context.Context, route *pb.WriteRoute, id string, m vector.Mutation, deleted bool) (*pb.MutationResponse, error) {
+	if route == nil {
+		return mutation(s.backend.Mutate(ctx, id, m, deleted))
+	}
+	w, ok := s.backend.(dataWriter)
+	if !ok {
+		return nil, status.Error(codes.FailedPrecondition, "stale data write route")
+	}
+	rec, err := w.MutateOwned(ctx, route.Namespace, vector.DataPartitionID(route.Partition), route.Epoch, route.Session, id, m, deleted)
+	if errors.Is(err, vector.ErrFenced) {
+		return nil, status.Error(codes.FailedPrecondition, "stale data write route")
+	}
+	return mutation(rec, err)
+}
 func (s *Server) Put(ctx context.Context, r *pb.PutRequest) (*pb.MutationResponse, error) {
 	if !validID(r.Id) || r.RequestId == "" || len(r.RequestId) > 256 {
 		return nil, status.Error(codes.InvalidArgument, "valid id and request_id required")
@@ -95,8 +147,7 @@ func (s *Server) Put(ctx context.Context, r *pb.PutRequest) (*pb.MutationRespons
 	if e := vector.ValidateVector(r.Vector, s.backend.VectorDimension()); e != nil {
 		return nil, status.Error(codes.InvalidArgument, e.Error())
 	}
-	rec, e := s.backend.Mutate(ctx, r.Id, vector.Mutation{RequestID: r.RequestId, Vector: r.Vector, Payload: r.Payload, ExpectedRevision: r.ExpectedRevision}, false)
-	return mutation(rec, e)
+	return s.applyMutation(ctx, r.Route, r.Id, vector.Mutation{RequestID: r.RequestId, Vector: r.Vector, Payload: r.Payload, ExpectedRevision: r.ExpectedRevision}, false)
 }
 func (s *Server) Get(ctx context.Context, r *pb.GetRequest) (*pb.Record, error) {
 	if !validID(r.Id) {
@@ -112,8 +163,7 @@ func (s *Server) Delete(ctx context.Context, r *pb.DeleteRequest) (*pb.MutationR
 	if !validID(r.Id) || r.RequestId == "" || len(r.RequestId) > 256 {
 		return nil, status.Error(codes.InvalidArgument, "valid id and request_id required")
 	}
-	rec, e := s.backend.Mutate(ctx, r.Id, vector.Mutation{RequestID: r.RequestId, ExpectedRevision: r.ExpectedRevision}, true)
-	return mutation(rec, e)
+	return s.applyMutation(ctx, r.Route, r.Id, vector.Mutation{RequestID: r.RequestId, ExpectedRevision: r.ExpectedRevision}, true)
 }
 func (s *Server) List(ctx context.Context, r *pb.ListRequest) (*pb.ListResponse, error) {
 	limit := r.Limit
@@ -162,6 +212,31 @@ func (s *Server) Search(ctx context.Context, r *pb.SearchRequest) (*pb.SearchRes
 }
 func (s *Server) Health(context.Context, *pb.Empty) (*pb.HealthResponse, error) {
 	return &pb.HealthResponse{Status: "ready", Namespace: s.namespace}, nil
+}
+
+func (s *Server) FollowerSearch(ctx context.Context, r *pb.SearchRequest) (*pb.SearchResponse, error) {
+	q := vector.Search{Vector: r.Vector, K: int(r.K), Filter: r.Filter, Exact: r.Exact, EFSearch: int(r.EfSearch)}
+	if r.MinVisible != nil {
+		return nil, status.Error(codes.InvalidArgument, "follower read cannot be combined with min_visible")
+	}
+	if err := vector.ValidateFollowerSearch(q, s.backend.VectorDimension()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	backend, ok := s.backend.(interface {
+		FollowerSearch(context.Context, vector.Search) (vector.FollowerSearchResult, error)
+	})
+	if !ok {
+		return nil, rpcError(vector.ErrFollowerReadUnsupported)
+	}
+	result, err := backend.FollowerSearch(ctx, q)
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	out := &pb.SearchResponse{}
+	if err := convert(result, out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // Operational objects share the existing JSON field names; protojson performs

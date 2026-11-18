@@ -10,8 +10,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -59,6 +61,31 @@ func main() {
 	}
 	var service runningService
 	var cluster *vector.ClusterService
+	grpcAddr := os.Getenv("GRPC_LISTEN_ADDR")
+	routedWorker := env("CLUSTER_MODE", "0") == "1" && os.Getenv("CLUSTER_ROUTING_FILE") != "" && slices.ContainsFunc(strings.Split(env("ROLES", "master,gateway,worker"), ","), func(role string) bool { return strings.TrimSpace(role) == vector.RoleWorker })
+	if routedWorker && grpcAddr == "" {
+		host, _, err := net.SplitHostPort(env("LISTEN_ADDR", "127.0.0.1:18090"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		grpcAddr = net.JoinHostPort(host, "0")
+	}
+	var listener net.Listener
+	var writeEndpoint string
+	if grpcAddr != "" {
+		listener, e = net.Listen("tcp", grpcAddr)
+		if e != nil {
+			log.Fatal(e)
+		}
+		defer listener.Close()
+		if routedWorker {
+			u, err := url.Parse(os.Getenv("ADVERTISE_URL"))
+			if err != nil {
+				log.Fatal(err)
+			}
+			writeEndpoint = env("GRPC_ADVERTISE_ADDR", net.JoinHostPort(u.Hostname(), strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)))
+		}
+	}
 	if env("CLUSTER_MODE", "0") == "1" {
 		ttl, err := time.ParseDuration(env("LEASE_TTL", "9s"))
 		if err != nil {
@@ -99,7 +126,7 @@ func main() {
 				log.Fatal(err)
 			}
 		}
-		cluster, e = vector.OpenClusterService(ctx, repo, objects, partitions, vector.ClusterConfig{GraphCheckpointBytes: checkpointBytes, GraphCheckpointAge: checkpointAge, Routing: routing, ConsumerRetention: os.Getenv("CONSUMER_RETENTION") == "1", IndexReplication: env("INDEX_REPLICATION", "independent"), HostID: os.Getenv("HOST_ID"), Zone: os.Getenv("ZONE"), FailureDomain: env("REPLICA_FAILURE_DOMAIN", "node"), MemoryBudgetBytes: memoryBudget, Scheduler: env("SCHEDULER", "hash"), Capacity: capacity, BalanceCooldown: cooldown, Replicas: replicas, NodeID: os.Getenv("NODE_ID"), AdvertiseURL: os.Getenv("ADVERTISE_URL"), Token: os.Getenv("CLUSTER_TOKEN"), LeaseTTL: ttl, Roles: env("ROLES", "master,gateway,worker")})
+		cluster, e = vector.OpenClusterService(ctx, repo, objects, partitions, vector.ClusterConfig{WriteEndpoint: writeEndpoint, GraphCheckpointBytes: checkpointBytes, GraphCheckpointAge: checkpointAge, Routing: routing, ConsumerRetention: os.Getenv("CONSUMER_RETENTION") == "1", IndexReplication: env("INDEX_REPLICATION", "independent"), HostID: os.Getenv("HOST_ID"), Zone: os.Getenv("ZONE"), FailureDomain: env("REPLICA_FAILURE_DOMAIN", "node"), MemoryBudgetBytes: memoryBudget, Scheduler: env("SCHEDULER", "hash"), Capacity: capacity, BalanceCooldown: cooldown, Replicas: replicas, NodeID: os.Getenv("NODE_ID"), AdvertiseURL: os.Getenv("ADVERTISE_URL"), Token: os.Getenv("CLUSTER_TOKEN"), LeaseTTL: ttl, Roles: env("ROLES", "master,gateway,worker")})
 		if e == nil {
 			service = cluster
 			defer cluster.Close()
@@ -157,7 +184,7 @@ func main() {
 	if cluster != nil {
 		handler = cluster.WrapHandler(handler)
 	}
-	if addr := os.Getenv("GRPC_LISTEN_ADDR"); addr != "" {
+	if listener != nil {
 		backend, ok := service.(rpcserver.Backend)
 		if !ok {
 			log.Fatal("service does not support gRPC")
@@ -170,10 +197,6 @@ func main() {
 				log.Fatal(err)
 			}
 			options = append(options, grpc.Creds(creds))
-		}
-		listener, err := net.Listen("tcp", addr)
-		if err != nil {
-			log.Fatal(err)
 		}
 		rpc := rpcserver.New(backend, token, env("NAMESPACE", "demo/default"), cluster == nil || cluster.HasRole(vector.RoleGateway), options...)
 		defer rpc.Stop()
@@ -193,7 +216,7 @@ func main() {
 				rpc.Stop()
 			}
 		}()
-		log.Printf("gRPC listening on %s", addr)
+		log.Printf("gRPC listening on %s", listener.Addr())
 	}
 	server := &http.Server{Addr: env("LISTEN_ADDR", "127.0.0.1:18090"), Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 35 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {

@@ -46,6 +46,7 @@ func newHandler(repo recordAPI, service searchAPI, dim int, token, namespace str
 	registerSubscriptionHandler(mux, service)
 	registerConsumerHandler(mux, service)
 	registerMetricsHandler(mux, service)
+	registerFollowerSearch(mux, service, dim)
 	mux.HandleFunc("/v1/drain", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			w.WriteHeader(405)

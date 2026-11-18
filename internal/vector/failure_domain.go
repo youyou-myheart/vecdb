@@ -78,7 +78,7 @@ func (r *Repository) ensureTopologyMode(ctx context.Context, scheduler, domain s
 	if scheduler == "load" {
 		schema = fmt.Sprintf("v9:dimension=%d:metric=l2:load=1:tasks=1", r.Dimension)
 	}
-	if e = tx.Set([]byte(r.Prefix+"schema"), []byte(schema)); e != nil {
+	if e = tx.Set([]byte(r.Prefix+"schema"), []byte(schema+dataLogSchemaSuffix)); e != nil {
 		return e
 	}
 	return tx.Commit(ctx)

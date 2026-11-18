@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"sync"
 	"time"
 
 	pb "example.com/vector-storage/api/vectorstore/v1"
@@ -20,7 +21,14 @@ type Options struct {
 }
 type Client struct {
 	pb.VectorStoreClient
-	conn *grpc.ClientConn
+	conn       *grpc.ClientConn
+	timeout    time.Duration
+	dialOpts   []grpc.DialOption
+	mu         sync.Mutex
+	closed     bool
+	partitions uint32
+	proxyOnly  bool
+	routes     map[uint32]*dataRoute
 }
 
 // Dial uses plaintext when TLSConfig is nil (for trusted local deployments).
@@ -42,18 +50,28 @@ func Dial(ctx context.Context, target, token string, opts Options) (*Client, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
-	conn, e := grpc.DialContext(ctx, target, grpc.WithTransportCredentials(creds), grpc.WithBlock(), grpc.WithDisableRetry(), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64<<20), grpc.MaxCallSendMsgSize(1<<20)), grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoke grpc.UnaryInvoker, options ...grpc.CallOption) error {
+	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(creds), grpc.WithDisableRetry(), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64<<20), grpc.MaxCallSendMsgSize(1<<20)), grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoke grpc.UnaryInvoker, options ...grpc.CallOption) error {
 		ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
 		defer cancel()
 		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
 		return invoke(ctx, method, req, reply, cc, options...)
-	}))
+	})}
+	conn, e := grpc.DialContext(ctx, target, append(append([]grpc.DialOption(nil), dialOpts...), grpc.WithBlock())...)
 	if e != nil {
 		return nil, e
 	}
-	return &Client{VectorStoreClient: pb.NewVectorStoreClient(conn), conn: conn}, nil
+	return &Client{VectorStoreClient: pb.NewVectorStoreClient(conn), conn: conn, dialOpts: dialOpts, timeout: opts.Timeout, routes: make(map[uint32]*dataRoute)}, nil
 }
-func (c *Client) Close() error { return c.conn.Close() }
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	for _, r := range c.routes {
+		r.conn.Close()
+	}
+	clear(c.routes)
+	return c.conn.Close()
+}
 func (c *Client) Insert(ctx context.Context, id string, v []float64, payload map[string]string, requestID string) (*pb.MutationResponse, error) {
 	zero := uint64(0)
 	return c.Put(ctx, &pb.PutRequest{Id: id, Vector: v, Payload: payload, RequestId: requestID, ExpectedRevision: &zero})

@@ -44,6 +44,11 @@ class VectorStoreStub(object):
                 request_serializer=vectorstore_dot_v1_dot_vector__pb2.ChangeRequest.SerializeToString,
                 response_deserializer=vectorstore_dot_v1_dot_vector__pb2.ChangePage.FromString,
                 _registered_method=True)
+        self.ResolveWriteRoute = channel.unary_unary(
+                '/vectorstore.v1.VectorStore/ResolveWriteRoute',
+                request_serializer=vectorstore_dot_v1_dot_vector__pb2.GetRequest.SerializeToString,
+                response_deserializer=vectorstore_dot_v1_dot_vector__pb2.WriteRoute.FromString,
+                _registered_method=True)
         self.Put = channel.unary_unary(
                 '/vectorstore.v1.VectorStore/Put',
                 request_serializer=vectorstore_dot_v1_dot_vector__pb2.PutRequest.SerializeToString,
@@ -66,6 +71,11 @@ class VectorStoreStub(object):
                 _registered_method=True)
         self.Search = channel.unary_unary(
                 '/vectorstore.v1.VectorStore/Search',
+                request_serializer=vectorstore_dot_v1_dot_vector__pb2.SearchRequest.SerializeToString,
+                response_deserializer=vectorstore_dot_v1_dot_vector__pb2.SearchResponse.FromString,
+                _registered_method=True)
+        self.FollowerSearch = channel.unary_unary(
+                '/vectorstore.v1.VectorStore/FollowerSearch',
                 request_serializer=vectorstore_dot_v1_dot_vector__pb2.SearchRequest.SerializeToString,
                 response_deserializer=vectorstore_dot_v1_dot_vector__pb2.SearchResponse.FromString,
                 _registered_method=True)
@@ -116,6 +126,12 @@ class VectorStoreServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ResolveWriteRoute(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Put(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -142,6 +158,13 @@ class VectorStoreServicer(object):
 
     def Search(self, request, context):
         """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def FollowerSearch(self, request, context):
+        """Followers batch fresh leader applied-position captures, wait locally, then query.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -195,6 +218,11 @@ def add_VectorStoreServicer_to_server(servicer, server):
                     request_deserializer=vectorstore_dot_v1_dot_vector__pb2.ChangeRequest.FromString,
                     response_serializer=vectorstore_dot_v1_dot_vector__pb2.ChangePage.SerializeToString,
             ),
+            'ResolveWriteRoute': grpc.unary_unary_rpc_method_handler(
+                    servicer.ResolveWriteRoute,
+                    request_deserializer=vectorstore_dot_v1_dot_vector__pb2.GetRequest.FromString,
+                    response_serializer=vectorstore_dot_v1_dot_vector__pb2.WriteRoute.SerializeToString,
+            ),
             'Put': grpc.unary_unary_rpc_method_handler(
                     servicer.Put,
                     request_deserializer=vectorstore_dot_v1_dot_vector__pb2.PutRequest.FromString,
@@ -217,6 +245,11 @@ def add_VectorStoreServicer_to_server(servicer, server):
             ),
             'Search': grpc.unary_unary_rpc_method_handler(
                     servicer.Search,
+                    request_deserializer=vectorstore_dot_v1_dot_vector__pb2.SearchRequest.FromString,
+                    response_serializer=vectorstore_dot_v1_dot_vector__pb2.SearchResponse.SerializeToString,
+            ),
+            'FollowerSearch': grpc.unary_unary_rpc_method_handler(
+                    servicer.FollowerSearch,
                     request_deserializer=vectorstore_dot_v1_dot_vector__pb2.SearchRequest.FromString,
                     response_serializer=vectorstore_dot_v1_dot_vector__pb2.SearchResponse.SerializeToString,
             ),
@@ -305,6 +338,33 @@ class VectorStore(object):
             '/vectorstore.v1.VectorStore/ReadChanges',
             vectorstore_dot_v1_dot_vector__pb2.ChangeRequest.SerializeToString,
             vectorstore_dot_v1_dot_vector__pb2.ChangePage.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ResolveWriteRoute(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vectorstore.v1.VectorStore/ResolveWriteRoute',
+            vectorstore_dot_v1_dot_vector__pb2.GetRequest.SerializeToString,
+            vectorstore_dot_v1_dot_vector__pb2.WriteRoute.FromString,
             options,
             channel_credentials,
             insecure,
@@ -438,6 +498,33 @@ class VectorStore(object):
             request,
             target,
             '/vectorstore.v1.VectorStore/Search',
+            vectorstore_dot_v1_dot_vector__pb2.SearchRequest.SerializeToString,
+            vectorstore_dot_v1_dot_vector__pb2.SearchResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def FollowerSearch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vectorstore.v1.VectorStore/FollowerSearch',
             vectorstore_dot_v1_dot_vector__pb2.SearchRequest.SerializeToString,
             vectorstore_dot_v1_dot_vector__pb2.SearchResponse.FromString,
             options,

@@ -2,6 +2,8 @@
 
 最新聚类投递实现的 review 覆盖：来源窗口恢复、连续完成位点、稀疏投递去重、入队/构图/事务提交边界、主备接管、快照与 GC、HTTP/gRPC 状态、验收脚本自身的失败处理。
 
+Follower Read 验收加入默认 UT/race、RPC/HTTP/SDK 测试和 smoke 的七服务聚类流水线：合批封闭边界、连续超时清理、取消共享捕获、队列满、捕获失败、切主/退休拒绝、大 uint64 和无 Leader 回退；七服务验证两个 Gateway 及两轮全 Worker 故障恢复后的完整 Follower 查询。协议与指标见 [FOLLOWER_READ.md](FOLLOWER_READ.md)。
+
 ## 本次修复
 
 | 问题 | 影响 | 修复及自动化证据 |
@@ -31,6 +33,41 @@ bash scripts/acceptance-dispatch.sh
 
 每个阶段运行在独立进程组；完成、失败、超时或 SIGINT/SIGTERM 后清理该组内的子孙进程，包括被 SIGSTOP 暂停的 Worker。外部 SIGKILL 无法被捕获；此时 `running` 报告不代表通过。不要同时运行其他直接调用旧验收脚本的任务，它们不遵守 quality runner 的工作区锁。
 
+## 性能 smoke
+
+运行 `bash scripts/acceptance-dispatch.sh` 会构建当前工作区的服务和 Go 压测客户端，并执行 `performance-smoke`。PD、TiKV 和 SeaweedFS 就绪后也可单独运行该阶段。
+
+```bash
+bash scripts/go.sh build -o .tools/vector-server ./cmd/vector-server
+bash scripts/go.sh build -o .tools/writebench ./scripts/writebench
+.venv/bin/python scripts/verify_performance.py
+```
+
+每轮使用独立 namespace，启动 2 Master、2 Gateway、3 Worker。16 个 DataPartition 按 ID 哈希，8 个 IndexPartition 按向量簇路由，各有 2 个副本。4 个 Go 客户端分别从两个 Gateway 获取路由，通过 SDK 写入 64 维、8 个中心附近的结构化向量。每条新 ID 使用独立的请求 ID，每个客户端最多 32 个在途请求。
+
+| 验收项 | 通过条件 |
+|---|---|
+| 写入完整性 | 固定到达率 200 次/秒 × 30 秒。6,000 次调用全部发出，全部收到 ID、revision 和 durable 标记正确的 ACK，RPC 错误为零 |
+| 写入吞吐 | 30 秒窗口内至少收到 5,700 个持久化 ACK，即 190 次/秒。窗口后返回的 ACK 单独计数 |
+| 写入延迟 | 从 SDK 发起调用到收到持久化 ACK，合并所有客户端延迟直方图，P99 桶上界 ≤ 200 ms |
+| 停写后副本可读 | 从最后一个客户端持久化 ACK 到首个覆盖全部 8 个索引最终图位点、且返回命中的 FollowerRead 响应 ≤ 1,000 ms。测量期间探针 RPC 错误为零 |
+| 现场清理 | 退出本轮全部压测客户端和 7 个向量服务进程 |
+
+探针保存每次响应及其客户端时间戳。16 个数据分片分别核对 ACK 数，等全部来源完成后取得最终图位点，再用这个位点复核已采集的响应。报告中的 `first_confirmed_ms` 衡量客户端确认可读的时间，`first_probe_ms` 显示首次发探针的延后，`applied_lower_ms` 和 `applied_upper_ms` 是从探针推算的应用时间区间。报告保留每秒发起、成功、失败和窗口外 ACK，以及分片 ACK 计数。完整 smoke 将摘要归档为 `reports/quality/<run_id>/performance-smoke.json`，其中的 `logs` 指向客户端、服务日志和逐次探针记录。
+
+4 万次/秒容量复测可以在安装好原生 onebox 依赖的 macOS 主机上单独运行 `.venv/bin/python scripts/onebox_writebench.py --qps 40000 --seconds 60 --clients 8 --inflight 128 --background-services`。报告的 `planned` 为计划量，`invoked` 为实际发出量，`ack_qps_in_window` 为 60 秒内持久化成功的吞吐。各客户端遇到在途上限时会跳过该到达时隙，记入 `not_sent`。该档记录过载行为，日常 smoke 使用上表的回归门槛。
+
+2026-11-18 在同一台 Mac 上独立启动两轮集群，两次均在 30 秒窗口内确认全部 6,000 条写入，写入和探针均为零错误。下表时间从最后一个持久化 ACK 起算。两轮的首个 FollowerRead 响应均命中向量，且覆盖 8 个索引的最终图位点。
+
+| smoke 运行 ID | 实际持久化吞吐 | 写入 P50 / P95 / P99 桶上界 | 首次发出 FollowerRead | 收到覆盖最终位点的响应 |
+|---|---:|---:|---:|---:|
+| `20261118T132117Z-7f34d0de` | 200 次/秒 | 2 / 5 / 10 ms | 14.1 ms | 39.6 ms |
+| `20261118T145805Z-df6a56f3` | 200 次/秒 | 5 / 5 / 10 ms | 19.7 ms | 94.3 ms |
+
+首轮在 144.5 ms 时才从集群状态观测到最终位点，复核使用先前已收到的 39.6 ms 响应。首轮完整流水线随后在订阅保留用例中遇到 TiKV 写冲突。该用例现于写入前申请从位点 0 开始的数据和图日志租约，确保后台 GC 首次具备回收条件时两个租约均已生效。第二轮完整 smoke 的 13 个阶段全部通过，包括修正后的订阅保留、故障接管和检查点恢复。
+
+同日原生 onebox 容量运行 `reports/writebench/20261118T211827-59d51e4e/report.json` 使用 macOS 后台服务优先级，60 秒计划 2,400,000 次，实际发出 115,773 次。窗口内确认 106,954 次（1,782.6 次/秒），窗口后确认 249 次，8,570 次 RPC 返回错误。成功写入的 P50/P95/P99 桶上界为 500/1,000/2,000 ms。写入窗口完成后，本轮数据和日志达到 1.5 GiB 保护阈值并触发清理，该档追平时间未取得。
+
 ## 故障矩阵
 
 需要连 PD/TiKV/SeaweedFS 一起启动、暂停和强杀时，使用新增的 [整套进程 onebox 验收](ONEBOX_E2E.md)：`bash scripts/acceptance-onebox-e2e.sh`。它独立于默认 smoke，默认包含 10 分钟常稳、6 轮连续故障和原目录全栈冷恢复；以独立端口和数据目录运行。
@@ -41,8 +78,8 @@ bash scripts/acceptance-dispatch.sh
 | Go UT | 穷举不同来源目标 ACK 组合，包含广播删除 | 只推进连续完成前缀，不能跨过最早未完成事件 |
 | 真实 TiKV | 已接受来源 epoch 后撤销全局租约；更高 epoch 在图提交快照之后持久化 | 租约撤销本身不阻塞已接受批次；Index 接受新 epoch 后旧快照写冲突，重试返回结构化 epoch 拒绝 |
 | 单 PID 七服务 | 2 Gateway、2 Master、3 Worker；CRUD/CAS/分页/过滤、主切换、排空、重建、Gateway/Worker 重启 | 无结果遗漏/重复，版本、距离、属性正确；非 Worker 不加载 HNSW |
-| 单 PID 七服务聚类模式 | 4 Data → 3 Index；两轮全 Worker 停止，每轮 144 条结构化写入；跨簇移动→删除→恢复；快照/GC 后再故障 | 原始读写继续，跨批次恢复；幂等凭证仍返回原结果；383 条最终记录逐条核对；积压和副本滞后归零 |
-| 多进程 | 所有 Worker SIGSTOP 后业务写入；旧 owner 长暂停→租约失效→新 owner 接管→恢复旧 owner | 写入不等待构图；旧 epoch 无法覆盖新状态；来源位点不倒退 |
+| 单 PID 七服务聚类模式 | 4 Data → 3 Index；两轮全 Worker 停止，每轮恢复后写入 144 条结构化记录；跨簇移动→删除→恢复；快照/GC 后再故障 | 停机期间拒绝写入，接管后跨批次恢复；幂等凭证仍返回原结果；383 条最终记录逐条核对；积压和副本滞后归零 |
+| 多进程 | 所有 Worker SIGSTOP 后尝试写入并按 ID 读取；旧 owner 长暂停→租约失效→新 owner 接管→恢复旧 owner | 停机时写入无 ACK，点读成功，恢复后按原请求 ID 重试；旧 epoch 无法覆盖新状态；来源位点不倒退 |
 | 多进程 | 三轮 Master 与 Worker 同时 SIGKILL，其中一轮两个 Worker 同时故障；4 路并发写入、同 ID CAS 竞争、重试、跨簇更新/删除/恢复；每轮先快照/GC | 原始数据读写成功；恰好一个 CAS 成功、一个冲突；每轮恢复后完整 oracle；接管 epoch 增长；精确结果与 ANN recall 检查 |
 | 多进程旧模式 | 消费 lease pin/ACK/release、图对象 GC、落后副本快照恢复、GC 后 Leader 故障 | 不清理被租约保护的日志；reset 可恢复；图副本可继续构建 |
 | 观测 | 鉴权、指标格式与数值、位点、队列、错误/去重计数、故障积压及恢复收敛 | 故障不能显示为零积压的假健康；指标能被 Prometheus parser 读取；RPC uint64 不经 float64 |

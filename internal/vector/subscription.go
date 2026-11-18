@@ -101,7 +101,14 @@ func (c *ClusterService) ReadChanges(ctx context.Context, q ChangeRequest) (Chan
 		return out, ErrSubscriptionUnavailable
 	}
 	j := graphJournal{c: c.coordinator, id: q.Partition}
-	h, e := j.Head(ctx)
+	// Read the bound, entries and their TiKV payloads at one MVCC snapshot,
+	// including when GC advances while a page is being returned.
+	tx, e := j.c.root.begin()
+	if e != nil {
+		return out, e
+	}
+	defer tx.Rollback()
+	h, e := j.headIn(ctx, tx)
 	if e != nil {
 		return out, e
 	}
@@ -120,33 +127,13 @@ func (c *ClusterService) ReadChanges(ctx context.Context, q ChangeRequest) (Chan
 	var payloadBytes int64
 	for n := q.After; n < out.Head && len(out.Graph) < q.Limit; {
 		n++
-		entry, e := j.Entry(ctx, n)
+		entry, e := j.entryIn(ctx, tx, n)
 		if e == nil && entry.Payload != nil {
 			if len(out.Graph) > 0 && int64(entry.Payload.Size) > graphReplayBytes-payloadBytes {
 				break
 			}
-			entry.PayloadData, e = j.loadPayload(ctx, entry)
-			if e != nil {
-				fresh, err := j.Head(ctx)
-				if err == nil && n <= fresh.Floor.Sequence {
-					e = ErrLogCompacted
-				}
-			}
+			entry.PayloadData, e = j.loadPayloadIn(ctx, tx, entry)
 			payloadBytes += int64(len(entry.PayloadData))
-		}
-		if errors.Is(e, ErrLogCompacted) {
-			fresh, err := j.Head(ctx)
-			if err != nil {
-				return out, err
-			}
-			out.Graph = []GraphEntry{}
-			out.Next = q.After
-			out.ResetRequired = true
-			out.Floor = fresh.Floor.Sequence
-			out.Head = fresh.Visible.Sequence
-			out.Checkpoint = fresh.Checkpoint
-			out.CheckpointPosition = &fresh.CheckpointPosition
-			return out, nil
 		}
 		if e != nil {
 			return out, e

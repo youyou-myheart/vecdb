@@ -421,3 +421,41 @@ func TestDispatchCompletedPrefixAllWatermarks(t *testing.T) {
 		}
 	}
 }
+
+func TestRestartListsRetainedRangeAtCompletedCursor(t *testing.T) {
+	f, c, owner := routedFixture(t)
+	for i := 1; i <= 6; i++ {
+		f.write(t, fmt.Sprint(i), false)
+	}
+	r := c.data[0]
+	seed(f.db, []byte(r.Prefix+"log-floor"), uint64(2))
+	delete(f.db.data, string(r.logKey(1)))
+	delete(f.db.data, string(r.logKey(2)))
+	seed(f.db, completedKey(r), uint64(4))
+	restart := func() (*dataDispatcher, error) {
+		s := &dataDispatcher{owner: owner}
+		return s, c.loadDispatchWindow(f.ctx, 0, s)
+	}
+	s, err := restart()
+	if err != nil || s.completed != 4 || len(s.window) != 2 || s.window[0].Sequence != 5 || s.window[1].Sequence != 6 {
+		t.Fatal(s, err)
+	}
+	// Even a hole before completed must not be mistaken for valid compaction.
+	delete(f.db.data, string(r.logKey(3)))
+	if _, err = restart(); err == nil {
+		t.Fatal("accepted missing first retained key")
+	}
+	for i := uint64(4); i <= 6; i++ {
+		delete(f.db.data, string(r.logKey(i)))
+	}
+	seed(f.db, []byte(r.Prefix+"log-floor"), uint64(6))
+	seed(f.db, completedKey(r), uint64(6))
+	s, err = restart()
+	if err != nil || s.completed != 6 || len(s.window) != 0 {
+		t.Fatal(s, err)
+	}
+	f.write(t, "next", false)
+	if err = c.loadDispatchWindow(f.ctx, 0, s); err != nil || len(s.window) != 1 || s.window[0].Sequence != 7 {
+		t.Fatal(s, err)
+	}
+}

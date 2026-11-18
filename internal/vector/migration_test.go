@@ -104,7 +104,7 @@ func TestMigrationDurableLifecycleAndFailover(t *testing.T) {
 		t.Fatal(f.task(p))
 	}
 	tx, _ := f.root.begin()
-	_ = putJSON(tx, []byte(f.root.Prefix+"log-head"), uint64(50))
+	_ = putJSON(tx, f.root.logKey(50), LogEvent{Sequence: 50})
 	_ = tx.Commit(f.ctx)
 	f.nodes[0].Draining = true
 	n := ClusterNode{ID: "c", Session: "c", URL: "http://c", Roles: []string{RoleWorker}}
@@ -365,7 +365,7 @@ func TestMigrationRecoveryAcrossPersistedStages(t *testing.T) {
 				f.ready(p, 50)
 				f.tick()
 				tx, _ := f.root.begin()
-				_ = putJSON(tx, []byte(f.root.Prefix+"log-head"), uint64(50))
+				_ = putJSON(tx, f.root.logKey(50), LogEvent{Sequence: 50})
 				_ = tx.Commit(f.ctx)
 				f.nodes[0].Draining = true
 				target := ClusterNode{ID: "c", Session: "c", URL: "http://c", Roles: []string{RoleWorker}}

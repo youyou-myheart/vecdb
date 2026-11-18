@@ -42,14 +42,15 @@ def main():
     try:
         c.start(2);c.wait_ready()
         assert c.status()['consumer_retention']
-        for i in range(40):c.request('/v1/records/'+str(i),'PUT',dict(request_id='new-'+str(i),vector=[i%4,i/100]))
-        wait('initial indexing',lambda:ready_at(40))
-        c.request('/v1/checkpoint','POST',{})
         with Client('127.0.0.1:18980',env['API_TOKEN']) as client:
+            # Protect offset zero before a checkpoint can make these events eligible for automatic GC.
             leases={};session=uuid.uuid4().hex
             for stream in ('data','graph'):
                 result=client.consumer('index-0000',stream=stream,action='acquire',consumer='sink',session=session,ack=0,ttl_seconds=60)
                 leases[stream]=result.leases['sink'].epoch
+            for i in range(40):c.request('/v1/records/'+str(i),'PUT',dict(request_id='new-'+str(i),vector=[i%4,i/100]))
+            wait('initial indexing',lambda:ready_at(40))
+            c.request('/v1/checkpoint','POST',{})
             first=client.changes('index-0000',stream='graph',limit=1).graph[0]
             visible=head()['visible']['sequence']
             c.request('/v1/log/prune','POST',{})

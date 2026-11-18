@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	tikverr "github.com/tikv/client-go/v2/error"
@@ -81,6 +82,11 @@ func (r *Repository) begin() (transactionAPI, error) {
 	}
 	return tikvTransaction{tx}, nil
 }
+
+// The suffix makes older writers fail their schema check on open. An in-place
+// upgrade requires stopping all old processes before opening the namespace.
+const dataLogSchemaSuffix = ":data-log=tail"
+
 func (r *Repository) ensureSchema(ctx context.Context) error {
 	tx, err := r.begin()
 	if err != nil {
@@ -88,10 +94,10 @@ func (r *Repository) ensureSchema(ctx context.Context) error {
 	}
 	defer tx.Rollback()
 	key := []byte(r.Prefix + "schema")
-	b, err := tx.Get(ctx, key)
-	schema := []byte(fmt.Sprintf("v2:dimension=%d:metric=l2:log=1", r.Dimension))
+	stored, err := tx.Get(ctx, key)
+	base := fmt.Sprintf("v2:dimension=%d:metric=l2:log=1", r.Dimension)
 	if tikverr.IsErrNotFound(err) {
-		if err = tx.Set(key, schema); err != nil {
+		if err = tx.Set(key, []byte(base+dataLogSchemaSuffix)); err != nil {
 			return err
 		}
 		return tx.Commit(ctx)
@@ -99,35 +105,49 @@ func (r *Repository) ensureSchema(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// Upgrade requires all old writers to be stopped before this binary opens the namespace.
-	if string(b) == fmt.Sprintf("v1:dimension=%d:metric=l2", r.Dimension) {
-		if err = tx.Set(key, schema); err != nil {
-			return err
-		}
-		return tx.Commit(ctx)
-	}
-	if string(b) == fmt.Sprintf("v9:dimension=%d:metric=l2:load=1:tasks=1", r.Dimension) || string(b) == fmt.Sprintf("v8:dimension=%d:metric=l2:replicas=2:tasks=1", r.Dimension) {
-		return nil
-	}
-	if string(b) == fmt.Sprintf("v7:dimension=%d:metric=l2:load=1", r.Dimension) {
-		return nil
-	}
-	if string(b) == fmt.Sprintf("v6:dimension=%d:metric=l2:replicas=2", r.Dimension) {
-		return nil
-	}
-	if string(b) == fmt.Sprintf("v5:dimension=%d:metric=l2:cluster-master=1", r.Dimension) {
-		return nil
-	}
-	if string(b) == fmt.Sprintf("v4:dimension=%d:metric=l2:cluster=1", r.Dimension) {
-		return nil
-	}
-	if string(b) == fmt.Sprintf("v3:dimension=%d:metric=l2:partition-layout=1", r.Dimension) {
-		return nil
-	}
-	if string(b) != string(schema) {
+	version := strings.TrimSuffix(string(stored), dataLogSchemaSuffix)
+	switch version {
+	case fmt.Sprintf("v1:dimension=%d:metric=l2", r.Dimension):
+		version = base
+	case base,
+		fmt.Sprintf("v3:dimension=%d:metric=l2:partition-layout=1", r.Dimension),
+		fmt.Sprintf("v4:dimension=%d:metric=l2:cluster=1", r.Dimension),
+		fmt.Sprintf("v5:dimension=%d:metric=l2:cluster-master=1", r.Dimension),
+		fmt.Sprintf("v6:dimension=%d:metric=l2:replicas=2", r.Dimension),
+		fmt.Sprintf("v7:dimension=%d:metric=l2:load=1", r.Dimension),
+		fmt.Sprintf("v8:dimension=%d:metric=l2:replicas=2:tasks=1", r.Dimension),
+		fmt.Sprintf("v9:dimension=%d:metric=l2:load=1:tasks=1", r.Dimension):
+	default:
 		return errors.New("collection schema mismatch")
 	}
-	return nil
+	if string(stored) == version+dataLogSchemaSuffix {
+		return nil
+	}
+	// Verify and retire the old counter atomically with the schema upgrade.
+	legacyKey := []byte(r.Prefix + "log-head")
+	raw, err := tx.Get(ctx, legacyKey)
+	if err == nil {
+		var legacy uint64
+		if err = json.Unmarshal(raw, &legacy); err != nil {
+			return err
+		}
+		head, err := r.logHead(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if legacy != head {
+			return fmt.Errorf("legacy data log head %d disagrees with retained tail %d", legacy, head)
+		}
+		if err = tx.Delete(legacyKey); err != nil {
+			return err
+		}
+	} else if !tikverr.IsErrNotFound(err) {
+		return err
+	}
+	if err = tx.Set(key, []byte(version+dataLogSchemaSuffix)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (r *Repository) key(kind, id string) []byte {
@@ -212,7 +232,8 @@ func (r *Repository) mutateOnce(ctx context.Context, id string, m Mutation, dele
 		return Record{}, err
 	}
 	defer tx.Rollback()
-	rec, changed, err := r.mutateIn(ctx, tx, q)
+	var tail appendCursor
+	rec, changed, err := r.mutateIn(ctx, tx, q, &tail)
 	if err != nil || !changed {
 		return rec, err
 	}
@@ -222,9 +243,14 @@ func (r *Repository) mutateOnce(ctx context.Context, id string, m Mutation, dele
 	return rec, nil
 }
 
+type appendCursor struct {
+	lsn   uint64
+	known bool
+}
+
 // Semantic conflicts are detected before any Set, so a group can reject one
 // request without dropping unrelated valid requests. Storage errors abort it.
-func (r *Repository) mutateIn(ctx context.Context, tx transactionAPI, q preparedMutation) (Record, bool, error) {
+func (r *Repository) mutateIn(ctx context.Context, tx transactionAPI, q preparedMutation, tail *appendCursor) (Record, bool, error) {
 	id, m, deleted, digest := q.id, q.mutation, q.deleted, q.digest
 	reqKey := r.key("request", m.RequestID)
 	b, e := tx.Get(ctx, reqKey)
@@ -258,21 +284,24 @@ func (r *Repository) mutateIn(ctx context.Context, tx transactionAPI, q prepared
 	}
 	encoded, _ := json.Marshal(rec)
 	ack, _ := json.Marshal(receipt{Digest: digest, Record: rec})
-	head, e := r.readCounter(ctx, tx, "log-head")
-	if e != nil {
-		return Record{}, false, e
+	if !tail.known {
+		tail.lsn, e = r.logHead(ctx, tx)
+		if e != nil {
+			return Record{}, false, e
+		}
+		tail.known = true
 	}
-	if head == ^uint64(0) {
+	if tail.lsn == ^uint64(0) {
 		return Record{}, false, errors.New("log sequence exhausted")
 	}
-	sequence := head + 1
+	sequence := tail.lsn + 1
 	event, _ := json.Marshal(LogEvent{sequence, rec})
-	counter, _ := json.Marshal(sequence)
-	for k, v := range map[string][]byte{string(r.key("record", id)): encoded, string(r.logKey(sequence)): event, r.Prefix + "log-head": counter, string(reqKey): ack} {
+	for k, v := range map[string][]byte{string(r.key("record", id)): encoded, string(r.logKey(sequence)): event, string(reqKey): ack} {
 		if e = tx.Set([]byte(k), v); e != nil {
 			return Record{}, false, e
 		}
 	}
+	tail.lsn = sequence
 	return rec, true, nil
 }
 func (r *Repository) Scan(ctx context.Context, kind string) ([]Record, error) {
@@ -374,7 +403,7 @@ func (r *Repository) Publish(ctx context.Context, expected string, m Manifest) e
 		return ErrConflict
 	}
 	if m.LogVersion != 0 {
-		head, err := r.readCounter(ctx, tx, "log-head")
+		head, err := r.logHead(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -414,6 +443,8 @@ type transactionAPI interface {
 	// Last reads the last persisted pair in [start, end) at this snapshot.
 	// It does not scan the prefix or include this transaction's pending writes.
 	Last(context.Context, []byte, []byte) ([]byte, []byte, error)
+	FirstKey(context.Context, []byte, []byte) ([]byte, error)
+	LastKey(context.Context, []byte, []byte) ([]byte, error)
 }
 type tikvTransaction struct{ *transaction.KVTxn }
 

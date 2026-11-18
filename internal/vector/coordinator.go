@@ -18,6 +18,7 @@ import (
 var ErrFenced = errors.New("partition ownership expired or superseded")
 
 type ClusterNode struct {
+	WriteEndpoint     string               `json:"write_endpoint,omitempty"`
 	HostID            string               `json:"host_id,omitempty"`
 	Zone              string               `json:"zone,omitempty"`
 	MemoryBudgetBytes uint64               `json:"memory_budget_bytes,omitempty"`
@@ -31,16 +32,17 @@ type ClusterNode struct {
 	Expires           int64                `json:"expires_ms"`
 }
 type Ownership struct {
-	Phase     string           `json:"phase,omitempty"`
-	LastError string           `json:"last_error,omitempty"`
-	Offset    uint64           `json:"offset,omitempty"`
-	Partition IndexPartitionID `json:"partition"`
-	Node      string           `json:"node"`
-	Session   string           `json:"session"`
-	URL       string           `json:"url"`
-	Epoch     uint64           `json:"epoch"`
-	Expires   int64            `json:"expires_ms"`
-	Ready     bool             `json:"ready"`
+	WriteEndpoint string           `json:"write_endpoint,omitempty"`
+	Phase         string           `json:"phase,omitempty"`
+	LastError     string           `json:"last_error,omitempty"`
+	Offset        uint64           `json:"offset,omitempty"`
+	Partition     IndexPartitionID `json:"partition"`
+	Node          string           `json:"node"`
+	Session       string           `json:"session"`
+	URL           string           `json:"url"`
+	Epoch         uint64           `json:"epoch"`
+	Expires       int64            `json:"expires_ms"`
+	Ready         bool             `json:"ready"`
 }
 type Coordinator struct {
 	leaseReads      bool
@@ -233,12 +235,17 @@ func (c *Coordinator) Acquire(ctx context.Context, id IndexPartitionID, node Clu
 	if old.Epoch == ^uint64(0) {
 		return old, errors.New("ownership epoch exhausted")
 	}
-	o := Ownership{Ready: id == masterLeaseID, Partition: id, Node: node.ID, Session: node.Session, URL: strings.TrimRight(node.URL, "/"), Epoch: old.Epoch + 1, Expires: now + c.ttl}
+	o := Ownership{WriteEndpoint: registered.WriteEndpoint, Ready: id == masterLeaseID, Partition: id, Node: node.ID, Session: node.Session, URL: strings.TrimRight(node.URL, "/"), Epoch: old.Epoch + 1, Expires: now + c.ttl}
 	if e = putJSON(tx, c.ownerKey(id), o); e != nil {
 		return o, e
 	}
 	if e = putJSON(tx, c.fenceKey(id), o); e != nil {
 		return o, e
+	}
+	if strings.HasPrefix(string(id), "data-") {
+		if e = tx.Set(c.writeGuardKey(id), epochToken(o.Epoch)); e != nil {
+			return o, e
+		}
 	}
 	return o, tx.Commit(ctx)
 }
@@ -246,6 +253,9 @@ func sameOwner(a, b Ownership) bool {
 	return a.Partition == b.Partition && a.Node == b.Node && a.Session == b.Session && a.Epoch == b.Epoch
 }
 func (c *Coordinator) Update(ctx context.Context, expected Ownership, ready, release bool) (Ownership, error) {
+	return c.update(ctx, expected, ready, release, nil)
+}
+func (c *Coordinator) update(ctx context.Context, expected Ownership, ready, release bool, report func(*Ownership)) (Ownership, error) {
 	tx, e := c.root.begin()
 	if e != nil {
 		return Ownership{}, e
@@ -268,6 +278,9 @@ func (c *Coordinator) Update(ctx context.Context, expected Ownership, ready, rel
 			return o, ErrFenced
 		}
 	}
+	if report != nil {
+		report(&o)
+	}
 	o.Ready = o.Ready || ready
 	o.Expires = now + c.ttl
 	if release {
@@ -278,6 +291,11 @@ func (c *Coordinator) Update(ctx context.Context, expected Ownership, ready, rel
 		return o, e
 	}
 	if release {
+		if strings.HasPrefix(string(o.Partition), "data-") {
+			if e = tx.Set(c.writeGuardKey(o.Partition), epochToken(0)); e != nil {
+				return o, e
+			}
+		}
 		if e = putJSON(tx, c.fenceKey(o.Partition), o); e != nil {
 			return o, e
 		}
@@ -358,7 +376,7 @@ func (r *Repository) ensureMode(ctx context.Context, cluster bool) error {
 	if e = tx.Set(key, []byte("v2-master")); e != nil {
 		return e
 	}
-	if e = tx.Set([]byte(r.Prefix+"schema"), []byte(fmt.Sprintf("v5:dimension=%d:metric=l2:cluster-master=1", r.Dimension))); e != nil {
+	if e = tx.Set([]byte(r.Prefix+"schema"), []byte(fmt.Sprintf("v5:dimension=%d:metric=l2:cluster-master=1", r.Dimension)+dataLogSchemaSuffix)); e != nil {
 		return e
 	}
 	return tx.Commit(ctx)

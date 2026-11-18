@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	tikverr "github.com/tikv/client-go/v2/error"
+	"strconv"
 )
 
 var ErrInvalidLogCursor = errors.New("log cursor exceeds head")
@@ -30,6 +31,28 @@ type IncrementalRepository interface {
 }
 
 func (r *Repository) logKey(n uint64) []byte { return []byte(fmt.Sprintf("%slog/%020d", r.Prefix, n)) }
+
+// logHead looks up one tail key at the caller's snapshot. GC atomically
+// records the last removed LSN, including when the entire log is compacted.
+func (r *Repository) logHead(ctx context.Context, tx transactionAPI) (uint64, error) {
+	prefix := r.Prefix + "log/"
+	key, err := tx.LastKey(ctx, []byte(prefix), []byte(r.Prefix+"log0"))
+	if tikverr.IsErrNotFound(err) {
+		return r.readCounter(ctx, tx, "log-floor")
+	}
+	if err != nil {
+		return 0, err
+	}
+	if len(key) != len(prefix)+20 {
+		return 0, fmt.Errorf("invalid data log tail key %q", key)
+	}
+	n, err := strconv.ParseUint(string(key[len(prefix):]), 10, 64)
+	if err != nil || n == 0 {
+		return 0, fmt.Errorf("invalid data log tail key %q", key)
+	}
+	return n, nil
+}
+
 func (r *Repository) readCounter(ctx context.Context, tx transactionAPI, name string) (uint64, error) {
 	b, e := tx.Get(ctx, []byte(r.Prefix+name))
 	if tikverr.IsErrNotFound(e) {
@@ -48,7 +71,7 @@ func (r *Repository) Bootstrap(ctx context.Context) ([]Record, uint64, error) {
 		return nil, 0, e
 	}
 	defer tx.Rollback()
-	head, e := r.readCounter(ctx, tx, "log-head")
+	head, e := r.logHead(ctx, tx)
 	if e != nil {
 		return nil, 0, e
 	}
@@ -73,12 +96,15 @@ func (r *Repository) readEvents(ctx context.Context, after, through uint64, limi
 }
 
 func (r *Repository) readEventsIn(ctx context.Context, tx transactionAPI, after, through uint64, limit, byteLimit int) (LogBatch, error) {
-	var out LogBatch
-	var e error
-	out.Head, e = r.readCounter(ctx, tx, "log-head")
+	head, e := r.logHead(ctx, tx)
 	if e != nil {
-		return out, e
+		return LogBatch{}, e
 	}
+	return r.readEventsAtHead(ctx, tx, after, through, head, limit, byteLimit)
+}
+func (r *Repository) readEventsAtHead(ctx context.Context, tx transactionAPI, after, through, head uint64, limit, byteLimit int) (LogBatch, error) {
+	out := LogBatch{Head: head}
+	var e error
 	out.Floor, e = r.readCounter(ctx, tx, "log-floor")
 	if e != nil {
 		return out, e
@@ -174,7 +200,7 @@ func (r *Repository) PruneEvents(ctx context.Context, limit int) (uint64, error)
 	if m.LogVersion != LogVersion {
 		return floor, nil
 	}
-	head, e := r.readCounter(ctx, tx, "log-head")
+	head, e := r.logHead(ctx, tx)
 	if e != nil {
 		return floor, e
 	}

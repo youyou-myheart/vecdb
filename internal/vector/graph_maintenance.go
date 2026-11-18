@@ -143,6 +143,19 @@ func (c *ClusterService) retainGraphReferences(ctx context.Context, tx transacti
 	return completedPrefix(batch.Events, floor, c.eventTargets, commits), nil
 }
 
+// A local writer is a candidate for maintenance, never proof of ownership.
+// Copy the small set so no writer lock spans a KV lookup, upload or GC.
+func (c *ClusterService) localDataOwners() map[DataPartitionID]Ownership {
+	c.writerMu.RLock()
+	defer c.writerMu.RUnlock()
+	owners := make(map[DataPartitionID]Ownership, len(c.writers))
+	for id, group := range c.writers {
+		if !group.lease.uncertain.Load() {
+			owners[id] = group.lease.owner
+		}
+	}
+	return owners
+}
 func (c *ClusterService) dataMaintenanceLoop(ctx context.Context) {
 	defer close(c.maintenanceDone)
 	ticker := time.NewTicker(time.Second)
@@ -153,14 +166,13 @@ func (c *ClusterService) dataMaintenanceLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
-		for d := range c.data {
-			owner, err := c.coordinator.Resolve(ctx, sourceID(d))
-			if err != nil || owner.Node != c.node.ID || owner.Session != c.node.Session {
+		for d, owner := range c.localDataOwners() {
+			if err := c.coordinator.Check(ctx, owner); err != nil {
 				continue
 			}
 			work, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			measure := c.observations.pipeline.track("data_checkpoint_gc", string(sourceID(d)))
-			err = c.maintainData(work, d, owner)
+			err := c.maintainData(work, d, owner)
 			measure(&err)
 			cancel()
 			if err != nil && ctx.Err() == nil && !errors.Is(err, ErrFenced) && !errors.Is(err, ErrConflict) {

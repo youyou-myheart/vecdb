@@ -19,19 +19,21 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	VectorStore_ManageConsumer_FullMethodName = "/vectorstore.v1.VectorStore/ManageConsumer"
-	VectorStore_ReadChanges_FullMethodName    = "/vectorstore.v1.VectorStore/ReadChanges"
-	VectorStore_Put_FullMethodName            = "/vectorstore.v1.VectorStore/Put"
-	VectorStore_Get_FullMethodName            = "/vectorstore.v1.VectorStore/Get"
-	VectorStore_Delete_FullMethodName         = "/vectorstore.v1.VectorStore/Delete"
-	VectorStore_List_FullMethodName           = "/vectorstore.v1.VectorStore/List"
-	VectorStore_Search_FullMethodName         = "/vectorstore.v1.VectorStore/Search"
-	VectorStore_Health_FullMethodName         = "/vectorstore.v1.VectorStore/Health"
-	VectorStore_GetCluster_FullMethodName     = "/vectorstore.v1.VectorStore/GetCluster"
-	VectorStore_GetLayout_FullMethodName      = "/vectorstore.v1.VectorStore/GetLayout"
-	VectorStore_Checkpoint_FullMethodName     = "/vectorstore.v1.VectorStore/Checkpoint"
-	VectorStore_Rebuild_FullMethodName        = "/vectorstore.v1.VectorStore/Rebuild"
-	VectorStore_Prune_FullMethodName          = "/vectorstore.v1.VectorStore/Prune"
+	VectorStore_ManageConsumer_FullMethodName    = "/vectorstore.v1.VectorStore/ManageConsumer"
+	VectorStore_ReadChanges_FullMethodName       = "/vectorstore.v1.VectorStore/ReadChanges"
+	VectorStore_ResolveWriteRoute_FullMethodName = "/vectorstore.v1.VectorStore/ResolveWriteRoute"
+	VectorStore_Put_FullMethodName               = "/vectorstore.v1.VectorStore/Put"
+	VectorStore_Get_FullMethodName               = "/vectorstore.v1.VectorStore/Get"
+	VectorStore_Delete_FullMethodName            = "/vectorstore.v1.VectorStore/Delete"
+	VectorStore_List_FullMethodName              = "/vectorstore.v1.VectorStore/List"
+	VectorStore_Search_FullMethodName            = "/vectorstore.v1.VectorStore/Search"
+	VectorStore_FollowerSearch_FullMethodName    = "/vectorstore.v1.VectorStore/FollowerSearch"
+	VectorStore_Health_FullMethodName            = "/vectorstore.v1.VectorStore/Health"
+	VectorStore_GetCluster_FullMethodName        = "/vectorstore.v1.VectorStore/GetCluster"
+	VectorStore_GetLayout_FullMethodName         = "/vectorstore.v1.VectorStore/GetLayout"
+	VectorStore_Checkpoint_FullMethodName        = "/vectorstore.v1.VectorStore/Checkpoint"
+	VectorStore_Rebuild_FullMethodName           = "/vectorstore.v1.VectorStore/Rebuild"
+	VectorStore_Prune_FullMethodName             = "/vectorstore.v1.VectorStore/Prune"
 )
 
 // VectorStoreClient is the client API for VectorStore service.
@@ -40,11 +42,14 @@ const (
 type VectorStoreClient interface {
 	ManageConsumer(ctx context.Context, in *ConsumerRequest, opts ...grpc.CallOption) (*ConsumerState, error)
 	ReadChanges(ctx context.Context, in *ChangeRequest, opts ...grpc.CallOption) (*ChangePage, error)
+	ResolveWriteRoute(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*WriteRoute, error)
 	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*MutationResponse, error)
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*Record, error)
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*MutationResponse, error)
 	List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error)
 	Search(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*SearchResponse, error)
+	// Followers batch fresh leader applied-position captures, wait locally, then query.
+	FollowerSearch(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*SearchResponse, error)
 	Health(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*HealthResponse, error)
 	GetCluster(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*ClusterStatus, error)
 	GetLayout(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*Layout, error)
@@ -73,6 +78,15 @@ func (c *vectorStoreClient) ManageConsumer(ctx context.Context, in *ConsumerRequ
 func (c *vectorStoreClient) ReadChanges(ctx context.Context, in *ChangeRequest, opts ...grpc.CallOption) (*ChangePage, error) {
 	out := new(ChangePage)
 	err := c.cc.Invoke(ctx, VectorStore_ReadChanges_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vectorStoreClient) ResolveWriteRoute(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*WriteRoute, error) {
+	out := new(WriteRoute)
+	err := c.cc.Invoke(ctx, VectorStore_ResolveWriteRoute_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -118,6 +132,15 @@ func (c *vectorStoreClient) List(ctx context.Context, in *ListRequest, opts ...g
 func (c *vectorStoreClient) Search(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*SearchResponse, error) {
 	out := new(SearchResponse)
 	err := c.cc.Invoke(ctx, VectorStore_Search_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vectorStoreClient) FollowerSearch(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*SearchResponse, error) {
+	out := new(SearchResponse)
+	err := c.cc.Invoke(ctx, VectorStore_FollowerSearch_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -184,11 +207,14 @@ func (c *vectorStoreClient) Prune(ctx context.Context, in *Empty, opts ...grpc.C
 type VectorStoreServer interface {
 	ManageConsumer(context.Context, *ConsumerRequest) (*ConsumerState, error)
 	ReadChanges(context.Context, *ChangeRequest) (*ChangePage, error)
+	ResolveWriteRoute(context.Context, *GetRequest) (*WriteRoute, error)
 	Put(context.Context, *PutRequest) (*MutationResponse, error)
 	Get(context.Context, *GetRequest) (*Record, error)
 	Delete(context.Context, *DeleteRequest) (*MutationResponse, error)
 	List(context.Context, *ListRequest) (*ListResponse, error)
 	Search(context.Context, *SearchRequest) (*SearchResponse, error)
+	// Followers batch fresh leader applied-position captures, wait locally, then query.
+	FollowerSearch(context.Context, *SearchRequest) (*SearchResponse, error)
 	Health(context.Context, *Empty) (*HealthResponse, error)
 	GetCluster(context.Context, *Empty) (*ClusterStatus, error)
 	GetLayout(context.Context, *Empty) (*Layout, error)
@@ -208,6 +234,9 @@ func (UnimplementedVectorStoreServer) ManageConsumer(context.Context, *ConsumerR
 func (UnimplementedVectorStoreServer) ReadChanges(context.Context, *ChangeRequest) (*ChangePage, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ReadChanges not implemented")
 }
+func (UnimplementedVectorStoreServer) ResolveWriteRoute(context.Context, *GetRequest) (*WriteRoute, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ResolveWriteRoute not implemented")
+}
 func (UnimplementedVectorStoreServer) Put(context.Context, *PutRequest) (*MutationResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Put not implemented")
 }
@@ -222,6 +251,9 @@ func (UnimplementedVectorStoreServer) List(context.Context, *ListRequest) (*List
 }
 func (UnimplementedVectorStoreServer) Search(context.Context, *SearchRequest) (*SearchResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Search not implemented")
+}
+func (UnimplementedVectorStoreServer) FollowerSearch(context.Context, *SearchRequest) (*SearchResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method FollowerSearch not implemented")
 }
 func (UnimplementedVectorStoreServer) Health(context.Context, *Empty) (*HealthResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Health not implemented")
@@ -286,6 +318,24 @@ func _VectorStore_ReadChanges_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(VectorStoreServer).ReadChanges(ctx, req.(*ChangeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VectorStore_ResolveWriteRoute_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VectorStoreServer).ResolveWriteRoute(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VectorStore_ResolveWriteRoute_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VectorStoreServer).ResolveWriteRoute(ctx, req.(*GetRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -376,6 +426,24 @@ func _VectorStore_Search_Handler(srv interface{}, ctx context.Context, dec func(
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(VectorStoreServer).Search(ctx, req.(*SearchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VectorStore_FollowerSearch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SearchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VectorStoreServer).FollowerSearch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VectorStore_FollowerSearch_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VectorStoreServer).FollowerSearch(ctx, req.(*SearchRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -504,6 +572,10 @@ var VectorStore_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _VectorStore_ReadChanges_Handler,
 		},
 		{
+			MethodName: "ResolveWriteRoute",
+			Handler:    _VectorStore_ResolveWriteRoute_Handler,
+		},
+		{
 			MethodName: "Put",
 			Handler:    _VectorStore_Put_Handler,
 		},
@@ -522,6 +594,10 @@ var VectorStore_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Search",
 			Handler:    _VectorStore_Search_Handler,
+		},
+		{
+			MethodName: "FollowerSearch",
+			Handler:    _VectorStore_FollowerSearch_Handler,
 		},
 		{
 			MethodName: "Health",

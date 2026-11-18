@@ -10,12 +10,17 @@ import verify_dispatch
 class DispatchHarnessTest(unittest.TestCase):
     def test_completion_is_not_replica_visibility(self):
         position = {'sequence':2, 'hash':'committed'}
+        owner = dict(partition="a", node="w", session="s", epoch=2)
         state = dict(ready=True, fully_replicated=True,
             data_progress={'d':dict(head=9, completed_lsn=9, floor=2, owner_available=True)},
-            graph_heads={'i':dict(visible=position, committed=position)},
-            replica_owners={'i':dict(owners=[dict(partition='a'), dict(partition='b')])},
+            graph_heads={'i':dict(visible=position, committed=position, leader=owner.copy())},
+            replica_plans={'i':dict(publisher='a')},
+            replica_owners={'i':dict(owners=[owner, dict(partition='b')])},
             graph_positions={'a':position, 'b':position})
         self.assertTrue(verify_dispatch.converged(state, 1, 1))
+        old = copy.deepcopy(state)
+        old['graph_heads']['i']['leader']['epoch'] -= 1
+        self.assertFalse(verify_dispatch.converged(old, 1, 1))
         for field in ('data', 'replica', 'unpublished', 'expired', 'missing'):
             bad = copy.deepcopy(state)
             if field == 'data': bad['data_progress']['d']['completed_lsn']=8

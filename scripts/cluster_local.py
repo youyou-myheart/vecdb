@@ -35,7 +35,7 @@ class LocalCluster:
         self.urls = {}
         self.grpc_port = grpc_port
         self.env = dict(os.environ if environment is None else environment)
-        self.env.pop("GRPC_LISTEN_ADDR", None)  # Only the Gateway receives the dedicated listener.
+        self.env.pop("GRPC_LISTEN_ADDR", None)  # Gateway uses the configured port. Routed workers allocate their own gRPC listeners.
         for key in ('API_TOKEN', 'CLUSTER_TOKEN'):
             if len(self.env.get(key, '')) < 16:
                 raise ValueError(key + ' must contain at least 16 characters')

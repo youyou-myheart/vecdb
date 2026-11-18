@@ -59,7 +59,7 @@ func TestGraphDurableTailReplaysBeforeLeaderApply(t *testing.T) {
 	if err != nil || h.Visible.Sequence != 2 || h.Visible != h.Committed || a.Cursor() != 0 {
 		t.Fatal(h, err)
 	}
-	commits, err := c.sourceCommits(f.ctx, 0)
+	commits, err := c.sourceCommits(f.ctx, 0, []IndexPartitionID{g.journal.id})
 	if err != nil || commits[g.journal.id] != 1 {
 		t.Fatal("source ACK missing before leader apply", commits, err)
 	}
@@ -113,7 +113,7 @@ func TestGraphRejectsInvalidDeltaBeforeDurability(t *testing.T) {
 	if err != nil || after.Committed.Sequence != 0 || blobs.gets.Load() != 0 {
 		t.Fatal("invalid patch persisted", after, err)
 	}
-	commits, err := c.sourceCommits(f.ctx, 0)
+	commits, err := c.sourceCommits(f.ctx, 0, []IndexPartitionID{g.journal.id})
 	if err != nil || commits[g.journal.id] != 0 {
 		t.Fatal("invalid patch acknowledged", commits, err)
 	}
@@ -143,7 +143,7 @@ func TestGraphSourceWatermarksSurviveCompleteCompaction(t *testing.T) {
 		if err != nil || h.Floor != h.Committed || h.Sources["0"] != n+1 {
 			t.Fatal(h, err)
 		}
-		commits, err := c.sourceCommits(f.ctx, 0)
+		commits, err := c.sourceCommits(f.ctx, 0, []IndexPartitionID{g.journal.id})
 		if err != nil || commits[g.journal.id] != n+1 {
 			t.Fatal(commits, err)
 		}

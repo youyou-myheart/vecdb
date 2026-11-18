@@ -99,6 +99,18 @@ class CapacityExplorationTest(unittest.TestCase):
         live.terminate.assert_called_once()
         with self.assertRaises(RuntimeError): guard.check()
 
+    def test_extended_runtime_preserves_resource_limits(self):
+        fixture=SimpleNamespace(args=SimpleNamespace(max_seconds=900),c=SimpleNamespace(children={}),storage=SimpleNamespace(children=[]),work_stop=threading.Event())
+        guard=ResourceGuard(fixture,Path('.'))
+        guard.sample=Mock(return_value=dict(disk_free_bytes=20*GIB,memory_pressure=1,system_cpu_percent=100,logical_cpus=14,elapsed_seconds=300))
+        guard.stop=Mock();guard.stop.is_set.side_effect=[False,True]
+        guard.run()
+        self.assertIsNone(guard.reason)
+        guard.stop.is_set.side_effect=[False,True]
+        guard.sample.return_value['elapsed_seconds']=901
+        guard.run()
+        self.assertIn('runtime budget',guard.reason)
+
     def test_sustained_system_cpu_stops_after_three_samples(self):
         fixture=SimpleNamespace(c=SimpleNamespace(children={}),storage=SimpleNamespace(children=[]),work_stop=threading.Event())
         guard=ResourceGuard(fixture,Path('.'))

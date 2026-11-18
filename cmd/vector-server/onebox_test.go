@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -378,6 +379,31 @@ func oneProcessPipeline(t *testing.T, graph, retention bool, clustered ...bool) 
 	}
 	verify(g0)
 	verify(g1)
+	if routing != nil {
+		// Business read through a follower, with no MinVisible/Sync side effects.
+		// Distinguish the apply barrier from the complete query wall time.
+		for _, gateway := range []*node{g0, g1} {
+			out := call(gateway, "POST", "/v1/follower-search", map[string]any{"vector": []float64{0, 0, 0}, "k": 1000, "exact": true}, 200)
+			var hits []vector.Hit
+			var reads []vector.FollowerReadInfo
+			if err := json.Unmarshal(out["hits"], &hits); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(out["follower_reads"], &reads); err != nil {
+				t.Fatal(err)
+			}
+			if len(hits) != 96 || len(reads) != indexCount {
+				t.Fatal("incomplete follower read", len(hits), len(reads))
+			}
+			for _, r := range reads {
+				if r.Target.Sequence == 0 || r.Applied.Sequence < r.Target.Sequence || r.Node == "" || r.Session == "" || r.OwnerEpoch == 0 {
+					t.Fatal("invalid follower barrier", r)
+				}
+			}
+			report["follower_read_"+gateway.id] = reads
+		}
+		check("follower_read_on_both_gateways_with_applied_positions_and_stage_timings")
+	}
 	filtered := call(g1, "POST", "/v1/search", map[string]any{"vector": []float64{0, 0, 0}, "k": 10, "filter": map[string]string{"group": "changed"}}, 200)
 	var fh []vector.Hit
 	_ = json.Unmarshal(filtered["hits"], &fh)
@@ -486,9 +512,8 @@ func oneProcessPipeline(t *testing.T, graph, retention bool, clustered ...bool) 
 	verify(g1)
 	report["live_records"] = 95
 	if routing != nil {
-		// Repeated total Worker outages: the Gateways keep accepting durable data
-		// writes while graph construction is unavailable. Each burst exceeds one
-		// 32-event dispatcher window per source on average.
+		// Lose all data owners after GC, verify the write cannot be acknowledged,
+		// then drive more than one dispatcher window through recovered owners.
 		expected := map[string]vector.Hit{}
 		baseline := call(g1, "POST", "/v1/search", map[string]any{"vector": []float64{0, 0, 0}, "k": 1000, "exact": true, "min_visible": latest}, 200)
 		var initial []vector.Hit
@@ -531,6 +556,34 @@ func oneProcessPipeline(t *testing.T, graph, retention bool, clustered ...bool) 
 			for n := 0; n < 3; n++ {
 				stop(nodes[fmt.Sprintf("worker-%d", n)])
 			}
+			probeID := fmt.Sprintf("no-owner-%d", round)
+			call(g1, "PUT", "/v1/records/"+probeID, map[string]any{"request_id": probeID, "vector": []float64{1, 0, 0}}, 503)
+			call(g1, "GET", "/v1/records/"+probeID, nil, 404)
+			wait("old Worker registrations disappear", func() bool {
+				for _, n := range status(g1).Nodes {
+					for _, role := range n.Roles {
+						if role == "worker" {
+							return false
+						}
+					}
+				}
+				return true
+			})
+			for n := 0; n < 3; n++ {
+				start(fmt.Sprintf("worker-%d", n), "worker")
+			}
+			wait("new data owners ready", func() bool {
+				s := status(g1)
+				if len(s.DataProgress) != dataCount {
+					return false
+				}
+				for _, d := range s.DataProgress {
+					if !d.OwnerAvailable {
+						return false
+					}
+				}
+				return true
+			})
 			for n := 0; n < 144; n++ {
 				id := fmt.Sprintf("outage-%d-%03d", round, n)
 				x := []float64{0, 48, 96}[n%3] + float64(n)/1000
@@ -558,22 +611,6 @@ func oneProcessPipeline(t *testing.T, graph, retention bool, clustered ...bool) 
 			expected[moving] = hit
 			if raw := call(g1, "GET", "/v1/records/"+moving, nil, 200); string(raw["revision"]) != "5" {
 				t.Fatal(raw)
-			}
-			if metricSum("vecdb_data_pending_events") < 144 {
-				t.Fatal("outage backlog not observed")
-			}
-			wait("old Worker registrations disappear", func() bool {
-				for _, n := range status(g1).Nodes {
-					for _, role := range n.Roles {
-						if role == "worker" {
-							return false
-						}
-					}
-				}
-				return true
-			})
-			for n := 0; n < 3; n++ {
-				start(fmt.Sprintf("worker-%d", n), "worker")
 			}
 			wait("all sources and graph replicas recover after repeated outage", func() bool {
 				s := status(g1)
@@ -620,6 +657,24 @@ func oneProcessPipeline(t *testing.T, graph, retention bool, clustered ...bool) 
 				}
 				seen[hit.ID] = true
 			}
+			follower := call(g1, "POST", "/v1/follower-search", map[string]any{"vector": []float64{0, 0, 0}, "k": 1000, "exact": true}, 200)
+			var followerHits []vector.Hit
+			var reads []vector.FollowerReadInfo
+			if err := json.Unmarshal(follower["hits"], &followerHits); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(follower["follower_reads"], &reads); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(followerHits, hits) || len(reads) != indexCount {
+				t.Fatal("follower recovery oracle mismatch")
+			}
+			for _, read := range reads {
+				if read.Applied.Sequence < read.Target.Sequence {
+					t.Fatal("follower returned before apply", read)
+				}
+			}
+			report[fmt.Sprintf("follower_after_outage_%d", round+1)] = reads
 			if metricSum("vecdb_data_pending_events") != 0 || metricSum("vecdb_graph_replica_lag_entries") != 0 {
 				t.Fatal("recovery lag failed to converge")
 			}

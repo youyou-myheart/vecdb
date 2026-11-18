@@ -57,7 +57,7 @@ func TestReplicaMigrationAndPublisherFence(t *testing.T) {
 	}
 	// Pin a migration barrier above the fresh replacement's offset.
 	tx, _ := r.begin()
-	_ = putJSON(tx, []byte(r.Prefix+"log-head"), uint64(50))
+	_ = putJSON(tx, r.logKey(50), LogEvent{Sequence: 50})
 	if e = tx.Commit(ctx); e != nil {
 		t.Fatal(e)
 	}

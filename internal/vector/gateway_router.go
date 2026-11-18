@@ -36,6 +36,16 @@ func (p *remotePartition) callOwner(ctx context.Context, op string, q Search, o 
 func (p *remotePartition) callOwnerThrough(ctx context.Context, op string, q Search, o Ownership, through uint64) (partitionReply, error) {
 	c := p.cluster
 	payload := partitionRPC{ReadThrough: through, Namespace: c.root.Prefix, Partition: o.Partition, Epoch: o.Epoch, Operation: op, Query: q}
+	payload.Session = o.Session
+	return c.sendPartition(ctx, o, payload)
+}
+func (c *ClusterService) sendPartition(ctx context.Context, o Ownership, payload partitionRPC) (partitionReply, error) {
+	if err := ctx.Err(); err != nil {
+		return partitionReply{}, err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		payload.TimeoutMS = max(1, time.Until(deadline).Milliseconds())
+	}
 	if o.Node == c.node.ID && o.Session == c.node.Session {
 		return c.execute(ctx, payload)
 	}
@@ -59,6 +69,16 @@ func (p *remotePartition) callOwnerThrough(ctx context.Context, op string, q Sea
 		return out, e
 	}
 	if response.StatusCode != 200 {
+		switch out.Code {
+		case "conflict":
+			return partitionReply{}, ErrConflict
+		case "deadline_exceeded":
+			return partitionReply{}, context.DeadlineExceeded
+		case "canceled":
+			return partitionReply{}, context.Canceled
+		case "resource_exhausted":
+			return partitionReply{}, ErrFollowerQueueFull
+		}
 		if out.Code == "fenced" {
 			if out.SourceEpoch != nil {
 				return out, out.SourceEpoch
@@ -70,7 +90,7 @@ func (p *remotePartition) callOwnerThrough(ctx context.Context, op string, q Sea
 		}
 		return partitionReply{}, fmt.Errorf("%w: %s", ErrPartitionUnavailable, out.Error)
 	}
-	if op == "search" && out.AppliedOffset < through {
+	if payload.Operation == "search" && out.AppliedOffset < payload.ReadThrough {
 		return partitionReply{}, ErrNotVisible
 	}
 	return out, nil

@@ -1,11 +1,27 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+import grpc
 from vectorstore import Client, messages
 
 class ClientTests(unittest.TestCase):
+    def test_follower_search_is_one_rpc_with_deadline(self):
+        with Client('localhost:1', 'secret') as client:
+            client.stub = Mock()
+            client.follower_search([1, 2], k=3, filter={'tag': 'x'}, timeout=.25)
+            call = client.stub.FollowerSearch.call_args
+            self.assertEqual(call.args[0].k, 3)
+            self.assertEqual(dict(call.args[0].filter), {'tag': 'x'})
+            self.assertEqual(call.kwargs['timeout'], .25)
+            self.assertEqual(call.kwargs['metadata'], (('authorization', 'Bearer secret'),))
+            client.stub.Search.assert_not_called()
+            client.stub.GetCluster.assert_not_called()
+            with self.assertRaises(ValueError):
+                client.follower_search([1, 2], timeout=0)
+
     def test_request_presence_and_token(self):
         with Client('localhost:1', 'secret', timeout=4) as client:
             client.stub = Mock()
+            client.stub.ResolveWriteRoute.return_value = messages.WriteRoute()
             client.insert('a', [1,2], request_id='insert')
             request = client.stub.Put.call_args.args[0]
             self.assertTrue(request.HasField('expected_revision'))
@@ -17,6 +33,31 @@ class ClientTests(unittest.TestCase):
                 client.update('a', [1], revision=0, request_id='bad')
             with self.assertRaises(ValueError):
                 client.get('a', timeout=0)
+
+    def test_direct_writes_share_route_and_refresh_a_stale_epoch(self):
+        class Stale(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.FAILED_PRECONDITION
+
+        with Client('localhost:1', 'secret') as client:
+            client.stub = Mock()
+            first = messages.WriteRoute(partitions=1, endpoint='worker:1000', epoch=1, session='a')
+            second = messages.WriteRoute(partitions=1, endpoint='worker:2000', epoch=2, session='b')
+            client.stub.ResolveWriteRoute.side_effect = [first, second]
+            old, new = Mock(), Mock()
+            old.Delete.side_effect = Stale()
+            new.Delete.return_value = messages.MutationResponse(durable=True)
+            with patch('vectorstore.VectorStoreStub', side_effect=[old, new]):
+                client.put('a', [1], request_id='r1')
+                response = client.delete('b', request_id='r2')
+            self.assertTrue(response.durable)
+            self.assertEqual(old.Put.call_args.args[0].route.epoch, 1)
+            self.assertEqual(new.Delete.call_args.args[0].route.epoch, 2)
+            self.assertEqual(new.Delete.call_args.args[0].request_id, 'r2')
+            self.assertEqual(new.Delete.call_args.kwargs['metadata'], client.metadata)
+            self.assertEqual(client.stub.ResolveWriteRoute.call_count, 2)
+            client.stub.Put.assert_not_called()
+            client.stub.Delete.assert_not_called()
 
     def test_iteration_continues_through_empty_page(self):
         with Client('localhost:1','secret') as client:

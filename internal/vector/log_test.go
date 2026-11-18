@@ -55,19 +55,19 @@ func TestOrderedLogBatchesAndRetry(t *testing.T) {
 	}
 }
 func TestLogFailureAndBounds(t *testing.T) {
-	for _, name := range []string{"head-read", "bad-head", "floor-read", "iter", "next", "bad-event", "bad-sequence", "gap", "set4", "head-overflow"} {
+	for _, name := range []string{"head-read", "bad-head", "floor-read", "iter", "next", "bad-event", "bad-sequence", "gap", "set3", "head-overflow"} {
 		t.Run(name, func(t *testing.T) {
 			r, d := newFakeRepo()
 			ctx := context.Background()
-			if name == "set4" {
-				d.setFail = 4
+			if name == "set3" {
+				d.setFail = 3
 				if _, e := r.Mutate(ctx, "a", Mutation{RequestID: "a", Vector: []float64{0, 0}}, false); e == nil || len(d.data) != 0 {
 					t.Fatal("partial transaction", e)
 				}
 				return
 			}
 			if name == "head-overflow" {
-				d.data[r.Prefix+"log-head"] = []byte("18446744073709551615")
+				seed(d, r.logKey(^uint64(0)), LogEvent{Sequence: ^uint64(0)})
 				if _, e := r.Mutate(ctx, "a", Mutation{RequestID: "a", Vector: []float64{0, 0}}, false); e == nil {
 					t.Fatal("overflow")
 				}
@@ -76,9 +76,9 @@ func TestLogFailureAndBounds(t *testing.T) {
 			putLogRecords(t, r, 2)
 			switch name {
 			case "head-read":
-				d.getFail = "log-head"
+				d.iterErr = injected
 			case "bad-head":
-				d.data[r.Prefix+"log-head"] = []byte("bad")
+				d.data[r.Prefix+"log/bad"] = []byte("bad")
 			case "floor-read":
 				d.getFail = "log-floor"
 			case "iter":
@@ -229,7 +229,7 @@ func TestSchemaOfflineUpgrade(t *testing.T) {
 	if e := r.ensureSchema(context.Background()); e != nil {
 		t.Fatal(e)
 	}
-	if string(d.data[r.Prefix+"schema"]) != "v2:dimension=2:metric=l2:log=1" {
+	if string(d.data[r.Prefix+"schema"]) != "v2:dimension=2:metric=l2:log=1"+dataLogSchemaSuffix {
 		t.Fatal("not upgraded")
 	}
 }
@@ -269,5 +269,51 @@ func TestIncrementalRetryDoesNotRescanHistory(t *testing.T) {
 	}
 	if e = s.Sync(ctx); e != nil || r.events != 600 {
 		t.Fatal("history reread", r.events, e)
+	}
+}
+
+func TestDataLogSchemaUpgrade(t *testing.T) {
+	const schema = "v2:dimension=2:metric=l2:log=1"
+	for _, tc := range []struct {
+		name                string
+		floor, last, legacy uint64
+		fail                bool
+	}{
+		{"retained", 40, 42, 42, false},
+		{"fully compacted", 42, 0, 42, false},
+		{"unwritten", 0, 0, 0, false},
+		{"missing tail", 40, 41, 42, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			r, db := newFakeRepo()
+			db.data[r.Prefix+"schema"] = []byte(schema)
+			seed(db, []byte(r.Prefix+"log-head"), tc.legacy)
+			seed(db, []byte(r.Prefix+"log-floor"), tc.floor)
+			for n := tc.floor + 1; n <= tc.last; n++ {
+				seed(db, r.logKey(n), LogEvent{n, Record{ID: "old", Revision: n, Deleted: true}})
+			}
+			err := r.ensureSchema(ctx)
+			_, legacyExists := db.data[r.Prefix+"log-head"]
+			if tc.fail {
+				if err == nil || !legacyExists || string(db.data[r.Prefix+"schema"]) != schema {
+					t.Fatal("inconsistent legacy data was upgraded", err)
+				}
+				return
+			}
+			if err != nil || legacyExists || string(db.data[r.Prefix+"schema"]) != schema+dataLogSchemaSuffix {
+				t.Fatal("schema upgrade", err, legacyExists)
+			}
+			if _, err = r.Mutate(ctx, "new", Mutation{RequestID: "new", Vector: []float64{1, 2}}, false); err != nil {
+				t.Fatal(err)
+			}
+			batch, err := r.ReadEvents(ctx, tc.legacy, 0, 1)
+			if err != nil || len(batch.Events) != 1 || batch.Head != tc.legacy+1 || batch.Floor != tc.floor {
+				t.Fatal(batch, err)
+			}
+			if _, exists := db.data[r.Prefix+"log-head"]; exists {
+				t.Fatal("append recreated the legacy counter")
+			}
+		})
 	}
 }

@@ -132,8 +132,11 @@ func (j graphJournal) Entry(ctx context.Context, seq uint64) (GraphEntry, error)
 	if seq <= h.Floor.Sequence {
 		return GraphEntry{}, ErrLogCompacted
 	}
+	return j.entryIn(ctx, tx, seq)
+}
+func (j graphJournal) entryIn(ctx context.Context, tx transactionAPI, seq uint64) (GraphEntry, error) {
 	var entry GraphEntry
-	e = readJSON(ctx, tx, j.key(fmt.Sprintf("entries/%020d", seq)), &entry)
+	e := readJSON(ctx, tx, j.key(fmt.Sprintf("entries/%020d", seq)), &entry)
 	if e == nil && (entry.Position.Sequence != seq || entry.Position.Hash != entryHash(entry)) {
 		e = errors.New("graph journal hash mismatch")
 	}
@@ -290,12 +293,9 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 	}
 	return entry, tx.Commit(ctx)
 }
-func (j graphJournal) SaveCheckpoint(ctx context.Context, pos GraphPosition, m Manifest, repo *Repository) error {
-	return j.saveCheckpoint(ctx, pos, m, repo, nil)
-}
 
 // Coverage describes the captured graph, not the possibly newer durable tail.
-func (j graphJournal) saveCheckpoint(ctx context.Context, pos GraphPosition, m Manifest, repo *Repository, coverage *GraphHead) error {
+func (j graphJournal) saveCheckpoint(ctx context.Context, pos GraphPosition, m Manifest, dataManifestKey []byte, coverage *GraphHead) error {
 	tx, e := j.c.root.begin()
 	if e != nil {
 		return e
@@ -343,34 +343,16 @@ func (j graphJournal) saveCheckpoint(ctx context.Context, pos GraphPosition, m M
 	if e = putJSON(tx, j.key("head"), h); e != nil {
 		return e
 	}
-	prefix := repo.Prefix
-	if repo.IndexPrefix != "" {
-		prefix = repo.IndexPrefix
-	}
-	if e = putJSON(tx, []byte(prefix+"manifest"), m); e != nil {
-		return e
+	// Identity routing uses this manifest to reset the data stream and prune
+	// its source log. Routed data streams publish their own checkpoints.
+	if dataManifestKey != nil {
+		if e = putJSON(tx, dataManifestKey, m); e != nil {
+			return e
+		}
 	}
 	return tx.Commit(ctx)
 }
 
-func (j graphJournal) Report(ctx context.Context, pos GraphPosition) error {
-	tx, e := j.c.root.begin()
-	if e != nil {
-		return e
-	}
-	defer tx.Rollback()
-	owner, e := j.c.readOwner(ctx, tx, j.owner.Partition)
-	if e != nil {
-		return e
-	}
-	if !sameOwner(owner, j.owner) || !owner.Ready || owner.Expires <= txnMillis(tx) {
-		return ErrFenced
-	}
-	if e = putJSON(tx, j.key("progress/"+string(j.owner.Partition)), graphAck{j.owner, pos}); e != nil {
-		return e
-	}
-	return tx.Commit(ctx)
-}
 func (j graphJournal) Progress(ctx context.Context, owner Ownership) (GraphPosition, error) {
 	tx, e := j.c.root.begin()
 	if e != nil {

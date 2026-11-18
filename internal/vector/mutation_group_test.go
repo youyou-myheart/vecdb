@@ -233,7 +233,8 @@ func TestSourceCommitsBatchesHeadsAtOneSnapshot(t *testing.T) {
 	begin := r.beginTxn
 	calls, begins := 0, 0
 	r.beginTxn = func() (transactionAPI, error) { begins++; tx, e := begin(); return countedBatchGetTx{tx, &calls}, e }
-	commits, err := c.sourceCommits(context.Background(), 0)
+	targets := (IdentityPartitionRouter{layout}).QueryIndexes(Search{})
+	commits, err := c.sourceCommits(context.Background(), 0, targets)
 	if err != nil || calls != 1 || begins != 1 || len(commits) != 8 {
 		t.Fatal(err, commits, calls, begins)
 	}

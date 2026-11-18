@@ -34,11 +34,11 @@ flowchart LR
 | `P/partition-layout` | version、epoch、hash 算法、分区数、data→index 绑定 |
 | `P/request/<request_id>` | namespace 级幂等凭证 |
 | `P/data/0000/record/...` | 数据分区 0 的完整记录和墓碑 |
-| `P/data/0000/log/...`、`log-head`、`log-floor` | 数据分区 0 的有序日志及保留范围 |
+| `P/data/0000/log/...`、`log-floor` | 数据分区 0 的有序日志及保留范围 |
 | `P/index/index-0000/manifest` | 索引分区 0 的图快照清单 |
 | SeaweedFS 的 `P/index/index-0000/snapshots/...` | 索引分区 0 的不可变快照对象 |
 
-记录、来源日志、来源 head 和 namespace 级凭证仍在一个 TiKV 事务内提交。不同数据分区不竞争同一个 head。请求 ID 仍在整个 namespace 内唯一，不能通过换一个 hash 分区绕过幂等冲突检查。
+记录、来源日志和 namespace 级凭证在一个 TiKV 事务内提交。聚类布局由各分片的写入 owner 从内存末尾分配 LSN，接管时按日志尾键或回收水位恢复。请求 ID 仍在整个 namespace 内唯一，不能通过换一个 hash 分区绕过幂等冲突检查。
 
 索引服务通过绑定的来源读取日志，图快照和 manifest 使用独立索引路径。发布快照仍校验来源 head/floor；清理通过该绑定读取持久化快照位点。当前一对一关系保证每个索引仍只需要一个来源 offset。
 
