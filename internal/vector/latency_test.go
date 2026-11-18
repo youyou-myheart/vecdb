@@ -180,5 +180,5 @@ func TestLocalQueueAndAppliedGaugesDuringStorageFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.db.beginErr = injected
-	check(0, 1)
+	check(0, 2)
 }

@@ -110,6 +110,7 @@ def stages_for(lane, python, directory):
             Stage('build-cli', go + ['build', '-o', '.tools/vectorctl', './cmd/vectorctl']),
             Stage('dispatch-faults', [python, 'scripts/verify_dispatch.py'], artifacts=('reports/dispatch-processes.json',)),
             Stage('retention-faults', [python, 'scripts/verify_retention.py'], timeout=300, artifacts=('reports/retention-processes.json',)),
+            Stage('reference-checkpoints', [python, 'scripts/verify_reference_checkpoint.py'], timeout=300, artifacts=('reports/reference-checkpoint.json',)),
         ]
     return stages
 

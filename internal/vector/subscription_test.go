@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestSubscriptionsPublishedPrefixAndResume(t *testing.T) {
+func TestSubscriptionsDurablePrefixAndResume(t *testing.T) {
 	f := newGraphFixture(t)
 	s := f.services[0]
 	g := s.graphReplica
@@ -30,7 +30,7 @@ func TestSubscriptionsPublishedPrefixAndResume(t *testing.T) {
 	if e != nil || page.Next != 2 || len(page.Data) != 0 {
 		t.Fatal(page, e)
 	}
-	// A durable but unpublished graph entry cannot escape through subscriptions.
+	// A durable graph entry is immediately subscribable, before any local apply.
 	head, e := g.journal.Claim(f.ctx)
 	if e != nil {
 		t.Fatal(e)
@@ -54,8 +54,8 @@ func TestSubscriptionsPublishedPrefixAndResume(t *testing.T) {
 	}
 	q = ChangeRequest{Partition: "index-0000", Stream: "graph", Limit: 1}
 	page, e = c.ReadChanges(f.ctx, q)
-	if e != nil || page.Head != 0 || len(page.Graph) != 0 {
-		t.Fatal("unpublished event leaked", page, e)
+	if e != nil || page.Head != 1 || len(page.Graph) != 1 || s.Cursor() != 0 {
+		t.Fatal("durable event not exposed before local apply", page, e)
 	}
 	if e = s.Sync(f.ctx); e != nil {
 		t.Fatal(e)

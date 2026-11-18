@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"math/rand"
 	"sync"
 )
@@ -16,17 +17,20 @@ type graphBlobs interface {
 	loadBytes(context.Context, Manifest) ([]byte, error)
 }
 type graphReplica struct {
-	input     *routedInput
-	retention bool
-	viewMu    sync.RWMutex
-	journal   graphJournal
-	repo      *Repository
-	objects   graphBlobs
-	position  GraphPosition
-	prepared  GraphPosition
-	delta     *GraphDelta
-	reset     *IndexSnapshot
-	leader    bool // Last authoritative plan read; guarded by Service.syncMu.
+	writer       *indexWriter
+	fastAppend   bool // Under Service.syncMu and writer.op.
+	input        *routedInput
+	retention    bool
+	checkpointMu sync.Mutex
+	viewMu       sync.RWMutex
+	journal      graphJournal
+	repo         *Repository
+	objects      graphBlobs
+	position     GraphPosition
+	prepared     GraphPosition
+	delta        *GraphDelta
+	reset        *IndexSnapshot
+	leader       bool // Last authoritative plan read; guarded by Service.syncMu.
 }
 
 func newGraphService(ctx context.Context, r *Repository, o ObjectAPI, j graphJournal) (*Service, error) {
@@ -58,7 +62,7 @@ func newGraphService(ctx context.Context, r *Repository, o ObjectAPI, j graphJou
 		if err != nil {
 			return nil, err
 		}
-		if state.GraphSequence != head.CheckpointPosition.Sequence || state.GraphHash != head.CheckpointPosition.Hash || state.Offset != head.CheckpointPosition.DataOffset || len(state.GraphState) == 0 {
+		if (g.journal.c.referenceLogs && (state.LogBytes != head.CheckpointBytes || !maps.Equal(state.Sources, head.CheckpointSources))) || !maps.Equal(state.SourceEpochs, head.CheckpointSourceEpochs) || state.GraphSequence != head.CheckpointPosition.Sequence || state.GraphHash != head.CheckpointPosition.Hash || state.Offset != head.CheckpointPosition.DataOffset || len(state.GraphState) == 0 {
 			return nil, errors.New("graph checkpoint position mismatch")
 		}
 		fresh, err := RestoreHNSW(state)
@@ -78,6 +82,19 @@ func newGraphService(ctx context.Context, r *Repository, o ObjectAPI, j graphJou
 }
 func (g *graphReplica) loadEntry(ctx context.Context, e GraphEntry) (_ *GraphDelta, _ *IndexSnapshot, err error) {
 	defer g.track("graph_load")(&err)
+	if g.input != nil {
+		p := &g.input.cluster.observations.pipeline
+		p.init()
+		gauge := p.graphLoads.WithLabelValues(string(g.journal.id))
+		gauge.Inc()
+		defer gauge.Dec()
+	}
+	if e.Kind == sourceEpochEntry {
+		if e.Payload != nil || e.Object.Key != "" || e.Position.DataOffset != e.Previous.DataOffset || len(e.SourceEpochs) == 0 {
+			return nil, nil, errors.New("invalid source epoch barrier")
+		}
+		return nil, nil, nil
+	}
 	if e.Kind == "reset" {
 		state, err := g.objects.LoadState(ctx, e.Object)
 		if err != nil {
@@ -87,6 +104,10 @@ func (g *graphReplica) loadEntry(ctx context.Context, e GraphEntry) (_ *GraphDel
 			return nil, nil, errors.New("graph reset mismatch")
 		}
 		return nil, &state, nil
+	}
+	if e.Kind == "delta" && e.Payload != nil {
+		d, err := g.loadReferenceEntry(ctx, e)
+		return d, nil, err
 	}
 	if e.Kind != "delta" || e.Object.Format != deltaFormat {
 		return nil, nil, errors.New("unknown graph entry kind")
@@ -118,8 +139,10 @@ func (g *graphReplica) apply(s *Service, d *GraphDelta, state *IndexSnapshot, po
 		s.Index.mu.Lock()
 		s.Index.replaceGraphLocked(fresh)
 		s.Index.mu.Unlock()
-	} else if e = s.Index.ApplyDelta(*d, false); e != nil {
-		return e
+	} else if d != nil {
+		if e = s.Index.ApplyDelta(*d, false); e != nil {
+			return e
+		}
 	}
 	g.position = pos
 	s.cursor = pos.DataOffset
@@ -134,97 +157,64 @@ func (g *graphReplica) catchUp(ctx context.Context, s *Service, target GraphPosi
 		if e := ctx.Err(); e != nil {
 			return e
 		}
-		entry, e := g.journal.Entry(ctx, g.position.Sequence+1)
-		if errors.Is(e, ErrLogCompacted) {
-			target, e = g.restoreCheckpoint(ctx, s)
-			if e != nil {
-				return e
-			}
-			continue
+		entries, e := g.journal.replayEntries(ctx, g.position, target)
+		if e == nil {
+			e = g.replayBatch(ctx, s, entries)
 		}
 		if e != nil {
-			return e
-		}
-		if entry.Previous != g.position {
-			return errors.New("graph journal discontinuity")
-		}
-		d, state := g.delta, g.reset
-		if g.prepared != entry.Position {
-			d, state, e = g.loadEntry(ctx, entry)
-			if e != nil {
-				head, err := g.journal.Head(ctx)
-				if err != nil {
-					return err
-				}
-				if g.position.Sequence < head.Floor.Sequence {
-					target, e = g.restoreCheckpoint(ctx, s)
-					if e != nil {
-						return e
-					}
-					continue
-				}
-				return e
-			}
-		}
-		if e = g.apply(s, d, state, entry.Position); e != nil {
-			return e
-		}
-		g.delta = nil
-		g.reset = nil
-		g.prepared = GraphPosition{}
-	}
-	if g.position != target {
-		return errors.New("graph published hash mismatch")
-	}
-	return nil
-}
-func (g *graphReplica) prepare(ctx context.Context, s *Service, head GraphHead) (err error) {
-	defer g.track("graph_prepare")(&err)
-	if head.Committed == head.Visible {
-		return nil
-	}
-	if g.prepared != head.Committed {
-		entry, e := g.journal.Entry(ctx, head.Committed.Sequence)
-		if e != nil {
-			return e
-		}
-		if entry.Previous != g.position || entry.Position != head.Committed {
-			return errors.New("graph pending base mismatch")
-		}
-		d, state, e := g.loadEntry(ctx, entry)
-		if e != nil {
-			return e
-		}
-		if state != nil {
-			fresh, err := RestoreHNSW(*state)
+			// Compaction can race both metadata reads and object downloads.
+			// Only a durable floor beyond the applied prefix permits a reset.
+			head, err := g.readHead(ctx)
 			if err != nil {
 				return err
 			}
-			fresh.graph.Close()
-		} else {
-			if e = s.Index.PrepareDelta(*d); e != nil {
-				return e
+			if errors.Is(e, ErrLogCompacted) || g.position.Sequence < head.Floor.Sequence {
+				target, e = g.restoreCheckpoint(ctx, s)
+				if e != nil {
+					return e
+				}
+				continue
 			}
+			return e
 		}
-		g.prepared = entry.Position
-		g.delta = d
-		g.reset = state
 	}
-	return g.journal.Ack(ctx, head.Committed)
+	if g.position != target {
+		return errors.New("graph durable hash mismatch")
+	}
+	return nil
+}
+
+func (g *graphReplica) readHead(ctx context.Context) (_ GraphHead, err error) {
+	defer g.track("graph_head_read")(&err)
+	return g.journal.Head(ctx)
+}
+
+// Validation is speculative: apply and roll back before durable append. Once
+// append succeeds, every replica may replay this exact patch independently.
+func (g *graphReplica) validateDelta(s *Service, d GraphDelta) (err error) {
+	defer g.track("graph_prepare_delta")(&err)
+	return s.Index.PrepareDelta(d)
 }
 
 // Called under Service.syncMu. A follower consumes graph entries only. A newly
 // elected leader completes a committed entry before touching the data journal.
-func (g *graphReplica) sync(ctx context.Context, s *Service, rebuild bool) (err error) {
+func (g *graphReplica) sync(ctx context.Context, s *Service, rebuild bool) error {
+	if g.writer != nil {
+		return g.syncLeased(ctx, s, rebuild)
+	}
+	return g.syncSlow(ctx, s, rebuild)
+}
+
+func (g *graphReplica) syncSlow(ctx context.Context, s *Service, rebuild bool) (err error) {
 	defer g.track("graph_sync")(&err)
 	// Explicit sync/rebuild paths can fail after a durable commit. Wake the
-	// consumer even if no new data arrives so pending publication can recover.
+	// consumer even if no new data arrives so durable replay can recover.
 	defer func() {
 		if err != nil && g.input != nil {
 			g.input.notify()
 		}
 	}()
-	head, e := g.journal.Head(ctx)
+	head, e := g.readHead(ctx)
 	if e != nil {
 		return e
 	}
@@ -240,7 +230,6 @@ func (g *graphReplica) sync(ctx context.Context, s *Service, rebuild bool) (err 
 	if rebuild && !leader {
 		return ErrFenced
 	}
-	builtReset := false
 	if leader {
 		head, e = g.journal.Claim(ctx)
 		if e != nil {
@@ -250,7 +239,7 @@ func (g *graphReplica) sync(ctx context.Context, s *Service, rebuild bool) (err 
 			return e
 		}
 	}
-	if head.Committed == head.Visible && leader {
+	if leader {
 		if rebuild {
 			fresh, err := NewHNSWIndex(s.Index.dimension, s.Index.config)
 			if err != nil {
@@ -273,14 +262,21 @@ func (g *graphReplica) sync(ctx context.Context, s *Service, rebuild bool) (err 
 			}
 			state.Offset = s.cursor
 			state.LogVersion = LogVersion
+			// Verify that a persisted reset can be restored before accepting it.
+			verified, err := RestoreHNSW(state)
+			if err != nil {
+				return err
+			}
+			verified.graph.Close()
 			m, err := g.saveState(ctx, state)
 			if err != nil {
 				return err
 			}
-			if _, err = g.journal.Commit(ctx, head, s.cursor, "reset", m); err != nil {
+			entry, err := g.journal.Commit(ctx, head, s.cursor, "reset", m)
+			if err != nil {
 				return err
 			}
-			builtReset = true
+			g.prepared, g.delta, g.reset = entry.Position, nil, &state
 		} else if g.input != nil {
 			if e = g.commitRouted(ctx, s, head); e != nil {
 				return e
@@ -304,72 +300,69 @@ func (g *graphReplica) sync(ctx context.Context, s *Service, rebuild bool) (err 
 			if err != nil {
 				return err
 			}
-			data, err := json.Marshal(d)
-			if err != nil {
-				return err
-			}
-			m, err := g.saveBlob(ctx, deltaFormat, data)
-			if err != nil {
-				return err
-			}
-			if _, err = g.journal.Commit(ctx, head, batch.Events[len(batch.Events)-1].Sequence, "delta", m); err != nil {
+			if err = g.appendDelta(ctx, s, head, batch.Events[len(batch.Events)-1].Sequence, d, nil, batch.Events...); err != nil {
 				return err
 			}
 		}
-		head, e = g.journal.Head(ctx)
+		head, e = g.readHead(ctx)
 		if e != nil {
 			return e
 		}
 	}
-	if head.Committed != head.Visible && leader {
-		if e = g.prepare(ctx, s, head); e != nil {
-			return e
-		}
-		if leader {
-			publish := g.track("graph_publish")
-			_, e = g.journal.Publish(ctx)
-			publish(&e)
-			if e != nil {
-				return e
-			}
-		}
-		head, e = g.journal.Head(ctx)
-		if e != nil {
-			return e
-		}
-		if e = g.catchUp(ctx, s, head.Visible); e != nil {
-			return e
-		}
-		if rebuild && !builtReset {
-			return g.sync(ctx, s, true)
-		}
-		return nil
-	}
-	return nil
+	return g.catchUp(ctx, s, head.Visible)
 }
+
 func (g *graphReplica) checkpoint(ctx context.Context, s *Service) (Manifest, error) {
+	g.checkpointMu.Lock()
+	defer g.checkpointMu.Unlock()
+	// Capture at S; uploads must not block ingestion of later entries.
 	s.syncMu.Lock()
-	defer s.syncMu.Unlock()
-	head, e := g.journal.Head(ctx)
+	head, e := g.readHead(ctx)
+	if e == nil {
+		e = g.catchUp(ctx, s, head.Visible)
+	}
+	if e == nil && g.journal.c.referenceLogs && head.Checkpoint != nil && head.CheckpointPosition == g.position {
+		// An automatic due check may have raced a completed manual checkpoint.
+		// Reuse its image instead of uploading another generation while idle.
+		tx, err := g.repo.begin()
+		if err == nil {
+			err = g.journal.c.ReplicaFence(g.journal.id, g.journal.owner)(ctx, tx)
+			_ = tx.Rollback()
+		}
+		s.syncMu.Unlock()
+		return *head.Checkpoint, err
+	}
+	var state IndexSnapshot
+	if e == nil {
+		state, e = s.Index.ExportState()
+	}
+	if e == nil {
+		state.LogVersion = LogVersion
+		state.Offset = g.position.DataOffset
+		state.GraphSequence = g.position.Sequence
+		state.GraphHash = g.position.Hash
+		state.Sources = maps.Clone(head.Sources)
+		state.SourceEpochs = maps.Clone(head.SourceEpochs)
+		state.LogBytes = head.LogBytes
+	}
+	s.syncMu.Unlock()
 	if e != nil {
 		return Manifest{}, e
 	}
-	if e = g.catchUp(ctx, s, head.Visible); e != nil {
-		return Manifest{}, e
-	}
-	state, e := s.Index.ExportState()
-	if e != nil {
-		return Manifest{}, e
-	}
-	state.LogVersion = LogVersion
-	state.Offset = s.cursor
-	state.GraphSequence = g.position.Sequence
-	state.GraphHash = g.position.Hash
 	m, e := g.saveState(ctx, state)
 	if e != nil {
 		return m, e
 	}
-	return m, g.journal.SaveCheckpoint(ctx, g.position, m, g.repo)
+	if g.journal.c.referenceLogs {
+		// Upload is outside syncMu, so ongoing ingestion can conflict on the
+		// ownership fence. Retry only definite transaction aborts, reusing S and
+		// the validated object; never repeat the upload or guess an unknown commit.
+		e = retryIndexCommit(ctx, func() error {
+			return g.journal.saveCheckpoint(ctx, head.Committed, m, g.repo, &head)
+		}, func() {})
+		return m, e
+	}
+	return m, g.journal.SaveCheckpoint(ctx, head.Committed, m, g.repo)
 }
 
 func (s *Service) searchGraphLocal(ctx context.Context, q Search) ([]Hit, GraphPosition, error) {
@@ -379,7 +372,7 @@ func (s *Service) searchGraphLocal(ctx context.Context, q Search) ([]Hit, GraphP
 	}
 	if q.MinVisible != nil {
 		s.syncMu.Lock()
-		head, e := g.journal.Head(ctx)
+		head, e := g.readHead(ctx)
 		if e == nil {
 			e = g.catchUp(ctx, s, head.Visible)
 		}
@@ -429,7 +422,7 @@ func (g *graphReplica) saveBlob(ctx context.Context, format string, data []byte)
 	}
 	return g.objects.saveTracked(ctx, g.repo.Namespace(), g.repo.Dimension, format, data, func(m Manifest) (err error) {
 		defer g.track("graph_object_intent")(&err)
-		return g.journal.stageObject(ctx, g.repo, m)
+		return retryIndexCommit(ctx, func() error { return g.journal.stageObject(ctx, g.repo, m) }, func() {})
 	})
 }
 func (g *graphReplica) saveState(ctx context.Context, state IndexSnapshot) (Manifest, error) {
@@ -444,7 +437,7 @@ func (g *graphReplica) saveState(ctx context.Context, state IndexSnapshot) (Mani
 }
 
 func (g *graphReplica) restoreCheckpoint(ctx context.Context, s *Service) (GraphPosition, error) {
-	h, e := g.journal.Head(ctx)
+	h, e := g.readHead(ctx)
 	if e != nil {
 		return GraphPosition{}, e
 	}
@@ -455,7 +448,7 @@ func (g *graphReplica) restoreCheckpoint(ctx context.Context, s *Service) (Graph
 	if e != nil {
 		return GraphPosition{}, e
 	}
-	if state.GraphSequence != h.CheckpointPosition.Sequence || state.GraphHash != h.CheckpointPosition.Hash || state.Offset != h.CheckpointPosition.DataOffset || len(state.GraphState) == 0 {
+	if (g.journal.c.referenceLogs && (state.LogBytes != h.CheckpointBytes || !maps.Equal(state.Sources, h.CheckpointSources))) || !maps.Equal(state.SourceEpochs, h.CheckpointSourceEpochs) || state.GraphSequence != h.CheckpointPosition.Sequence || state.GraphHash != h.CheckpointPosition.Hash || state.Offset != h.CheckpointPosition.DataOffset || len(state.GraphState) == 0 {
 		return GraphPosition{}, errors.New("recovery checkpoint position mismatch")
 	}
 	if e = g.apply(s, nil, &state, h.CheckpointPosition); e != nil {

@@ -738,20 +738,20 @@ func (t dispatchHookTx) Commit(ctx context.Context) error {
 	return t.transactionAPI.Commit(ctx)
 }
 
-func TestDispatchCommitSourceFenceTiKV(t *testing.T) {
+func TestDispatchCommitIndependentOfSourceLeaseTiKV(t *testing.T) {
 	if os.Getenv("INTEGRATION") != "1" {
 		t.Skip("requires TiKV")
 	}
 	for _, twoPhase := range []bool{false, true} {
 		for _, sources := range []int{1, 2} {
 			t.Run(fmt.Sprintf("force_2pc_%t/sources_%d", twoPhase, sources), func(t *testing.T) {
-				testDispatchCommitSourceFenceTiKV(t, twoPhase, sources)
+				testDispatchCommitIndependentOfSourceLeaseTiKV(t, twoPhase, sources)
 			})
 		}
 	}
 }
 
-func testDispatchCommitSourceFenceTiKV(t *testing.T, twoPhase bool, sourceCount int) {
+func testDispatchCommitIndependentOfSourceLeaseTiKV(t *testing.T, twoPhase bool, sourceCount int) {
 	ctx := context.Background()
 	r, e := NewRepository([]string{"127.0.0.1:12379"}, "dispatch-fence/"+uuid.NewString(), 2)
 	if e != nil {
@@ -812,7 +812,19 @@ func testDispatchCommitSourceFenceTiKV(t *testing.T, twoPhase bool, sourceCount 
 				break
 			}
 		}
-		inputs = append(inputs, Delivery{Source: DataPartitionID(n), Owner: source, RouteVersion: 1, Through: 1, Events: []LogEvent{{Sequence: 1, Record: Record{ID: id, Revision: 1, Vector: []float64{0, 0}}}}})
+		repo := *r
+		repo.Prefix += fmt.Sprintf("source-%d/", n)
+		c.data[DataPartitionID(n)] = &repo
+		record, err := repo.Mutate(ctx, id, Mutation{RequestID: id, Vector: []float64{0, 0}}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		q := Delivery{Source: DataPartitionID(n), Owner: source, RouteVersion: 1, Through: 1, Events: []LogEvent{{Sequence: 1, Record: record}}}
+		inputs = append(inputs, q)
+		head, err = j.admitSource(ctx, c, q)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	base := *r
 	other := *coord
@@ -826,19 +838,20 @@ func testDispatchCommitSourceFenceTiKV(t *testing.T, twoPhase bool, sourceCount 
 		return err
 	}, func() {})
 	r.beginTxn = nil
-	if !errors.Is(e, ErrFenced) {
-		t.Fatal("retry did not recheck the revoked source fence", e)
+	if e != nil {
+		t.Fatal("accepted epoch depended on the global source fence", e)
 	}
 	h, e := j.Head(ctx)
 	if e != nil {
 		t.Fatal(e)
 	}
-	if h.Committed.Sequence != 0 || h.Sources["0"] != 0 {
-		t.Fatal("partial source progress escaped", h)
+	if h.Committed.Sequence != uint64(sourceCount+1) {
+		t.Fatal(h)
 	}
-	for n := range sources {
-		if h.Sources[fmt.Sprint(n)] != 0 {
-			t.Fatal("partial batch source progress escaped", h)
+	for n, source := range sources {
+		if h.Sources[fmt.Sprint(n)] != 1 || h.SourceEpochs[fmt.Sprint(n)] != source.Epoch {
+			t.Fatal("batch did not commit atomically", h)
 		}
 	}
+
 }

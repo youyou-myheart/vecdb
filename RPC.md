@@ -142,9 +142,9 @@ PYTHONPATH=sdk/python .venv/bin/python -m unittest discover -s sdk/python/tests 
 请求字段：`partition`（如 index-0000）、`stream`（data 或 graph）、`after`（不包含该序号，初始为 0）、`limit`（默认 100，最大 256）。一个游标只属于一个 namespace、分片、流；不同分片不能共用游标，也不存在全局顺序。消费一页并持久化处理结果后，再持久化响应 `next`。重试可能重复返回事件，消费者应按分片/流/sequence 幂等处理。
 
 - data：返回包含完整 Record 的顺序事件，包括更新和墓碑；它表达 TiKV 已持久化，不代表已可检索。
-- graph：只在 INDEX_REPLICATION=graph 时提供；只返回已发布条目，不返回 committed-but-unpublished。条目含 previous、position、term、kind 和 object manifest。消费者通过已有 SeaweedFS S3 端点读取 object.key，核验 size/SHA256，再处理内容。RPC 不转发大对象，也不下发 S3 凭据。
-- delta 对象中的 records 是记录前后版本，nodes 将 label 映射到 record ID/revision，新增 links 提供被修改节点的完整分层邻接表：internal_id、label、layers。先安装本批所有节点映射，再替换邻接表。邻居使用内部节点 ID，旧记录版本可能仍留在图中，须根据 records 的当前 revision/deleted 过滤。
-- links 是 HNSW 图边，**不是每个向量的精确 Top-K 最近邻表**。本次版本之前的图日志对象可能没有 links 字段；不能把缺失字段当成空邻接表。
+- graph：只在 INDEX_REPLICATION=graph 时提供；返回已持久化、允许立即回放的条目，不等待 Leader 本地应用或下一条日志。条目含 previous、position、term、kind、累计 sources、payload 描述符与 payload_data。普通 delta 的 payload_data 是 JSON 编码的图结构补丁及历史数据日志引用（gRPC bytes，HTTP base64），用 payload.sha256 核验；无 S3 增量对象。reset/检查点仍通过 object manifest 从 SeaweedFS 读取。单页载荷预算 8 MiB，单个超预算条目单独返回。
+- `hnsw-data-reference-v1` 载荷中的 changes 是 before_hash 与 `(source,lsn,id,revision,hash)` 引用或墓碑，delta.nodes 将 label 映射到 record ID/revision，新增 links 提供被修改节点的完整分层邻接表：internal_id、label、layers。先安装本批所有节点映射，再替换邻接表。邻居使用内部节点 ID，旧记录版本可能仍留在图中，须根据 records 的当前 revision/deleted 过滤。
+- links 是 HNSW 图边，**不是每个向量的精确 Top-K 最近邻表**。引用的数据日志含向量和属性；图补丁与 links 本身不重复保存它们。
 - kind=reset 表示 Leader 重建后的完整 IndexSnapshot，消费者必须加载并替换整个图及映射，再应用后续 delta；不能跨 reset 复用旧内部节点编号。
 - 若 data 游标已经低于清理水位，响应 `reset_required=true`、floor、checkpoint（若有），events 为空、next 保持原值。消费者必须从经校验的 checkpoint 恢复记录基线，再从快照 Offset 续读。没有可用快照时应停止并请求基线，不能直接把 after 改成 floor。分页 List 不提供一致性快照，不能作为无损补齐基线。
 - 单独读取订阅页不注册保留租约，不会阻止 prune。需要保留承诺时，启用下述消费保留模式并先 acquire、处理后 ACK。Worker 全部离线时，只要 Gateway、TiKV 与所需对象存储可用，已有日志仍可订阅。
@@ -182,7 +182,7 @@ session = uuid.uuid4().hex
 state = client.consumer('index-0000', stream='graph', action='acquire',
                         consumer='analytics', session=session, ack=saved_sequence)
 lease = state.leases['analytics']
-# 拉取并校验图对象，在下游持久化本页全部效果之后，才推进 ACK。
+# 拉取并校验图载荷与数据引用，在下游持久化本页全部效果之后，才推进 ACK。
 state = client.consumer('index-0000', stream='graph', action='ack',
                         consumer='analytics', session=session,
                         epoch=lease.epoch, ack=processed_sequence, ttl_seconds=60)
@@ -193,8 +193,20 @@ Go Client 内嵌的 `ManageConsumer(ctx, *vectorv1.ConsumerRequest)` 提供同�
 
 有效租约不能被另一 session 抢占。冲突返回 Aborted/HTTP 409；过期、已释放或旧 epoch 返回 FailedPrecondition/409；从已清理位置 acquire 返回 FailedPrecondition/410；无效参数为 InvalidArgument/400。遇到过期应查询最新 floor，必要时恢复检查点，并使用新 session acquire。
 
-启用保留模式后，`Prune` / `POST /v1/log/prune` 同时执行数据日志清理、图日志清理与登记对象 sweep。原有返回值仍是数据日志 floor；图 floor 在 GetCluster 的 graph_heads 中查看，consumer_retention 表示是否开启。清理失败可能已完成某些分片或阶段，可检查状态后重新执行；操作有界且可继续推进。
+graph 模式默认按 30 MB / 3 分钟自动检查点和有界 GC；消费租约需显式启用。`Prune` / `POST /v1/log/prune` 同时执行数据日志清理、图日志清理与登记对象 sweep。原有返回值仍是数据日志 floor；图 floor 在 GetCluster 的 graph_heads 中查看，consumer_retention 表示是否开启。清理失败可能已完成某些分片或阶段，可检查状态后重新执行；操作有界且可继续推进。
 
 ## 聚类布局扩展
 
 Layout.routing 和 ClusterStatus.routing 描述固定中心，protobuf 为 ClusterRouting(version, centers)，每个 Center 包含 vector。聚类布局 Binding.data_partition 为 -1（字段类型扩展为 int32，原非负值编码不变），表示索引没有唯一数据绑定。ClusterStatus.data_progress 返回各 data-NNNN 的 head/completed_lsn/floor/owner，GraphHead.sources 的键为来源数据分区十进制编号。data 订阅和租约请求使用 data-NNNN，graph 使用 index-NNNN；两种 LSN 不可混用。数据 reset 快照为 data-records-v1 的 JSON Record 数组，完整协议见 [CLUSTER_ROUTING.md](CLUSTER_ROUTING.md)。Python/Go SDK 生成类型已更新。
+
+## Index 来源 epoch（聚类协议 v13）
+
+GetCluster 的 GraphHead 新增 `source_epochs`（字段 13）和 `checkpoint_source_epochs`（字段 14），均为 map<string,uint64>。ReadChanges 的 GraphChange 新增 `source_epochs`（字段 11）；`kind=source_epoch` 是无 payload/object 的控制记录，不改变数据完成 LSN 或 HNSW，消费者仍需推进图订阅游标。Go/Python 生成类型保持 uint64 精度。
+
+内部 Worker 投递拒绝旧来源 epoch 时返回 HTTP 503、`code=fenced`，以及 `source_epoch:{source,epoch,commit_lsn}`；这是 Index 已持久化状态。Dispatcher 不把该响应当作 ACK，继续以持久化完成水位为准。业务写入接口不等待 epoch 屏障或构图。完整顺序与升级边界见 [GRAPH_JOURNAL.md](GRAPH_JOURNAL.md)。
+
+## Publisher lease 状态（聚类协议 v14）
+
+`ReplicaPlan.lease_draining`（protobuf 字段 7）表示 Master 正在等待旧 Publisher 已发放租约到期；此时 `publisher` 和 `serving` 仍保留旧主，停止给旧主续租。完成切换后字段为 false。HTTP `/v1/cluster`、gRPC GetCluster、Go/Python SDK 和 vectorctl 的集群状态均可读取，不改变业务读写 API。
+
+升级需要新的 v14 聚类 namespace，拒绝 v13 及更早写入者混跑；当前未实现旧 namespace 原地迁移。见 [GRAPH_JOURNAL.md](GRAPH_JOURNAL.md)。

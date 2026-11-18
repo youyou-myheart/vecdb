@@ -10,7 +10,7 @@ import (
 )
 
 func indexWriteConflict() error {
-	return tikverr.NewErrWriteConflictWithArgs(1, 2, 3, []byte("source-fence"), 0)
+	return tikverr.NewErrWriteConflictWithArgs(1, 2, 3, []byte("index-fence"), 0)
 }
 
 func TestIndexCommitRetriesOnlyDefiniteConflicts(t *testing.T) {
@@ -49,25 +49,6 @@ func TestIndexCommitRetryIsBoundedAndCancelable(t *testing.T) {
 	}
 }
 
-func TestIndexCommitRetriesNoWaitOnlyBeforePrewrite(t *testing.T) {
-	calls := 0
-	err := retryIndexCommit(context.Background(), func() error {
-		calls++
-		if calls < 3 {
-			return errSourceLockBusy
-		}
-		return nil
-	}, func() { t.Fatal("lock contention counted as optimistic write conflict") })
-	if err != nil || calls != 3 {
-		t.Fatal(err, calls)
-	}
-	calls = 0
-	err = retryIndexCommit(context.Background(), func() error { calls++; return errSourceLockBusy }, func() {})
-	if !errors.Is(err, errSourceLockBusy) || calls != 16 {
-		t.Fatal(err, calls)
-	}
-}
-
 type indexCommitHookTx struct {
 	transactionAPI
 	before func() error
@@ -93,6 +74,10 @@ func TestIndexCommitConflictReusesObjectAndRechecksFence(t *testing.T) {
 			if err = g.enqueue(f.ctx, deliveryFor(t, f, source, 0)); err != nil {
 				t.Fatal(err)
 			}
+			head, err = g.journal.Head(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
 			original := f.r.beginTxn
 			calls := 0
 			var hooked func() (transactionAPI, error)
@@ -106,7 +91,7 @@ func TestIndexCommitConflictReusesObjectAndRechecksFence(t *testing.T) {
 					if calls == 1 {
 						if revoke {
 							f.r.beginTxn = original
-							_, err := f.c.Update(f.ctx, source, false, true)
+							_, err := f.c.Update(f.ctx, g.journal.owner, false, true)
 							f.r.beginTxn = hooked
 							if err != nil {
 								t.Fatal(err)
@@ -138,7 +123,7 @@ func TestIndexCommitConflictReusesObjectAndRechecksFence(t *testing.T) {
 			if revoke {
 				want = 0
 			}
-			if h.Committed.Sequence != want || h.Sources["0"] != want {
+			if h.Committed.Sequence != 1+want || h.Sources["0"] != want {
 				t.Fatal("partial/duplicate commit", h)
 			}
 		})

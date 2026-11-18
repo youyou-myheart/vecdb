@@ -105,7 +105,7 @@ func (c *ClusterService) ReadChanges(ctx context.Context, q ChangeRequest) (Chan
 	if e != nil {
 		return out, e
 	}
-	// Capture one published head. A committed but unpublished entry is invisible.
+	// Every durable entry is immediately replayable. Capture a finite head.
 	out.Head = h.Visible.Sequence
 	out.Floor = h.Floor.Sequence
 	out.CheckpointPosition = &h.CheckpointPosition
@@ -117,9 +117,23 @@ func (c *ClusterService) ReadChanges(ctx context.Context, q ChangeRequest) (Chan
 	if q.After > out.Head {
 		return out, fmt.Errorf("%w: after exceeds published head", ErrInvalidSubscription)
 	}
+	var payloadBytes int64
 	for n := q.After; n < out.Head && len(out.Graph) < q.Limit; {
 		n++
 		entry, e := j.Entry(ctx, n)
+		if e == nil && entry.Payload != nil {
+			if len(out.Graph) > 0 && int64(entry.Payload.Size) > graphReplayBytes-payloadBytes {
+				break
+			}
+			entry.PayloadData, e = j.loadPayload(ctx, entry)
+			if e != nil {
+				fresh, err := j.Head(ctx)
+				if err == nil && n <= fresh.Floor.Sequence {
+					e = ErrLogCompacted
+				}
+			}
+			payloadBytes += int64(len(entry.PayloadData))
+		}
 		if errors.Is(e, ErrLogCompacted) {
 			fresh, err := j.Head(ctx)
 			if err != nil {

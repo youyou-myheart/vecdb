@@ -10,12 +10,13 @@ import (
 )
 
 type ReplicaPlan struct {
-	Version   uint64           `json:"version"`
-	TaskID    string           `json:"task_id,omitempty"`
-	Desired   []Assignment     `json:"desired"`
-	Serving   []Assignment     `json:"serving"`
-	Barrier   uint64           `json:"barrier"`
-	Publisher IndexPartitionID `json:"publisher"`
+	LeaseDraining bool             `json:"lease_draining,omitempty"`
+	Version       uint64           `json:"version"`
+	TaskID        string           `json:"task_id,omitempty"`
+	Desired       []Assignment     `json:"desired"`
+	Serving       []Assignment     `json:"serving"`
+	Barrier       uint64           `json:"barrier"`
+	Publisher     IndexPartitionID `json:"publisher"`
 }
 
 func replicaID(id IndexPartitionID, n ClusterNode) IndexPartitionID {
@@ -164,6 +165,13 @@ func (c *Coordinator) ScheduleReplicas(ctx context.Context, leader Ownership, la
 			}
 		}
 		next.Publisher = publisher
+		draining, err := c.protectPublisherLease(ctx, tx, b.Index, old, &next)
+		if err != nil {
+			return err
+		}
+		if draining {
+			ready = false
+		}
 		if e = c.reconcileTask(ctx, tx, view, leader, b.Index, old, &next, ready); e != nil {
 			return e
 		}

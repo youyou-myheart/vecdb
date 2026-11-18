@@ -197,6 +197,9 @@ func (c *Coordinator) reconcileTask(ctx context.Context, tx transactionAPI, view
 				if allLoaded {
 					task.transition(MigrationCatchingUp, now)
 					task.Blocked = "waiting_for_log_barrier"
+					if next.LeaseDraining {
+						task.Blocked = "waiting_for_publisher_lease"
+					}
 				} else if anyOwner {
 					task.transition(MigrationRestoring, now)
 					if task.Blocked == "" {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -254,9 +255,26 @@ func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID,
 }
 func (c *ClusterService) sourceCommits(ctx context.Context, id DataPartitionID) (_ map[IndexPartitionID]uint64, err error) {
 	defer c.observations.pipeline.track("dispatch_poll_commits", string(sourceID(id)))(&err)
+	defer func() {
+		c.observations.pipeline.observeBatch("source_heads", string(sourceID(id)), len(c.layout.Bindings), err)
+	}()
+	tx, err := c.root.begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	keys := make([][]byte, 0, len(c.layout.Bindings))
+	for _, b := range c.layout.Bindings {
+		keys = append(keys, (graphJournal{c: c.coordinator, id: b.Index}).key("head"))
+	}
+	values, err := batchGet(ctx, tx, keys)
+	if err != nil {
+		return nil, err
+	}
+	cached := prefetchedTransaction{transactionAPI: tx, values: values}
 	commits := map[IndexPartitionID]uint64{}
 	for _, b := range c.layout.Bindings {
-		h, err := (graphJournal{c: c.coordinator, id: b.Index}).Head(ctx)
+		h, err := (graphJournal{c: c.coordinator, id: b.Index}).headIn(ctx, cached)
 		if err != nil {
 			return nil, err
 		}
@@ -324,17 +342,28 @@ func (c *ClusterService) deliver(ctx context.Context, id IndexPartitionID, q Del
 	}
 	defer response.Body.Close()
 	if response.StatusCode != 200 {
+		var reply partitionReply
+		if json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&reply) == nil && reply.Code == "fenced" {
+			if reply.SourceEpoch != nil {
+				return reply.SourceEpoch
+			}
+			return ErrFenced
+		}
 		return ErrPartitionUnavailable
 	}
 	return nil
 }
 
-func (c *ClusterService) validateDelivery(ctx context.Context, tx transactionAPI, id IndexPartitionID, q Delivery, committed uint64) error {
-	if q.Source < 0 || int(q.Source) >= c.layout.DataPartitions || q.RouteVersion != c.layout.Epoch || q.Owner.Partition != sourceID(q.Source) {
-		return ErrFenced
+func (c *ClusterService) validateDelivery(ctx context.Context, tx transactionAPI, id IndexPartitionID, q Delivery, h GraphHead) error {
+	if err := checkSourceEpoch(h, q); err != nil {
+		return err
 	}
-	if e := c.coordinator.Fence(q.Owner)(ctx, tx); e != nil {
-		return e
+	return c.validateDeliveryBounds(ctx, tx, id, q, h.Sources[fmt.Sprint(q.Source)])
+}
+
+func (c *ClusterService) validateDeliveryBounds(ctx context.Context, tx transactionAPI, id IndexPartitionID, q Delivery, committed uint64) error {
+	if q.Source < 0 || int(q.Source) >= c.layout.DataPartitions || q.RouteVersion != c.layout.Epoch || q.Owner.Partition != sourceID(q.Source) || q.Owner.Epoch == 0 {
+		return ErrFenced
 	}
 	if q.Through <= committed {
 		return nil
@@ -373,7 +402,8 @@ func (c *ClusterService) validateDelivery(ctx context.Context, tx transactionAPI
 // Verify coverage once on admission, at the same TiKV snapshot as the graph
 // watermark. A strictly ordered subset alone does not prove that no event for
 // this index was omitted. The immutable routing version makes replay sufficient;
-// no per-event routing journal is needed. Commit rechecks ownership and cursors.
+// no per-event routing journal is needed. Commit rechecks the Index-local epoch
+// and cursors; its Index fence rejects a stale snapshot after concurrent append/GC.
 func (c *ClusterService) validateDeliveryEvents(ctx context.Context, tx transactionAPI, id IndexPartitionID, q Delivery) error {
 	b, e := c.data[q.Source].readEventsIn(ctx, tx, q.Previous, q.Through, dispatchBatchSize, dispatchBytes)
 	if e != nil {

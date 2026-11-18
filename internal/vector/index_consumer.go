@@ -17,11 +17,13 @@ const followerPollInterval = 100 * time.Millisecond
 const initialIndexRetry = 10 * time.Millisecond
 const maxIndexRetry = time.Second
 
+// more requests an immediate pass: a Leader has queued input, or a Follower
+// advanced its graph position and must re-read the head before declaring idle.
 type consumerStep func(context.Context) (leader, more bool, err error)
 
-// Queue notifications only schedule work; every batch still reads the current
-// plan and executes the existing source/replica fences. Timers are used for
-// remote follower tailing and failed IO, never for a healthy empty Leader queue.
+// Queue notifications only schedule work. Leased publishers use cached control
+// state and a storage write guard. Timers are used for
+// idle follower tailing and failed IO, never for a healthy empty Leader queue.
 func runIndexConsumer(ctx context.Context, in *routedInput, partition string, step consumerStep, reportError func(error)) {
 	p := &in.cluster.observations.pipeline
 	retry := initialIndexRetry
@@ -53,8 +55,11 @@ func runIndexConsumer(ctx context.Context, in *routedInput, partition string, st
 			continue
 		}
 		retry = initialIndexRetry
-		if leader && more {
+		if more {
 			reason = "continue"
+			if !leader {
+				reason = "follower_continue"
+			}
 			continue
 		}
 		var timer *time.Timer
@@ -104,24 +109,7 @@ func (c *ClusterService) runRoutedIndex(ctx context.Context, entry *localPartiti
 		return
 	}
 	runIndexConsumer(ctx, in, id, func(ctx context.Context) (bool, bool, error) {
-		if err := c.coordinator.Check(ctx, entry.owner); err != nil {
-			return false, false, err
-		}
-		entry.mu.RLock()
-		defer entry.mu.RUnlock()
-		s := entry.service
-		if s == nil {
-			return false, false, ErrFenced
-		}
-		// Release both locks between batches, allowing search/checkpoint and
-		// retirement to proceed even under a continuous input stream.
-		wait := s.graphReplica.track("graph_sync_lock_wait")
-		s.syncMu.Lock()
-		wait(nil)
-		defer s.syncMu.Unlock()
-		g := s.graphReplica
-		err := g.sync(ctx, s, false)
-		return g.leader, in.hasQueued(), err
+		return c.stepRoutedIndex(ctx, entry)
 	}, func(err error) {
 		log.Printf("index consumer %s failed: %v", id, err)
 		if errors.Is(err, ErrGraphCorrupt) {
@@ -129,4 +117,36 @@ func (c *ClusterService) runRoutedIndex(ctx context.Context, entry *localPartiti
 			c.remove(entry)
 		}
 	})
+}
+
+func (c *ClusterService) stepRoutedIndex(ctx context.Context, entry *localPartition) (leader, more bool, err error) {
+	if !c.coordinator.leaseReads {
+		if err = c.coordinator.Check(ctx, entry.owner); err != nil {
+			return false, false, err
+		}
+	}
+	entry.mu.RLock()
+	defer entry.mu.RUnlock()
+	s := entry.service
+	if s == nil {
+		return false, false, ErrFenced
+	}
+	// Release both locks between passes, allowing search/checkpoint and
+	// retirement to proceed even while a Follower continuously tails new heads.
+	wait := s.graphReplica.track("graph_sync_lock_wait")
+	s.syncMu.Lock()
+	wait(nil)
+	defer s.syncMu.Unlock()
+	g := s.graphReplica
+	before := g.position.Sequence
+	err = g.sync(ctx, s, false)
+	if err != nil {
+		return g.leader, false, err
+	}
+	if g.leader {
+		return true, g.input.hasQueued(), nil
+	}
+	// Ignore stale Leader input after demotion. Only successful replay progress
+	// requests another immediate head read; an empty read starts the idle timer.
+	return false, g.position.Sequence > before, nil
 }

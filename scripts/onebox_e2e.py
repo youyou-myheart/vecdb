@@ -139,9 +139,10 @@ class Storage:
 
 
 class Oracle:
-    def __init__(self, transport, capacity=RECORDS, vector_factory=vector_for):
+    def __init__(self, transport, capacity=RECORDS, vector_factory=vector_for, payload_factory=None):
         self.transport = transport
         self.vector_factory = vector_factory
+        self.payload_factory = payload_factory or (lambda n,r: dict(group=str(n%8),revision=str(r)))
         self.records = {}
         self.lock = threading.Lock()
         self.id_locks = [threading.Lock() for _ in range(capacity)]
@@ -157,7 +158,7 @@ class Oracle:
             deleted = not initial and revision % 11 == 0 if deleted is None else deleted
             request = dict(request_id=f'{id}-r{revision}', expected_revision=previous)
             vector = [] if deleted else self.vector_factory(n, revision)
-            payload = {} if deleted else dict(group=str(n%8), revision=str(revision))
+            payload = {} if deleted else self.payload_factory(n, revision)
             if not deleted: request.update(vector=vector, payload=payload)
             method = 'DELETE' if deleted else 'PUT'
             response = self.transport('/v1/records/'+id, method, request, budget=120)
@@ -224,7 +225,7 @@ class Onebox:
         self.urls = [f'http://127.0.0.1:{base+102}', f'http://127.0.0.1:{base+135}']
         self.request_counter = 0
         self.request_lock = threading.Lock()
-        self.oracle = Oracle(self.request, getattr(args, 'oracle_capacity', RECORDS), getattr(args, 'vector_factory', vector_for))
+        self.oracle = Oracle(self.request, getattr(args, 'oracle_capacity', RECORDS), getattr(args, 'vector_factory', vector_for), getattr(args, 'payload_factory', None))
         self.work_stop = threading.Event(); self.workers = []
         self.failures = []; self.failure_lock = threading.Lock()
         self.watch_stop = threading.Event(); self.watcher = None
@@ -319,9 +320,12 @@ class Onebox:
         with self.failure_lock:
             if self.failures: raise AssertionError(self.failures)
 
-    def local_metrics(self):
+    def local_metrics(self, *, progress_only=False):
         endpoints = {node:self.c.urls[node] for slot,node in list(self.slots.items()) if slot in (2,35,3,4,5)}
-        return collect(endpoints, self.c.env['API_TOKEN'])
+        return collect(endpoints, self.c.env['API_TOKEN'], progress_only=progress_only)
+
+    def local_progress(self):
+        return self.local_metrics(progress_only=True)
 
     def drain(self):
         started = time.monotonic(); rows = []

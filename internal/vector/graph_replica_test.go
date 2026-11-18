@@ -86,7 +86,7 @@ type graphFixture struct {
 	objects  *Objects
 }
 
-func newGraphFixture(t *testing.T) *graphFixture {
+func newGraphFixture(t testing.TB) *graphFixture {
 	t.Helper()
 	ctx := context.Background()
 	r, db := newFakeRepo()
@@ -138,7 +138,7 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	}
 	return &graphFixture{ctx, r, db, c, lease, layout, nodes, services, objects}
 }
-func (f *graphFixture) write(t *testing.T, id string, deleted bool) Record {
+func (f *graphFixture) write(t testing.TB, id string, deleted bool) Record {
 	t.Helper()
 	r, e := f.r.Mutate(f.ctx, id, Mutation{RequestID: fmt.Sprintf("write-%d", f.db.commits), Vector: []float64{1, 2}}, deleted)
 	if e != nil {
@@ -169,7 +169,7 @@ func TestGraphAsyncReplicationAndFailover(t *testing.T) {
 		t.Fatal(e)
 	}
 	equalGraph(t, a.Index, b.Index)
-	// Commit a graph delta and crash before publication. Raw data already durable.
+	// Commit a graph delta and crash before local apply. Raw data already durable.
 	f.write(t, "w", false)
 	h, e := a.graphReplica.journal.Claim(ctx)
 	if e != nil {
@@ -209,13 +209,10 @@ func TestGraphAsyncReplicationAndFailover(t *testing.T) {
 		t.Fatal(e)
 	}
 	if after.Visible != pending.Position || after.Term <= h.Term || b.Cursor() != 2 {
-		t.Fatal("promotion lost pending entry", after)
+		t.Fatal("promotion lost durable entry", after)
 	}
 	if _, e = a.graphReplica.journal.Commit(ctx, h, 3, "delta", m); !errors.Is(e, ErrFenced) {
 		t.Fatal("old leader not fenced", e)
-	}
-	if _, e = a.graphReplica.journal.Publish(ctx); !errors.Is(e, ErrFenced) {
-		t.Fatal("old publisher not fenced", e)
 	}
 	f.write(t, "z", false)
 	if e = b.Sync(ctx); e != nil {
@@ -305,8 +302,8 @@ func TestGraphJournalCommitOutcomes(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
-			if (h.Committed.Sequence == 1) != uncertain || h.Visible.Sequence != 0 || s.Cursor() != 0 {
-				t.Fatal("ambiguous commit leaked visible state", h)
+			if (h.Committed.Sequence == 1) != uncertain || h.Visible != h.Committed || s.Cursor() != 0 {
+				t.Fatal("ambiguous commit has inconsistent durable state", h)
 			}
 			if e = s.Sync(f.ctx); e != nil {
 				t.Fatal(e)

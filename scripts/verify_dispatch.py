@@ -43,6 +43,8 @@ def main():
                      base_port=19040, grpc_port=19080, environment=env, directory=directory)
     report = dict(status='running', checks=[], rounds=[], namespace=c.namespace)
     paused, expected, last_completed = set(), {}, {}
+    last_source_epochs = {}
+    report['observed_source_epoch_advances'] = 0
 
     def check(name):
         report['checks'].append(name)
@@ -55,6 +57,16 @@ def main():
             assert d['floor'] <= d['completed_lsn'] <= d['head'], d
             assert d['completed_lsn'] >= last_completed.get(id, 0), d
             last_completed[id] = d['completed_lsn']
+        for index, head in s.get('graph_heads', {}).items():
+            for source, epoch in head.get('source_epochs', {}).items():
+                key = (index, source)
+                previous = last_source_epochs.get(key, 0)
+                assert epoch >= previous, (key, previous, epoch)
+                if previous and epoch > previous:
+                    report['observed_source_epoch_advances'] += 1
+                last_source_epochs[key] = epoch
+            for source, epoch in head.get('checkpoint_source_epochs', {}).items():
+                assert epoch <= head.get('source_epochs', {}).get(source, 0), head
         report['last_status'] = s
         return s
 
@@ -106,6 +118,7 @@ def main():
         assert metric_sum(text, 'vecdb_graph_replica_lag_entries') == 0
         assert metric_sum(text, 'vecdb_data_owner_available') == 4
         assert metric_sum(text, 'vecdb_routing_version') == 1
+        assert metric_sum(text, 'vecdb_index_source_epoch') > 0
         # Compare approximate retrieval with exact ground truth on structured data.
         exact = client.search([9.999, .02], k=10, exact=True).hits
         ann = client.search([9.999, .02], k=10).hits
@@ -225,6 +238,8 @@ def main():
                     master_epoch=after['leader']['epoch'], data_progress=after['data_progress'],
                     graph_heads=after['graph_heads'], graph_positions=after['graph_positions']))
             check('three_rounds_overlapping_master_worker_SIGKILL_two_workers_GC_and_concurrent_writes')
+            assert report['observed_source_epoch_advances'] > 0
+            check('durable_Index_source_epochs_monotonic_across_repeated_failover_and_GC')
             for node in c.workers:
                 text = metrics(c.urls[node])
                 assert metric_sum(text, 'vecdb_dispatch_ticks_total') >= 0

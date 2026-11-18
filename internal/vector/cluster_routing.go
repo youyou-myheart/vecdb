@@ -106,7 +106,7 @@ func (r *Repository) ensureRoutedLayout(ctx context.Context, n int, route *Clust
 			return l, e
 		}
 	}
-	mode := fmt.Sprintf("v10-cluster-routing-%s-%s-retention=%t", scheduler, domain, retention)
+	mode := fmt.Sprintf("v14-cluster-routing-lease-%s-%s-retention=%t", scheduler, domain, retention)
 	key = []byte(r.Prefix + "cluster-mode")
 	raw, e = tx.Get(ctx, key)
 	if e == nil && string(raw) != mode {

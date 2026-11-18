@@ -294,25 +294,25 @@ Preview 返回 snapshot_ts、observed_at_ms、节点采样、归一化负载、�
 flowchart LR
   W[任意 Gateway 写入] --> T[TiKV 事务：记录 + 数据日志]
   T --> A[A：当前构图 Leader]
-  A --> D[生成可回退的图变更]
-  D --> O[SeaweedFS：不可变图变更对象]
-  O --> C[TiKV：提交图日志引用和数据消费位置]
-  C --> P[A 验证并发布，不等待 B]
-  P --> AQ[A 应用已发布图并提供查询]
-  P --> B[B 异步重放图日志]
+  A --> D[生成并预校验可回退图变更]
+  D --> C[TiKV：原子保存图结构、数据引用和消费位置]
+  C --> AQ[A 按序应用并提供查询]
+  C --> B[B 直接重放持久化图日志]
   B --> BQ[B 提供查询，允许落后]
   R[Gateway 查询] --> AQ
   R --> BQ
 ```
 
-### 提交、发布和接管
+### 持久化、应用和接管
 
 - 数据日志 offset 与图日志 sequence 分开计数。一批最多消费 256 条数据事件；图条目包含前序位置、消费到的数据 offset、构图任期、对象校验和及链式 hash。
-- 原生构图捕获本批次修改过的节点镜像，并在生成变更后回退；全过程持有索引写锁，查询不能看到推测修改。先上传和校验变更对象，再通过带 fencing 的 TiKV 事务提交图日志引用与消费位置。
-- Leader 验证可重放性后推进 visible，再应用到本地可查询图。此处的验证和发布只依赖 Leader，**不等待 Follower ACK**。Follower 直接应用已发布条目。对象上传成功但事务未提交的对象不参与恢复；事务结果不确定时重新读取日志头，不重复追加已提交批次。
-- 主备过期的是租约。Master 更换 Publisher，接任者领取递增的图任期；每次提交和发布均检查副本 ownership 与当前 Publisher，并写入 fencing 键，与主权切换产生事务冲突。
-- B 接管时先追平已发布图，再完成已提交但尚未发布的批次，然后从 committed.data_offset 继续消费数据日志。无需重新计算已提交的图变更，也无需等持续写入的数据全部追平才允许旧版本查询。
+- 原生构图捕获本批次修改过的节点镜像，并在生成变更后回退；全过程持有索引写锁，查询不能看到推测修改。先 apply/rollback 验证，去掉向量字节和属性，最后通过带 fencing 的 TiKV 事务原子保存图载荷分块、历史数据引用和累计来源水位。
+- **日志持久化成功即允许回放**；没有额外的 ACK 或 commit_lsn 发布协议。A、B 按序独立 apply，B 不等下一条日志、不等 A 应用。visible 保留为 committed 的兼容别名。普通变更不上传 S3；事务结果不确定时重新读取日志头，不重复追加已提交批次。
+- 主备过期的是租约。Master 更换 Publisher，接任者领取递增的图任期；每次追加均检查副本 ownership 与当前 Publisher，并写入 fencing 键，与主权切换产生事务冲突。
+- B 接管时先追平所有持久化图条目，然后从 committed.data_offset 继续消费数据日志。无需重新计算已提交的图变更，也无需等持续写入的数据全部追平才允许旧版本查询。
 - 正常查询不等待图日志的网络读取；图状态交换期间短暂互斥。带 MinVisible 的查询要求相应记录版本已可见。已有 HTTP/gRPC MinVisible 流程先同步有限的数据日志头，无法满足时返回不可见/不可用，不返回伪造的最新结果。
+
+最新位置与来源水位从尾日志派生；控制 head 只保存任期、检查点与回收锚点。并发追加、未知结果及升级边界见 [GRAPH_JOURNAL.md](GRAPH_JOURNAL.md)。
 
 ### 快照、维护与观测
 
@@ -320,26 +320,26 @@ flowchart LR
 
 `/v1/cluster`、vectorctl cluster status 和 gRPC GetCluster 增加 index_replication、graph_heads、graph_positions。graph_heads 展示 committed/visible/term/checkpoint；graph_positions 是各副本通过心跳上报的已应用位置，可能比真实进度稍旧。
 
-默认未启用消费保留模式时保留全部图日志及对象；显式启用后的清理边界见“消费租约与图日志回收”。原始数据日志仍支持已有的 checkpoint/prune。跨分片查询不是全局时间点快照。二进制图格式固定为 hnswlib 0.8.0 的 64 位小端格式，不承诺跨版本/架构导入。测试中的跨 host 标签在一台机器上模拟，不代表已完成真实多机器或 TiKV/SeaweedFS 自身高可用验收。
+graph 模式默认每片 30 MB 或 3 分钟触发检查点和有界清理；消费租约显式启用后的边界见“消费租约与图日志回收”。原始数据日志仍支持已有的 checkpoint/prune。跨分片查询不是全局时间点快照。二进制图格式固定为 hnswlib 0.8.0 的 64 位小端格式，不承诺跨版本/架构导入。测试中的跨 host 标签在一台机器上模拟，不代表已完成真实多机器或 TiKV/SeaweedFS 自身高可用验收。
 
 ## 对外订阅边界
 
-`subscription.go` 提供按绑定分区读取 data/graph 流的只读接口，`subscription_handler.go` 与 RPC ReadChanges 负责协议适配。Gateway 直接读取持久化日志，订阅不依赖 Worker 当前在线或当前 Leader 所在机器。图流读取开始时固定 visible 上界；对象引用经过日志 hash 校验，载荷由消费者从 S3 读取并验证校验和。原生图变更额外导出 links 投影，不触发距离计算，不改变副本应用路径。
+`subscription.go` 提供按绑定分区读取 data/graph 流的只读接口，`subscription_handler.go` 与 RPC ReadChanges 负责协议适配。Gateway 直接读取持久化日志，订阅不依赖 Worker 当前在线或当前 Leader 所在机器。图流读取开始时固定 visible 上界；对象引用经过日志 hash 校验，普通载荷随 payload_data 返回并验证校验和，包含历史数据引用；reset 仍从 S3 读取。原生图变更额外导出 links 投影，不触发距离计算，不改变副本应用路径。
 
 默认订阅为无服务端状态的分页拉取；消费 ACK、保留租约和登记对象 GC 可通过后述保留模式启用。详细字段、reset 和断点语义见 RPC.md。
 
 ## 消费租约与图日志回收
 
-通过 `CONSUMER_RETENTION=1` 在异步图复制集群显式开启。所有角色必须一致配置，使用新 namespace；协议标识为 v9-graph-retention，禁止不识别租约和图清理水位的旧节点混入。默认关闭，现有 namespace 不会因升级二进制而自动开启删除。
+通过 `CONSUMER_RETENTION=1` 在异步图复制集群显式开启。所有角色必须一致配置，使用新 namespace；图协议标识为 v12-graph-reference-retention（聚类为 v14-cluster-routing-lease），禁止不识别租约和图清理水位的旧节点混入。消费租约默认关闭；v12 graph 自动检查点/GC 默认启用，旧 namespace 拒绝混用，不自动升级。
 
 消费者以 `(namespace, partition, stream, consumer)` 标识。调用者提供 session（建议 UUID），服务端分配递增 epoch。acquire 注册 ACK 起点；ack 同时推进 ACK 和续租，ACK 不得倒退或超过流 head；release 立即解除保留。租约以 TiKV 事务时间判断，TTL 为 10–3600 秒，默认 60 秒。过期或释放后必须使用新 session 重新 acquire；旧 session/epoch 的 ACK 被拒绝。有效消费者同 session 的 acquire 重试返回既有状态，不代替续租。每个分片/流最多保留 128 个逻辑消费者名称，复用名称会递增 epoch。
 
 清理只由受 fencing 保护的分片 Publisher 执行：
 
-- 数据日志：清理水位取检查点 offset、既有副本保留约束、有效 data 消费者 ACK 的最小值。
+- 数据日志：清理受数据检查点、completed_lsn、实际目标索引 floor_sources、有效 data 消费者 ACK 约束，逐事件求连续前缀。未退休图条目引用的数据必须保留。
 - 图日志：清理水位取检查点 graph sequence 与有效 graph 消费者 ACK 的最小值，每次最多 256 条。数据 offset 与图 sequence 不可混用。
 - 注册/ACK/续租与清理在事务中写同一个有界消费者注册表，避免读取空注册表后并发注册的消费者被遗漏。真实 TiKV 测试覆盖两个方向的提交竞争。
-- 图清理事务同时删除条目、推进 graph head 的 floor，并标记对象待回收。尚未发布的批次不会被清理。落后副本检测到图日志缺口后加载保留的检查点，再追增量；下载、解码和创建替代图时可继续查询旧视图，交换时互斥。
+- 图清理事务同时删除条目和载荷分块、推进 graph head 的 floor/floor_sources；reset 对象另标记待回收。未被检查点覆盖的批次不会被清理。落后副本检测到图日志缺口后加载保留的检查点，再追增量；下载、解码和创建替代图时可继续查询旧视图，交换时互斥。
 - 订阅游标低于 floor 时返回 reset_required，next 不推进。graph 响应包含 checkpoint_position；消费者从该位置的快照重建基线后续读。
 
 ### 对象回收
@@ -348,4 +348,6 @@ flowchart LR
 
 回收器先提交持久化 garbage 标记，再调用 S3 删除。标记禁止重新采用；删除失败或迟到 PUT 造成对象重新出现时，后续 sweep 再次删除，最小重试间隔为一分钟。每轮扫描最多 128 条登记记录，游标循环推进，避免被大量 live 对象挡住。它不扫描整个桶，不删除未登记的旧对象。
 
-本阶段沿用显式 `cluster prune` 作为有界清理入口，没有后台定时清理。当前及历史检查点均保留，供恢复和消费者基线下载使用；尚未提供历史检查点淘汰、未登记遗留对象回收、永久对象回收标记压缩。它们是安全边界，不代表所有存储元数据已实现无限期可控增长。TiKV 自身的 MVCC GC、安全点及备份策略仍独立管理。
+后台维护按每片 30 MB / 3 分钟触发检查点，并执行有界清理；`cluster prune` 可显式调用。当前及历史检查点均保留，供恢复和消费者基线下载使用；尚未提供历史检查点淘汰、未登记遗留对象回收、永久对象回收标记压缩。它们是安全边界，不代表所有存储元数据已实现无限期可控增长。TiKV 自身的 MVCC GC、安全点及备份策略仍独立管理。
+
+最新检查点覆盖信息、异步上传边界、引用保护与 v12 升级协议，以 [GRAPH_JOURNAL.md](GRAPH_JOURNAL.md) 为准。检查点是可恢复状态，不是 TiKV 所有日志/元数据的完整备份。

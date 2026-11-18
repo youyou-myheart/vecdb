@@ -14,6 +14,7 @@ char* ann_patch_finish(void* p,char** out,uint64_t* size);
 char* ann_patch_apply(void* p,const char* data,uint64_t size,int reverse);
 char* ann_meta_save(void* p,char** out,uint64_t* size);
 char* ann_meta_load(void* p,const char* data,uint64_t size);
+char* ann_vector(void* p,uint64_t label,float* out);
 #ifdef __cplusplus
 }
 #endif

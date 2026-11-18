@@ -15,6 +15,8 @@ import (
 )
 
 type ClusterConfig struct {
+	GraphCheckpointBytes        uint64
+	GraphCheckpointAge          time.Duration
 	Routing                     *ClusterRouting
 	ConsumerRetention           bool
 	IndexReplication            string
@@ -29,6 +31,10 @@ type ClusterConfig struct {
 	Roles                       string
 }
 type ClusterService struct {
+	checkpointBytes    uint64
+	checkpointAge      time.Duration
+	maintenanceDone    chan struct{}
+	mutationGroups     map[DataPartitionID]*mutationGroup
 	observations       clusterObservations
 	dispatchMu         sync.Mutex
 	dispatchers        map[DataPartitionID]*dataDispatcher
@@ -63,6 +69,15 @@ type ClusterService struct {
 }
 
 func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI, count int, cfg ClusterConfig) (*ClusterService, error) {
+	if cfg.GraphCheckpointBytes == 0 {
+		cfg.GraphCheckpointBytes = DefaultGraphCheckpointBytes
+	}
+	if cfg.GraphCheckpointAge == 0 {
+		cfg.GraphCheckpointAge = DefaultGraphCheckpointAge
+	}
+	if cfg.GraphCheckpointAge < time.Second {
+		return nil, errors.New("graph checkpoint age must be >=1s")
+	}
 	if cfg.Scheduler == "" {
 		cfg.Scheduler = "hash"
 	}
@@ -170,7 +185,7 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 		return nil, e
 	}
 	runCtx, cancel := context.WithCancel(ctx)
-	c := &ClusterService{consumerRetention: cfg.ConsumerRetention, graphReplication: cfg.IndexReplication == "graph", lastSample: time.Now(), replicas: cfg.Replicas, PartitionedService: &PartitionedService{layout: layout, router: IdentityPartitionRouter{layout}, data: map[DataPartitionID]*Repository{}, indexes: map[IndexPartitionID]PartitionIndex{}, dimension: root.Dimension}, coordinator: &Coordinator{failureDomain: cfg.FailureDomain, loadBalance: cfg.Scheduler == "load", balanceCooldown: cfg.BalanceCooldown, root: root, ttl: cfg.LeaseTTL.Milliseconds()}, node: node, objects: objects, token: cfg.Token, root: root, locals: map[IndexPartitionID]*localPartition{}, cancel: cancel, done: make(chan struct{}), client: &http.Client{Timeout: 30 * time.Second}}
+	c := &ClusterService{consumerRetention: cfg.ConsumerRetention, graphReplication: cfg.IndexReplication == "graph", lastSample: time.Now(), replicas: cfg.Replicas, PartitionedService: &PartitionedService{layout: layout, router: IdentityPartitionRouter{layout}, data: map[DataPartitionID]*Repository{}, indexes: map[IndexPartitionID]PartitionIndex{}, dimension: root.Dimension}, coordinator: &Coordinator{leaseReads: cfg.Routing != nil, failureDomain: cfg.FailureDomain, loadBalance: cfg.Scheduler == "load", balanceCooldown: cfg.BalanceCooldown, root: root, ttl: cfg.LeaseTTL.Milliseconds()}, node: node, objects: objects, token: cfg.Token, root: root, locals: map[IndexPartitionID]*localPartition{}, cancel: cancel, done: make(chan struct{}), client: &http.Client{Timeout: 30 * time.Second}}
 	if cfg.Routing != nil {
 		c.router = clusterRouter{IdentityPartitionRouter{layout}, layout.Routing}
 		c.dispatchers = map[DataPartitionID]*dataDispatcher{}
@@ -180,7 +195,7 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 		c.notifyDone = make(chan struct{})
 	}
 	if hasRole(node, RoleMaster) {
-		c.master = &Master{replicas: cfg.Replicas, coordinator: c.coordinator, node: node, layout: layout}
+		c.master = &Master{metrics: &c.observations.pipeline, replicas: cfg.Replicas, coordinator: c.coordinator, node: node, layout: layout}
 	}
 	if hasRole(node, RoleWorker) {
 		c.worker = &Worker{cluster: c}
@@ -211,6 +226,15 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 			c.indexes[b.Index] = &remotePartition{cluster: c, id: b.Index}
 		}
 	}
+	c.coordinator.referenceLogs = c.graphReplication
+	c.coordinator.data = c.data
+	c.checkpointBytes, c.checkpointAge = cfg.GraphCheckpointBytes, cfg.GraphCheckpointAge
+	c.mutationGroups = make(map[DataPartitionID]*mutationGroup, len(c.data))
+	for id, repo := range c.data {
+		group := newMutationGroup(runCtx, repo, &c.observations.pipeline, string(sourceID(id)))
+		group.onCommit = func() { c.signalSource(id, "write", false) }
+		c.mutationGroups[id] = group
+	}
 	if e = c.coordinator.Heartbeat(ctx, node); e != nil {
 		cancel()
 		return nil, e
@@ -220,6 +244,10 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 		go c.notifySourceLoop(runCtx)
 	}
 	go c.run(runCtx, cfg.LeaseTTL/3)
+	if c.graphReplication && cfg.Routing != nil && c.worker != nil {
+		c.maintenanceDone = make(chan struct{})
+		go c.dataMaintenanceLoop(runCtx)
+	}
 	return c, nil
 }
 func (c *ClusterService) run(ctx context.Context, interval time.Duration) {
@@ -267,7 +295,13 @@ func (c *ClusterService) reconcile(ctx context.Context) {
 }
 func (c *ClusterService) Close() {
 	c.cancel()
+	for _, group := range c.mutationGroups {
+		group.close()
+	}
 	<-c.done
+	if c.maintenanceDone != nil {
+		<-c.maintenanceDone
+	}
 	if c.dispatchDone != nil {
 		<-c.dispatchDone
 	}

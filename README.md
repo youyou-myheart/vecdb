@@ -34,6 +34,14 @@ onebox 默认分片数现为 32；负载放置调度使用 `--replicas 2 --sched
 
 受限容量探索入口：`.venv/bin/python scripts/capacity_explore.py --series my-run --records 960 --dimension 64 --rate 80`。每次只跑一个档位，包含磁盘/内存/CPU 守卫和本轮数据清理；资源预算及已验证范围见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md)。
 
+探针支持最多 2,000 条的分桶全量核验，服务查询仍限制 `K ≤ 1000`。使用 `--records 2000 --dimension 64 --rate 20 --seed-rate 20 --rounds 2 --load-seconds 3` 运行短冒烟；全部在役副本、两个 Gateway、空桶、删除结果和查询后成员检查共用最后 durable ACK 的计时起点。初始写入默认限速 20 次/秒，不能与旧不限速初始化结果直接比较。错误诊断、运行边界和结果以时延文档为准。
+
+探针 profile 优化后，2,000 条 / 64 维、20 次/秒的同容量五轮复测通过，完整停写核验最大 601 ms；单次样本与短轮次不代表生产 SLA。各阶段证据和仍未覆盖的范围见[复测记录](PIPELINE_LATENCY.md#优化后的真实进程复测)。
+
+图协议与升级边界见 [GRAPH_JOURNAL.md](GRAPH_JOURNAL.md)；新协议需新 namespace，不能与旧发布协议混用。
+
+日志路径现支持同一 DataPartition 的数据事务合批、批量读取来源水位、图日志持久化即允许回放（无额外发布事务），以及 Follower 的 TiKV 图载荷及数据引用最多 4 路预取与顺序 apply。用 `.venv/bin/python scripts/capacity_explore.py --series batch-check --records 2000 --dimension 64 --rate 20 --seed-rate 40 --rounds 3 --load-seconds 8 --burst-writes 32` 验证同分片并发突发写；批量上限、故障语义与测量口径见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md)。
+
 ## 启动基础组件
 
 实测 PD/TiKV 8.5.8、SeaweedFS 4.53，macOS ARM64。安装包和 Go 缓存在 `.tools/`，数据在 `.state/`。已有本次安装包时，在三个终端分别启动，已运行的组件不要重复启动：
@@ -129,7 +137,7 @@ Python 验证 17 MiB 分段上传、Range、SHA-256、四路恢复；SQLite 清�
 
 - HNSW 是近似搜索；`exact:true` 使用精确 Top-K。原始 float64 向量之外还保留图及 float32 向量，降低查询分配不等于降低总常驻内存。
 - 同一图支持并发查询；每个数据分区的事务序号仍可能是局部写热点。重建需要新旧图同时驻留，追赶跟不上写入时可能超时。
-- Outbox 已改为有序增量日志，支持快照保护的分批清理；完整基线恢复仍限制为 100,000 条记录。已支持固定分区跨进程分配与故障接管，尚无负载调度、背压和完整容量管理。
+- Outbox 已改为有序增量日志，支持快照保护的分批清理；完整基线恢复仍限制为 100,000 条记录。已支持固定分区跨进程分配、故障接管、基础负载调度与有界队列背压，尚无完整容量管理。
 - 快照最多 512 MiB，完整回读及恢复占用内存。
 - 单 namespace、固定分区、字符串等值过滤，无跨租户身份管理。
 - 独立 TiKV 的 GC、安全点、备份恢复与多节点故障测试尚未实现。
@@ -145,3 +153,5 @@ Python 验证 17 MiB 分段上传、Range、SHA-256、四路恢复；SQLite 清�
 用例矩阵见 [ACCEPTANCE.md](ACCEPTANCE.md)。执行 `bash scripts/acceptance.sh`，本次总结果见 `reports/acceptance.status`。
 
 消费 ACK、保留租约和有界图日志/对象清理可用 `CONSUMER_RETENTION=1` 在新 graph namespace 中启用，见 [CLI.md](CLI.md#消费保留与-gc)。验收入口：`bash scripts/acceptance-retention.sh`。
+
+图复制现使用 v12 数据引用日志：正常构图不上传 SeaweedFS 增量对象，每个索引分片累计 30 MB 或等待 3 分钟生成完整检查点，再按依赖顺序清理图日志与数据日志。配置 `GRAPH_CHECKPOINT_BYTES=30000000`、`GRAPH_CHECKPOINT_AGE=3m`；需要新 namespace，详细恢复/订阅/升级边界见 [GRAPH_JOURNAL.md](GRAPH_JOURNAL.md)。

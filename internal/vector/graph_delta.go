@@ -13,6 +13,7 @@ var ErrGraphCorrupt = errors.New("graph replica requires recovery")
 // GraphDelta is a reversible, versioned materialized mutation, not an insertion
 // command. Followers never call addPoint or evaluate distances while replaying.
 type GraphDelta struct {
+	references []ReferenceChange
 	Links      []ann.NodeLinks        `json:"links,omitempty"`
 	Format     string                 `json:"format"`
 	Dimension  int                    `json:"dimension"`
@@ -118,6 +119,16 @@ func (i *HNSWIndex) PrepareDelta(d GraphDelta) error {
 	return i.applyDeltaLocked(d, true)
 }
 func (i *HNSWIndex) applyDeltaLocked(d GraphDelta, reverse bool) error {
+	if d.references != nil {
+		if reverse {
+			return errors.New("referenced delta cannot be reversed before expansion")
+		}
+		var err error
+		d, err = i.expandReferenceDelta(d)
+		if err != nil {
+			return err
+		}
+	}
 	if i.poison != nil {
 		return i.poison
 	}

@@ -112,14 +112,14 @@ func TestRoutedDedupAtomicCommitAndRecovery(t *testing.T) {
 		t.Fatal("in-flight duplicate queued")
 	}
 	h, _ := g.journal.Head(f.ctx)
-	if h.Committed.Sequence != 0 || h.Sources["0"] != 0 {
-		t.Fatal("enqueue advanced durability")
+	if h.Committed.Sequence != 1 || h.Sources["0"] != 0 || h.SourceEpochs["0"] != o.Epoch {
+		t.Fatal("enqueue must persist only the epoch barrier")
 	}
 	if e := a.Sync(f.ctx); e != nil {
 		t.Fatal(e)
 	}
 	h, _ = g.journal.Head(f.ctx)
-	if h.Sources["0"] != 3 || h.Committed.Sequence != 1 {
+	if h.Sources["0"] != 3 || h.Committed.Sequence != 2 {
 		t.Fatal(h)
 	}
 	before, _ := a.Index.ExportState()
@@ -152,7 +152,7 @@ func TestRoutedDedupAtomicCommitAndRecovery(t *testing.T) {
 	}
 	f.db.commitErr = nil
 	h, _ = g.journal.Head(f.ctx)
-	if h.Sources["0"] != 3 || h.Committed.Sequence != 1 {
+	if h.Sources["0"] != 3 || h.Committed.Sequence != 2 {
 		t.Fatal("partial watermark commit", h)
 	}
 	if e = g.enqueue(f.ctx, q); e != nil {
@@ -160,9 +160,9 @@ func TestRoutedDedupAtomicCommitAndRecovery(t *testing.T) {
 	}
 	if e = g.commitRouted(f.ctx, a, h); e != nil {
 		t.Fatal(e)
-	} // crash after commit, before publish
+	} // crash after commit, before local apply
 	pending, _ := g.journal.Head(f.ctx)
-	if pending.Sources["0"] != 4 || pending.Committed == pending.Visible {
+	if pending.Sources["0"] != 4 || pending.Committed != pending.Visible {
 		t.Fatal(pending)
 	}
 	if _, e = f.c.Update(f.ctx, g.journal.owner, false, true); e != nil {
@@ -219,11 +219,11 @@ func TestRoutedGapEpochAndQueueLoss(t *testing.T) {
 	if _, e := f.c.Update(f.ctx, o, false, true); e != nil {
 		t.Fatal(e)
 	}
-	if e := f.services[0].Sync(f.ctx); !errors.Is(e, ErrFenced) {
-		t.Fatal("expired dispatcher applied", e)
+	if e := f.services[0].Sync(f.ctx); e != nil {
+		t.Fatal("accepted epoch should survive source lease expiry until a higher epoch arrives", e)
 	}
 	h, _ := g.journal.Head(f.ctx)
-	if h.Committed.Sequence != 0 {
+	if h.Committed.Sequence != 2 || h.Sources["0"] != 1 {
 		t.Fatal(h)
 	}
 }
@@ -310,7 +310,7 @@ func TestDispatchRecoverySkipsCommittedWindow(t *testing.T) {
 		t.Fatal(done, state, e)
 	}
 	head, _ := a.graphReplica.journal.Head(f.ctx)
-	if head.Committed.Sequence != 1 {
+	if head.Committed.Sequence != 2 {
 		t.Fatal("recovery rebuilt committed events")
 	}
 }

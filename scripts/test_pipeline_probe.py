@@ -1,9 +1,69 @@
 import copy
+import io
 import unittest
-from pipeline_probe import parse_metrics, interval, drain_summary
+import urllib.error
+from unittest.mock import patch
+from pipeline_probe import parse_metrics, interval, drain_summary, collect
 
 
 class PipelineProbeTest(unittest.TestCase):
+    def test_local_leases_are_observed_without_changing_progress_probe(self):
+        text = '\n'.join([
+            'vecdb_index_local_lease_valid{index_partition="i",replica="r"} 1',
+            'vecdb_index_local_lease_remaining_seconds{index_partition="i",replica="r"} 0.75',
+            'vecdb_index_local_head_ready{index_partition="i",replica="r"} 0'])
+        self.assertEqual(parse_metrics(text)['index_leases'], {'r': dict(lease_valid=1, lease_remaining_seconds=.75, head_ready=0)})
+        self.assertEqual(parse_metrics(text, progress_only=True)['index_leases'], {})
+
+    def test_epoch_control_counters_are_retained_without_changing_frontier(self):
+        text = '\n'.join([
+            'vecdb_index_source_epoch_advances_total{index_partition="i",source="2"} 3',
+            'vecdb_index_source_epoch_rejections_total{index_partition="i",phase="commit"} 4',
+            'vecdb_index_source_epoch_rejections_total{index_partition="i",phase="admission"} 5'])
+        self.assertEqual(parse_metrics(text)['source_epochs'], dict(advances={'i':{'2':3}}, rejections={'i':{'commit':4,'admission':5}}))
+        self.assertEqual(parse_metrics(text, progress_only=True)['source_epochs'], dict(advances={}, rejections={}))
+
+    def test_batch_size_histograms_are_separate_from_duration_histograms(self):
+        snapshot=parse_metrics('''
+vecdb_pipeline_batch_items_count{stage="data_commit",partition="data-0000",outcome="success"} 3
+vecdb_pipeline_batch_items_sum{stage="data_commit",partition="data-0000",outcome="success"} 12
+vecdb_pipeline_batch_items_bucket{stage="data_commit",partition="data-0000",outcome="success",le="8"} 3
+vecdb_pipeline_stage_seconds_count{stage="data_commit",partition="data-0000",outcome="success"} 2
+''')
+        self.assertEqual(snapshot['histograms']['batch_items_data_commit/success']['sum'],12)
+        self.assertEqual(snapshot['histograms']['data_commit/success']['count'],2)
+
+    def test_metrics_http_error_keeps_evidence_without_credentials(self):
+        def failed(req,timeout):
+            raise urllib.error.HTTPError(req.full_url,503,'unavailable',{},io.BytesIO(b'backend unavailable'))
+        with patch('urllib.request.urlopen',failed):
+            row=collect({'worker':'http://worker'},'private-token',progress_only=True)['worker']
+        self.assertEqual(row['http_status'],503)
+        self.assertEqual(row['response_body'],'backend unavailable')
+        self.assertNotIn('private-token',str(row))
+
+    def test_scrape_profiles_http_and_parsing_without_losing_progress(self):
+        text=b'vecdb_graph_local_applied_sequence{index_partition="i",replica="r"} 7\n'
+        with patch('urllib.request.urlopen',side_effect=lambda *a,**kw:io.BytesIO(text)):
+            row=collect({'worker':'http://worker'},'secret')['worker']
+        self.assertEqual(row['applied'],{'r':7})
+        self.assertEqual(row['response_bytes'],len(text))
+        self.assertGreaterEqual(row['scrape_seconds'],row['http_seconds']+row['parse_seconds'])
+        self.assertEqual(row['parse_mode'],'full')
+
+    def test_progress_mode_preserves_uint64_epochs_and_every_replica(self):
+        text='\n'.join(f'{name}{{index_partition="i",replica="r{n}"}} {2**64-1-n}'
+            for name in ('vecdb_graph_local_applied_sequence','vecdb_graph_local_owner_epoch') for n in range(3))
+        text+='\nvecdb_pipeline_stage_seconds_count{stage="graph_apply",outcome="success"} 8\n'
+        full=parse_metrics(text);progress=parse_metrics(text,progress_only=True)
+        for field in ('applied','applied_epochs'):
+            self.assertEqual(progress[field],full[field])
+            self.assertEqual(progress[field],{f'r{n}':2**64-1-n for n in range(3)})
+        self.assertFalse(progress['histograms']);self.assertTrue(full['histograms'])
+        for value in ('nan','-1',str(2**64)):
+            with self.assertRaises(ValueError):
+                parse_metrics(f'vecdb_graph_local_owner_epoch{{replica="r"}} {value}',progress_only=True)
+
     def metrics(self, count, total):
         return {'node':parse_metrics(f'''
 vecdb_pipeline_stage_seconds_bucket{{outcome="success",partition="replica-a",stage="index_queue_wait",le="1"}} 0

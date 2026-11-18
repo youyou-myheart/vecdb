@@ -44,6 +44,9 @@ func (j graphJournal) stageObject(ctx context.Context, r *Repository, m Manifest
 	return tx.Commit(ctx)
 }
 func (j graphJournal) adoptObject(ctx context.Context, tx transactionAPI, m Manifest) error {
+	if m.Key == "" {
+		return nil
+	}
 	var o trackedObject
 	e := readJSON(ctx, tx, j.objectKey(m), &o)
 	// Older binaries produced unregistered objects. Keep these objects forever;
@@ -65,6 +68,9 @@ func (j graphJournal) adoptObject(ctx context.Context, tx transactionAPI, m Mani
 	return putJSON(tx, j.objectKey(m), o)
 }
 func (j graphJournal) retireObject(ctx context.Context, tx transactionAPI, r *Repository, m Manifest) error {
+	if m.Key == "" {
+		return nil
+	}
 	var o trackedObject
 	e := readJSON(ctx, tx, j.objectKey(m), &o)
 	if tikverr.IsErrNotFound(e) {
@@ -113,6 +119,11 @@ func (j graphJournal) CollectObjects(ctx context.Context, r *Repository, o graph
 		return e
 	}
 	defer it.Close()
+	// No intents and no sweep cursor: avoid an empty write transaction on the
+	// shared replica fence during ordinary ingestion without checkpoints.
+	if !it.Valid() && len(cursor) == 0 {
+		return nil
+	}
 	var remove []string
 	var last []byte
 	count := 0

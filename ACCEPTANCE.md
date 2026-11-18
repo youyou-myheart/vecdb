@@ -272,7 +272,31 @@ AC-58：`.venv/bin/python scripts/verify_hnsw_crash.py`，已加入普通一键�
 | AC-122 | 全部 Worker 暂停时原始写入仍返回，恢复后有界窗口追赶 |
 | AC-123 | 在途重复与已提交重投不重复构图；提交失败不推进来源水位 |
 | AC-124 | 空洞阻止连续前缀推进，无关目标不阻塞；来源重启跳过已提交窗口 |
-| AC-125 | 真实 TiKV 中来源租约撤销使在途图提交冲突，图与来源水位无部分成功 |
+| AC-125 | 真实 TiKV 验证每 Index 持久化来源 epoch：持有共享来源锁仍可并发图提交；新 epoch 屏障或 GC 使旧图事务冲突；全局来源租约撤销本身不失效已接受批次 |
 | AC-126 | 跨簇更新、删除、旧位置清理、回迁新版本保护、主从图一致 |
 | AC-127 | data/graph 独立订阅和 ACK、独立数据快照、GC 后来源与索引接管 |
 | AC-128 | 七服务单进程覆盖双 Gateway、主备 Master、Worker 排空/重启及重建 |
+
+## Index 本地来源 epoch 验收（v13）
+
+- 首次或更高 epoch 先提交 `source_epoch` 控制记录；未签发 epoch、错误来源和错误路由不得升级。相同 epoch 重试不增加控制条目。
+- 已完成批次带更高 epoch 仍持久化屏障，数据日志已被清理也能完成此操作；sources/data_offset/HNSW 不变。
+- 入队旧批次被新 epoch 替换；已经构图、已读取旧快照的批次不能越过新屏障。拒绝携带当前 epoch/commit_lsn。
+- 确定提交失败无部分状态；结果未知从图日志恢复，不重复追加控制记录。控制记录可订阅、回放，经过检查点、全量日志清理、Leader 故障和重启不丢失。
+- 不同 Index 分别观察来源 epoch；某片升级不提前拒绝另一片旧 epoch。真实 TiKV 同时验证共享来源锁无依赖和图/数据 GC 竞争后的完整恢复。
+- HTTP、gRPC、Go/Python 类型保留精确 uint64；全局 epoch gauge、升级/拒绝 counter 和 admission 阶段均可观测。多进程故障流水线检查来源 epoch 单调和检查点覆盖。
+
+对应 `source_epoch_test.go`、`source_epoch_integration_test.go`、`metrics_test.go`、RPC 测试及 `verify_dispatch.py`，均进入 smoke 门禁。
+
+## Publisher lease 与内存热路径验收（v14）
+
+- `TestIndexLeaseHotPathAndFollowerEquality`：相同 epoch 入队与构图禁止 owner、fence、plan、graph head 和反向尾扫描；允许精确数据日志校验与 Index guard，最终副本完整状态相等。
+- `TestIndexLeaseUnknownAppendRecoversDurableState`：提交失败和已提交但返回错误均使缓存失效，重试不丢失、不重复推进完成水位。
+- `TestIndexLeaseExpiryFailsClosedAndDelayedGrant`：租约到期拒绝处理，延迟响应不续命，退役后不能被在途续租复活。
+- `TestIndexLeasePinsPublisherUntilExpiry`、`TestIndexLeaseScheduledMigrationDrains`：release 不提前撤销 lease；真实调度过程保留旧 Publisher、停止续期、到期后继续迁移。
+- `TestIndexLeaseEpochAndCheckpointRebuild`：来源 epoch、图检查点、重建、后续写入和 Follower 恢复保持一致。
+- `TestIndexLeaseTiKVLateAppendAfterTakeover`：真实 TiKV，旧主通过本地检查后暂停，lease 到期并切主，1PC/2PC 均拒绝迟到旧提交，新主继续写入。
+- `TestIndexLeaseTiKVRenewalSerializesDrain`：续期与 drain/switch 竞争不能同时越过租约边界。
+- `TestIndexLeaseTiKVRecoveryFencesUnknownAppend`：任期未变化时恢复也隔离仍在途的未知旧事务，不能只读一个图头就启用缓存。
+
+这些测试自动进入现有 unit-race / storage-integration；正常排队性能沿用容量探针和完整业务 oracle，增加 queue-to-build 指标，未改变原计时起点或 1 秒追平验收门槛。

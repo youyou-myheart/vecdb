@@ -114,6 +114,25 @@ func (f *fakeTx) Iter(start, end []byte) (iteratorAPI, error) {
 
 func (f *fakeTx) Delete(k []byte) error { return f.Set(k, nil) }
 
+func (f *fakeTx) Last(ctx context.Context, start, end []byte) ([]byte, []byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if f.db.iterErr != nil {
+		return nil, nil, f.db.iterErr
+	}
+	var last string
+	for key := range f.db.data {
+		if key >= string(start) && key < string(end) && key > last {
+			last = key
+		}
+	}
+	if last == "" {
+		return nil, nil, tikverr.ErrNotExist
+	}
+	return []byte(last), f.db.data[last], nil
+}
+
 type fakeIter struct {
 	keys   []string
 	values [][]byte

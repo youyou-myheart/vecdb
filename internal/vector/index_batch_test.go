@@ -44,7 +44,7 @@ func TestRoutedBatchBoundsAndFairness(t *testing.T) {
 }
 
 // Two independent source logs feeding the same Index, with actual admission,
-// durable commit, publication and graph replay (including a revoked source).
+// durable commit, publication and graph replay (including a revoked Index leader).
 func TestRoutedBatchAtomicSourcesAndReplay(t *testing.T) {
 	for _, scenario := range []string{"normal", "revoke", "uncertain_commit"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -97,7 +97,7 @@ func TestRoutedBatchAtomicSourcesAndReplay(t *testing.T) {
 				}
 			}
 			if revoke {
-				if _, err = f.c.Update(f.ctx, owner1, false, true); err != nil {
+				if _, err = f.c.Update(f.ctx, g.journal.owner, false, true); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -113,7 +113,7 @@ func TestRoutedBatchAtomicSourcesAndReplay(t *testing.T) {
 					t.Fatal("uncertain commit not exercised", err)
 				}
 				pending, err := g.journal.Head(f.ctx)
-				if err != nil || pending.Committed == pending.Visible || pending.Sources["0"] != 1 || pending.Sources["1"] != 1 {
+				if err != nil || pending.Committed != pending.Visible || pending.Sources["0"] != 1 || pending.Sources["1"] != 1 {
 					t.Fatal("missing durable batch", pending, err)
 				}
 			}
@@ -129,7 +129,7 @@ func TestRoutedBatchAtomicSourcesAndReplay(t *testing.T) {
 			if revoke {
 				want = 0
 			}
-			if head.Committed.Sequence != want || head.Visible != head.Committed || head.Sources["0"] != want || head.Sources["1"] != want {
+			if head.Committed.Sequence != 2+want || head.Visible != head.Committed || head.Sources["0"] != want || head.Sources["1"] != want {
 				t.Fatal("sources committed separately or partially", head)
 			}
 			if err = f.services[1].Sync(f.ctx); err != nil {

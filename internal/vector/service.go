@@ -289,18 +289,37 @@ func (s *Service) Prune(ctx context.Context) (uint64, error) {
 	}
 	var floor uint64
 	var e error
-	if s.graphReplica == nil || s.graphReplica.input == nil {
-		floor, e = repo.PruneEvents(ctx, LogBatchSize)
-	}
-	if e != nil {
-		return floor, e
-	}
-	if g := s.graphReplica; g != nil && g.retention {
-		if _, e = g.journal.Prune(ctx, g.repo, LogBatchSize); e != nil {
+	g := s.graphReplica
+	if g != nil && (g.retention || g.journal.c.referenceLogs) {
+		e = retryIndexCommit(ctx, func() error { _, err := g.journal.Prune(ctx, g.repo, LogBatchSize); return err }, func() {})
+		if e != nil {
 			return floor, e
 		}
-		e = g.journal.CollectObjects(ctx, g.repo, g.objects, 128)
+	}
+	if g == nil || g.input == nil {
+		if g != nil && g.journal.c.referenceLogs {
+			r := *g.repo
+			old := r.Retain
+			r.Retain = func(ctx context.Context, tx transactionAPI, end uint64) (uint64, error) {
+				h, err := g.journal.headIn(ctx, tx)
+				if err != nil {
+					return 0, err
+				}
+				end = min(end, h.Floor.DataOffset)
+				if old != nil {
+					return old(ctx, tx, end)
+				}
+				return end, nil
+			}
+			e = retryIndexCommit(ctx, func() error { var err error; floor, err = r.PruneEvents(ctx, LogBatchSize); return err }, func() {})
+		} else {
+			floor, e = repo.PruneEvents(ctx, LogBatchSize)
+		}
+	}
+	if e == nil && g != nil && (g.retention || g.journal.c.referenceLogs) {
+		e = retryIndexCommit(ctx, func() error { return g.journal.CollectObjects(ctx, g.repo, g.objects, 128) }, func() {})
 	}
 	return floor, e
 }
+
 func (s *Service) Cursor() uint64 { s.syncMu.Lock(); defer s.syncMu.Unlock(); return s.cursor }

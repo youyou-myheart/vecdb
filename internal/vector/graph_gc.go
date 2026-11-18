@@ -58,6 +58,17 @@ func (j graphJournal) Prune(ctx context.Context, r *Repository, limit int) (Grap
 		if e = tx.Delete(key); e != nil {
 			return h.Floor, e
 		}
+		if p := entry.Payload; p != nil {
+			if p.Size <= 0 || p.Size > maxGraphPayload || p.Chunks != (p.Size+graphPayloadChunk-1)/graphPayloadChunk {
+				return h.Floor, errors.New("invalid GC payload descriptor")
+			}
+			for chunk := 0; chunk < p.Chunks; chunk++ {
+				if e = tx.Delete(j.payloadKey(n, chunk)); e != nil {
+					return h.Floor, e
+				}
+			}
+		}
+		h.FloorSources = entry.Sources
 		pos = entry.Position
 	}
 	if pos.Sequence == h.CheckpointPosition.Sequence && pos != h.CheckpointPosition {

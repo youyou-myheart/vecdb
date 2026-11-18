@@ -80,6 +80,14 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		checkpointBytes, err := strconv.ParseUint(env("GRAPH_CHECKPOINT_BYTES", "30000000"), 10, 64)
+		if err != nil || checkpointBytes == 0 {
+			log.Fatal("invalid GRAPH_CHECKPOINT_BYTES")
+		}
+		checkpointAge, err := time.ParseDuration(env("GRAPH_CHECKPOINT_AGE", "3m"))
+		if err != nil {
+			log.Fatal("invalid GRAPH_CHECKPOINT_AGE")
+		}
 		var routing *vector.ClusterRouting
 		if path := os.Getenv("CLUSTER_ROUTING_FILE"); path != "" {
 			raw, err := os.ReadFile(path)
@@ -91,7 +99,7 @@ func main() {
 				log.Fatal(err)
 			}
 		}
-		cluster, e = vector.OpenClusterService(ctx, repo, objects, partitions, vector.ClusterConfig{Routing: routing, ConsumerRetention: os.Getenv("CONSUMER_RETENTION") == "1", IndexReplication: env("INDEX_REPLICATION", "independent"), HostID: os.Getenv("HOST_ID"), Zone: os.Getenv("ZONE"), FailureDomain: env("REPLICA_FAILURE_DOMAIN", "node"), MemoryBudgetBytes: memoryBudget, Scheduler: env("SCHEDULER", "hash"), Capacity: capacity, BalanceCooldown: cooldown, Replicas: replicas, NodeID: os.Getenv("NODE_ID"), AdvertiseURL: os.Getenv("ADVERTISE_URL"), Token: os.Getenv("CLUSTER_TOKEN"), LeaseTTL: ttl, Roles: env("ROLES", "master,gateway,worker")})
+		cluster, e = vector.OpenClusterService(ctx, repo, objects, partitions, vector.ClusterConfig{GraphCheckpointBytes: checkpointBytes, GraphCheckpointAge: checkpointAge, Routing: routing, ConsumerRetention: os.Getenv("CONSUMER_RETENTION") == "1", IndexReplication: env("INDEX_REPLICATION", "independent"), HostID: os.Getenv("HOST_ID"), Zone: os.Getenv("ZONE"), FailureDomain: env("REPLICA_FAILURE_DOMAIN", "node"), MemoryBudgetBytes: memoryBudget, Scheduler: env("SCHEDULER", "hash"), Capacity: capacity, BalanceCooldown: cooldown, Replicas: replicas, NodeID: os.Getenv("NODE_ID"), AdvertiseURL: os.Getenv("ADVERTISE_URL"), Token: os.Getenv("CLUSTER_TOKEN"), LeaseTTL: ttl, Roles: env("ROLES", "master,gateway,worker")})
 		if e == nil {
 			service = cluster
 			defer cluster.Close()

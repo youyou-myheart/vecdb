@@ -3,7 +3,8 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import time
-import urllib.request
+from probe_http import request as http_request, classify_error, RequestJournal
+from query_buckets import MAX_SEARCH_K
 
 
 def target_index(record, centers):
@@ -20,14 +21,15 @@ def add_targets(targets, source, events, centers):
             targets.setdefault(index,{})[str(source)] = max(targets.get(index,{}).get(str(source),0),event['sequence'])
 
 
-def matches(hits, expected):
+def matches(hits, expected, distances=None):
     """Full final ID/revision/payload/distance oracle, including absent tombstones."""
     hits = hits or []
     if len(hits) != len(expected) or len({h['id'] for h in hits}) != len(hits): return False
     for hit in hits:
         record = expected.get(hit['id'])
         if record is None or hit['revision'] != record['revision'] or (hit.get('payload') or {}) != record['payload']: return False
-        if not math.isclose(hit['distance'],sum(v*v for v in record['vector']),rel_tol=1e-9,abs_tol=1e-6): return False
+        distance=distances[hit['id']] if distances is not None else sum(v*v for v in record['vector'])
+        if not math.isclose(hit['distance'],distance,rel_tol=1e-9,abs_tol=1e-6): return False
     return True
 
 
@@ -65,116 +67,207 @@ def positions_ready(state, local, sources, positions, baseline, indexes, replica
     return done and len(positions)==indexes
 
 
-def probe(fixture, baseline, expected, t0, *, name, target_seconds=1, observe_seconds=30, poll_seconds=.02):
-    centers = baseline['routing']['centers']; index_count = len(centers)
-    active = {id:r for id,r in expected.items() if not r['deleted']}
-    by_index = {f'index-{n:04d}':{} for n in range(index_count)}
-    for id, record in active.items(): by_index[target_index(record,centers)[0]][id] = record
-    assert len(active)<=1000, 'full-query probe currently supports at most 1000 live records'
-    query = dict(vector=[0.0]*len(centers[0]),k=1000,exact=True)
-    # No min_visible, sync, checkpoint or rebuild call is made by this probe.
-    api_token, peer_token = fixture.c.env['API_TOKEN'], fixture.c.env['CLUSTER_TOKEN']
-    namespace = 'vector-v0/'+fixture.c.namespace.encode().hex()+'/'
-    positions, successes, rows, transport_errors = {}, {}, [], []
-    state = baseline
+def membership(state):
+    return {key:(index,owner.get('node'),owner.get('session'),owner.get('url'),owner['epoch'])
+            for key,(index,owner) in replica_queries(state).items()}
 
-    def request(url, token, body=None):
-        started = time.monotonic()
-        req = urllib.request.Request(url, data=None if body is None else json.dumps(body).encode(),
-            headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'})
-        try:
-            with urllib.request.urlopen(req,timeout=3) as response: result = json.load(response)
-            return dict(value=result,elapsed=time.monotonic()-t0,duration=time.monotonic()-started)
-        except (OSError,ValueError) as exc:
-            return dict(error=type(exc).__name__,elapsed=time.monotonic()-t0,duration=time.monotonic()-started)
+
+def query_plan(fixture, expected, centers):
+    layout=getattr(fixture,'visibility_buckets',None)
+    active={id:r for id,r in expected.items() if not r['deleted']}
+    if layout is None:
+        assert len(active)<=MAX_SEARCH_K, 'more than 1000 live records requires an explicit bounded bucket layout'
+        groups=[('all',None,active)]
+    else: groups=layout.partition(expected)
+    plans=[]
+    for label,filters,records in groups:
+        by_index={f'index-{n:04d}':{} for n in range(len(centers))}
+        for id,r in records.items(): by_index[target_index(r,centers)[0]][id]=r
+        query=dict(vector=[0.0]*len(centers[0]),k=MAX_SEARCH_K,exact=True)
+        if filters is not None: query['filter']=filters
+        plans.append(dict(label=label,query=query,expected=records,by_index=by_index))
+    return plans
+
+
+def probe(fixture, baseline, expected, t0, *, name, target_seconds=1, observe_seconds=30, poll_seconds=.02):
+    entered=time.monotonic()
+    centers=baseline['routing']['centers']; index_count=len(centers)
+    plans=query_plan(fixture,expected,centers)
+    plan_seconds=time.monotonic()-entered
+    distances={id:sum(v*v for v in r['vector']) for id,r in expected.items() if not r['deleted']}
+    api_token,peer_token=fixture.c.env['API_TOKEN'],fixture.c.env['CLUSTER_TOKEN']
+    namespace='vector-v0/'+fixture.c.namespace.encode().hex()+'/'
+    positions,rows,transport_errors,control_errors={ },[],[],[]
+    target=None; first_positions=final_queries=total=first_frontier=None
+    http_path=fixture.logs/(name+'-requests.jsonl')
+    collect_progress=getattr(fixture,'local_progress',fixture.local_metrics)
+
+    def request(url,token,body=None,submitted=None):
+        result=http_request(url,token,t0,body,submitted)
+        result.update(journal.record(result))
+        return result
+
+    def observe_metrics():
+        start=time.monotonic()
+        value=collect_progress()
+        return dict(value=value,started_seconds=start-t0,elapsed=time.monotonic()-t0)
+
+    def scrape_profile(local):
+        return {node:{k:v[k] for k in ('scrape_seconds','http_seconds','parse_seconds','parse_mode','response_bytes','error','http_status') if k in v}
+                for node,v in local.items()}
+
+    def metric_errors(local, phase, elapsed):
+        for node,value in local.items():
+            if 'error' in value:
+                control_errors.append(dict(observation='local_metrics',phase=phase,node=node,elapsed=elapsed,details=value))
 
     def discover():
         def source(item):
-            name, progress = item; after = progress['head']; end = None; events = []
+            source_name,progress=item; after=progress['head']; end=None; events=[]
             while end is None or after<end:
-                result = request(fixture.urls[0]+'/v1/changes',api_token,dict(partition=name,stream='data',after=after,limit=256))
-                if 'error' in result: raise RuntimeError('source target discovery: '+result['error'])
-                page = result['value']
-                assert not page['reset_required'], 'target log compacted during measurement'
-                if end is None: end = page['head']
-                batch = [event for event in (page.get('data') or []) if event['sequence']<=end]
-                if after<end: assert batch and batch[0]['sequence']==after+1 and page['next']>after, 'target log gap'
-                events.extend(batch); after = page['next']
-            return name,end,events
-        targets, heads, count = {}, {}, 0
-        mutations = dict(insert=0, update=0, delete=0)
+                result=request(fixture.urls[0]+'/v1/changes',api_token,dict(partition=source_name,stream='data',after=after,limit=256))
+                if 'error' in result: raise RuntimeError('source target discovery: '+json.dumps(result))
+                page=result['value']; assert not page['reset_required'], 'target log compacted during measurement'
+                if end is None: end=page['head']
+                batch=[e for e in (page.get('data') or []) if e['sequence']<=end]
+                if after<end:
+                    assert batch and all(e['sequence']==after+n+1 for n,e in enumerate(batch)), 'target log gap'
+                    assert page['next']==batch[-1]['sequence'], 'target log next mismatch'
+                events.extend(batch); after=page['next']
+            return source_name,end,events
+        sources,heads,count={}, {},0; mutations=dict(insert=0,update=0,delete=0)
+        routing_seconds=0
         with ThreadPoolExecutor(max_workers=len(baseline['data_progress'])) as pool:
-            for name,head,events in pool.map(source,baseline['data_progress'].items()):
-                heads[name]=head; count+=len(events)
-                add_targets(targets,int(name.split('-')[-1]),events,centers)
+            for source_name,head,events in pool.map(source,baseline['data_progress'].items()):
+                heads[source_name]=head;count+=len(events)
+                route_start=time.monotonic()
+                add_targets(sources,int(source_name.split('-')[-1]),events,centers)
+                routing_seconds+=time.monotonic()-route_start
                 for event in events:
-                    r=event['record']
-                    kind='delete' if r.get('deleted') else ('insert' if r['revision']==1 else 'update')
+                    r=event['record'];kind='delete' if r.get('deleted') else ('insert' if r['revision']==1 else 'update')
                     mutations[kind]+=1
-        return dict(sources=targets,heads=heads,events=count,mutations=mutations,elapsed=time.monotonic()-t0)
+        return dict(sources=sources,heads=heads,events=count,mutations=mutations,elapsed=time.monotonic()-t0,
+            routing_seconds=routing_seconds)
 
-    started = time.monotonic(); first_positions = None; final_queries = None; target = None
-    path = fixture.logs/(name+'-visibility.jsonl')
-    with ThreadPoolExecutor(max_workers=24) as pool, path.open('w') as output:
-        discovery = pool.submit(discover)
+    started=time.monotonic(); query_attempts=0; verification_sum=0
+    path=fixture.logs/(name+'-visibility.jsonl')
+    # The pool exits before the journal closes, including on exceptions. A
+    # successful sweep explicitly flushes all request evidence inside its t0.
+    with RequestJournal(http_path) as journal,ThreadPoolExecutor(max_workers=24) as pool,path.open('w') as output:
+        discovery=pool.submit(discover)
         while time.monotonic()-t0<observe_seconds:
-            checked = replica_queries(state)
-            status_future = pool.submit(request,fixture.urls[0]+'/v1/cluster',api_token)
-            metrics_start = time.monotonic()
-            metrics_future = pool.submit(lambda: (fixture.local_metrics(),time.monotonic()-t0))
-            queries = {}
-            for key,(index,owner) in checked.items():
-                body = dict(namespace=namespace,partition=owner['partition'],epoch=owner['epoch'],operation='search',query=query)
-                queries[key]=(index,pool.submit(request,owner['url']+'/internal/partition',peer_token,body))
-            for n,url in enumerate(fixture.urls):
-                queries['gateway-'+str(n)]=(None,pool.submit(request,url+'/v1/search',api_token,query))
-            status = status_future.result(); local, metrics_elapsed = metrics_future.result()
-            if 'error' not in status: state = status['value']
-            if target is None and discovery.done(): target = discovery.result()
-            good_positions = target is not None and 'error' not in status and positions_ready(state,local,target['sources'],positions,baseline,index_count,2)
-            observation = max(status['elapsed'],metrics_elapsed)
-            current = replica_queries(state)
-            # Re-evaluate membership every observation; a former owner's success
-            # cannot prove that a replacement replica has applied or can query.
-            if good_positions:
-                if first_positions is None: first_positions = observation
-            else: first_positions = None
-            outcomes = {}
-            for key,(index,future) in queries.items():
-                result = future.result()
+            iteration=time.monotonic()
+            early_metrics=pool.submit(observe_metrics)
+            before=request(fixture.urls[0]+'/v1/cluster',api_token)
+            if 'error' in before:
+                early=early_metrics.result()
+                metric_errors(early['value'],'before_queries',early['elapsed'])
+                control_errors.append(before);time.sleep(poll_seconds);continue
+            state=before['value']
+            assert state['routing']==baseline['routing'], 'routing changed during fixed-route oracle'
+            checked=replica_queries(state); queries={}
+            query_started=time.monotonic()
+            for plan in plans:
+                bucket=plan['label']
+                for key,(index,owner) in checked.items():
+                    body=dict(namespace=namespace,partition=owner['partition'],epoch=owner['epoch'],operation='search',query=plan['query'])
+                    queries[(key,bucket)]=(plan['by_index'][index],pool.submit(request,owner['url']+'/internal/partition',peer_token,body,time.monotonic()))
+                for n,url in enumerate(fixture.urls):
+                    queries[('gateway-'+str(n),bucket)]=(plan['expected'],pool.submit(request,url+'/v1/search',api_token,plan['query'],time.monotonic()))
+            query_attempts+=len(queries); outcomes={}; errors=[]; good_queries=True; verified=[]
+            # A complete sweep must pass. A previous successful bucket cannot
+            # mask a later error, stale revision, or failed empty-bucket query.
+            for (key,bucket),(wanted,future) in queries.items():
+                result=future.result(); label=key+'/'+bucket
                 if 'error' in result:
-                    transport_errors.append(dict(key=key,error=result['error'],elapsed=result['elapsed']))
-                    outcomes[key]=dict(error=result['error'],seconds=result['duration'])
+                    good_queries=False;errors.append(dict(result,key=key,bucket=bucket))
+                    outcomes[label]={k:v for k,v in result.items() if k!='value'}
                     continue
-                wanted = active if index is None else by_index[index]
-                ok = matches(result['value'].get('hits'),wanted)
-                outcomes[key]=dict(correct=ok,seconds=result['duration'],graph_position=result['value'].get('graph_position'))
-                if ok: successes.setdefault(key,result['elapsed'])
-                else: successes.pop(key,None)
-            required = set(current) | {'gateway-'+str(n) for n in range(len(fixture.urls))}
-            all_queries = len(current)>=index_count*2 and required<=successes.keys()
-            final_queries = max(successes[key] for key in required) if all_queries else None
-            row = dict(elapsed=time.monotonic()-t0,position_observation_seconds=observation,
-                positions_ready=good_positions,queries_ready=all_queries,query_outcomes=outcomes,
-                graph_targets=positions,discovery_ready=target is not None,
-                graph_heads=state.get('graph_heads',{}),replica_owners=state.get('replica_owners',{}),
+                verifying=time.monotonic()
+                ok=matches(result['value'].get('hits'),wanted,distances)
+                verification_sum+=time.monotonic()-verifying
+                verified.append(time.monotonic()-t0)
+                good_queries=good_queries and ok
+                outcomes[label]=dict(correct=ok,seconds=result['duration'],queue_seconds=result['queue_seconds'],request_id=result['request_id'],
+                    response_seconds=result['elapsed'],verified_seconds=verified[-1],graph_position=result['value'].get('graph_position'),
+                    request_profile={k:result[k] for k in ('prepare_seconds','open_seconds','read_seconds','json_seconds',
+                        'record_seconds','record_lock_wait_seconds','record_encode_seconds','record_write_seconds') if k in result})
+            query_done=time.monotonic()
+            # The source frontier is part of this same measurement. Wait for
+            # its proof once, rather than discarding a complete query sweep
+            # solely because target discovery finished a few milliseconds later.
+            discovery_wait=time.monotonic()
+            if target is None: target=discovery.result()
+            discovery_wait=time.monotonic()-discovery_wait
+            # Close the membership race after every query completes; this read
+            # and epoch/membership checks count inside the same t0 window.
+            after_future=pool.submit(request,fixture.urls[0]+'/v1/cluster',api_token)
+            metrics_start=time.monotonic()
+            local=collect_progress(); metrics_elapsed=time.monotonic()-t0
+            after=after_future.result()
+            if 'error' in after: control_errors.append(after)
+            current=after.get('value',state)
+            assert current['routing']==baseline['routing'], 'routing changed during fixed-route oracle'
+            stable='error' not in after and membership(state)==membership(current)
+            good_positions=target is not None and 'error' not in after and positions_ready(current,local,target['sources'],positions,baseline,index_count,2)
+            position_verified=time.monotonic()-t0
+            early=early_metrics.result()
+            metric_errors(early['value'],'before_queries',early['elapsed'])
+            metric_errors(local,'after_queries',metrics_elapsed)
+            # Diagnostic only: compare the earlier observation with the SAME
+            # final targets and member set. It never substitutes for queries
+            # or the final post-query epoch/membership check.
+            early_ready=(good_positions and stable and
+                positions_ready(state,early['value'],target['sources'],dict(positions),baseline,index_count,2))
+            early_elapsed=max(before['elapsed'],early['elapsed'])
+            if first_frontier is None:
+                if early_ready:first_frontier=early_elapsed
+                elif good_positions:first_frontier=position_verified
+            for error in errors:
+                retired=not error['key'].startswith('gateway') and membership(current).get(error['key'])!=membership(state).get(error['key'])
+                error['classification']=classify_error(error,retired=retired,gateway=error['key'].startswith('gateway'))
+                transport_errors.append(error)
+            all_queries=good_queries and stable and len(checked)>=index_count*2
+            candidate_queries=max(verified) if all_queries and verified else None
+            row=dict(elapsed=time.monotonic()-t0,position_observation_seconds=max(after['elapsed'],metrics_elapsed),
+                positions_ready=good_positions,queries_ready=all_queries,membership_stable=stable,
+                query_outcomes=outcomes,graph_targets=positions,discovery_ready=target is not None,
+                queried_replica_owners=state.get('replica_owners',{}),replica_owners=current.get('replica_owners',{}),graph_heads=current.get('graph_heads',{}),
                 local_applied={node:dict(applied=v.get('applied',{}),epochs=v.get('applied_epochs',{})) for node,v in local.items()},
-                metadata_seconds=status['duration'],metrics_seconds=metrics_elapsed-(metrics_start-t0),
-                pending_events=sum(d['head']-d['completed_lsn'] for d in state.get('data_progress',{}).values()))
+                early_position_observation=dict(ready=early_ready,elapsed=early_elapsed,metadata_response_seconds=before['elapsed'],
+                    metadata_started_seconds=before['started_seconds'],graph_heads=state.get('graph_heads',{}),
+                    cluster_ready=state.get('ready'),fully_replicated=state.get('fully_replicated'),
+                    metrics_started_seconds=early['started_seconds'],metrics_elapsed=early['elapsed'],
+                    local_applied={node:dict(applied=v.get('applied',{}),epochs=v.get('applied_epochs',{})) for node,v in early['value'].items()}),
+                scrape_profile=dict(before=scrape_profile(early['value']),after=scrape_profile(local)),
+                metadata_before_seconds=before['duration'],metadata_after_seconds=after['duration'],
+                metrics_seconds=metrics_elapsed-(metrics_start-t0),query_sweep_seconds=query_done-query_started,
+                target_discovery_wait_seconds=discovery_wait,
+                iteration_seconds=time.monotonic()-iteration,
+                pending_events=sum(d['head']-d['completed_lsn'] for d in current.get('data_progress',{}).values()))
+            if good_positions and all_queries:
+                first_positions=position_verified;final_queries=candidate_queries
+                journal.flush()
+                total=time.monotonic()-t0
+                row['completion_seconds']=total
             rows.append(row);output.write(json.dumps(row)+'\n');output.flush()
-            if good_positions and all_queries: break
+            if total is not None: break
             time.sleep(poll_seconds)
-        if target is None: target = discovery.result()
-    complete = first_positions is not None and final_queries is not None
-    total = max(first_positions,final_queries) if complete else None
-    result = dict(correct=complete,within_target=complete and total<=target_seconds,target_seconds=target_seconds,
+        if target is None: target=discovery.result()
+        journal.flush()
+        journal_profile=journal.summary()
+    complete=total is not None
+    result=dict(correct=complete,within_target=complete and total<=target_seconds,target_seconds=target_seconds,
         positions_seconds=first_positions,queries_seconds=final_queries,both_seconds=total,
-        source_targets=target,graph_targets=positions,live_records=len(active),records=len(expected),
-        initial_pending_events=rows[0]['pending_events'] if rows else None,
-        pending_observation_seconds=rows[0]['position_observation_seconds'] if rows else None,
-        samples=len(rows),poll_seconds=poll_seconds,
-        max_observation_gap_seconds=max((b['elapsed']-a['elapsed'] for a,b in zip(rows,rows[1:])),default=0),
-        probe_setup_seconds=started-t0,transport_errors=transport_errors,
-        counting='from last acknowledged writer quiescence; no implicit query sync; heartbeat progress excluded')
+        source_targets=target,graph_targets=positions,live_records=sum(not r['deleted'] for r in expected.values()),records=len(expected),
+        buckets=[dict(label=p['label'],filter=p['query'].get('filter'),expected_live_records=len(p['expected']),k=p['query']['k']) for p in plans],
+        query_attempts=query_attempts,verification_cpu_wall_seconds=verification_sum,
+        first_frontier_observed_seconds=first_frontier,
+        initial_pending_events=rows[0]['pending_events'] if rows else None,pending_observation_seconds=rows[0]['position_observation_seconds'] if rows else None,
+        samples=len(rows),poll_seconds=poll_seconds,max_observation_gap_seconds=max((b['elapsed']-a['elapsed'] for a,b in zip(rows,rows[1:])),default=0),
+        probe_setup_seconds=started-t0,transport_errors=transport_errors,control_errors=control_errors,
+        profiling=dict(clock='time.monotonic wall time',pre_probe_seconds=entered-t0,query_plan_seconds=plan_seconds,
+            request_journal=journal_profile),
+        counting='last durable ACK; independent oracle and post-query membership/epoch validation included; no implicit query sync')
     (fixture.logs/(name+'-visibility.json')).write_text(json.dumps(result,indent=2)+'\n')
     return result

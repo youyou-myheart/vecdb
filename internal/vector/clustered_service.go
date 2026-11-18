@@ -10,6 +10,9 @@ import (
 func (c *ClusterService) Mutate(ctx context.Context, id string, m Mutation, deleted bool) (_ Record, err error) {
 	partition := c.router.DataForID(id)
 	defer c.observations.pipeline.track("data_mutate", string(sourceID(partition)))(&err)
+	if group := c.mutationGroups[partition]; group != nil {
+		return group.mutate(ctx, id, m, deleted)
+	}
 	record, err := c.PartitionedService.Mutate(ctx, id, m, deleted)
 	if err == nil {
 		c.signalSource(partition, "write", false)
@@ -130,7 +133,17 @@ func (c *ClusterService) Checkpoint(ctx context.Context) (Manifest, error) {
 		m.Format = "data-records-v1"
 		m.Offset = offset
 		m.LogVersion = LogVersion
-		if err = r.Publish(ctx, expected, m); err != nil {
+		err = retryIndexCommit(ctx, func() error { return r.Publish(ctx, expected, m) }, func() {})
+		if errors.Is(err, ErrConflict) {
+			// Automatic source maintenance may publish a newer full data image
+			// while this manual checkpoint uploads. Reuse that proven coverage.
+			current, readErr := r.Manifest(ctx)
+			if readErr == nil && current != nil && current.LogVersion == m.LogVersion && current.Format == m.Format && current.Offset >= m.Offset {
+				m = *current
+				err = nil
+			}
+		}
+		if err != nil {
 			return result, err
 		}
 		if result.Partitions == nil {
@@ -158,9 +171,13 @@ func (c *ClusterService) PruneState(ctx context.Context) (any, error) {
 		repo.Fence = c.coordinator.Fence(owner)
 		repo.Retain = func(ctx context.Context, tx transactionAPI, end uint64) (uint64, error) {
 			n, e := c.completedIn(ctx, tx, d)
-			return min(end, n), e
+			if e != nil {
+				return 0, e
+			}
+			return c.retainGraphReferences(ctx, tx, d, min(end, n))
 		}
-		n, err := repo.PruneEvents(ctx, LogBatchSize)
+		var n uint64
+		err = retryIndexCommit(ctx, func() error { var e error; n, e = repo.PruneEvents(ctx, LogBatchSize); return e }, func() {})
 		if err != nil {
 			return nil, err
 		}

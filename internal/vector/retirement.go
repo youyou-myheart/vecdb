@@ -3,6 +3,7 @@ package vector
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -60,8 +61,17 @@ func (c *ClusterService) startLoad(ctx context.Context, b PartitionBinding, o Ow
 		defer close(entry.loadDone)
 		defer cancel()
 		c.load(loadCtx, b, entry)
+		var maintenance sync.WaitGroup
+		if c.coordinator.referenceLogs {
+			maintenance.Add(1)
+			go func() { defer maintenance.Done(); c.runGraphMaintenance(loadCtx, entry) }()
+		}
 		if c.EventDrivenIndexing() {
 			c.runRoutedIndex(loadCtx, entry)
+		} else if c.coordinator.referenceLogs {
+			<-loadCtx.Done()
 		}
+		cancel()
+		maintenance.Wait()
 	}()
 }

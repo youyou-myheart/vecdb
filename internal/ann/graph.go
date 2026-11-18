@@ -23,6 +23,15 @@ type Graph struct {
 	dimension int
 }
 
+// Vector copies an immutable node vector, including obsolete record versions.
+// Patch expansion uses this lookup without evaluating any distances.
+func (g *Graph) Vector(label uint64) ([]float32, error) {
+	v := make([]float32, g.dimension)
+	err := nativeError(C.ann_vector(g.h.p, C.uint64_t(label), (*C.float)(unsafe.Pointer(&v[0]))))
+	runtime.KeepAlive(g.h)
+	return v, err
+}
+
 func nativeError(p *C.char) error {
 	if p == nil {
 		return nil

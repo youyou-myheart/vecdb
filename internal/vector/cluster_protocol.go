@@ -110,9 +110,9 @@ func (r *Repository) ensureGraphProtocol(ctx context.Context, scheduler, domain 
 	}
 	defer tx.Rollback()
 	key := []byte(r.Prefix + "cluster-mode")
-	want := "v8-graph-async-" + scheduler + "-" + domain + "-2"
+	want := "v12-graph-reference-" + scheduler + "-" + domain + "-2"
 	if retention {
-		want = "v9-graph-retention-" + scheduler + "-" + domain + "-2"
+		want = "v12-graph-reference-retention-" + scheduler + "-" + domain + "-2"
 	}
 	b, e := tx.Get(ctx, key)
 	if e == nil {

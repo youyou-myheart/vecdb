@@ -74,6 +74,9 @@ func clusterMetrics(s ClusterStatus) *metricText {
 		m.add("vecdb_data_owner_available", "gauge", "Dispatcher lease resolves successfully.", labels, flag(d.OwnerAvailable))
 		m.add("vecdb_data_dispatch_error", "gauge", "Current dispatcher reports an error; details in cluster status.", labels, flag(d.Owner.LastError != ""))
 	}
+	for id, plan := range s.ReplicaPlans {
+		m.add("vecdb_index_publisher_lease_draining", "gauge", "Master is waiting for the old publisher lease before switching.", fmt.Sprintf("{index_partition=%q}", id), flag(plan.LeaseDraining))
+	}
 	for id, h := range s.GraphHeads {
 		labels := fmt.Sprintf("{index_partition=%q}", id)
 		for _, v := range []struct {
@@ -81,15 +84,28 @@ func clusterMetrics(s ClusterStatus) *metricText {
 			value      uint64
 		}{
 			{"term", "Graph publisher fencing term.", h.Term},
+			{"log_bytes", "Cumulative serialized graph payload bytes.", h.LogBytes},
+			{"checkpoint_bytes", "Graph bytes covered by the published checkpoint.", h.CheckpointBytes},
+			{"checkpoint_pending_bytes", "Durable graph bytes beyond the checkpoint.", lag(h.LogBytes, h.CheckpointBytes)},
+			{"checkpoint_sequence", "Self-contained checkpoint graph position.", h.CheckpointPosition.Sequence},
 			{"committed_sequence", "Durable graph journal head.", h.Committed.Sequence},
-			{"visible_sequence", "Published query version.", h.Visible.Sequence},
+			{"visible_sequence", "Durable replayable graph position; not local apply progress.", h.Visible.Sequence},
 			{"floor_sequence", "Graph log retention floor.", h.Floor.Sequence},
-			{"unpublished_entries", "Committed entries not yet published.", lag(h.Committed.Sequence, h.Visible.Sequence)},
+			{"unpublished_entries", "Compatibility gauge: committed minus replayable; zero in durable protocol.", lag(h.Committed.Sequence, h.Visible.Sequence)},
 		} {
 			m.add("vecdb_graph_"+v.name, "gauge", v.help, labels, v.value)
 		}
 		for source, commit := range h.Sources {
 			m.add("vecdb_index_source_commit_lsn", "gauge", "Durable sparse source coverage; not replica applied progress.", fmt.Sprintf("{index_partition=%q,source=%q}", id, source), commit)
+		}
+		for source, epoch := range h.SourceEpochs {
+			m.add("vecdb_index_source_epoch", "gauge", "Durable source Dispatcher epoch accepted by this Index.", fmt.Sprintf("{index_partition=%q,source=%q}", id, source), epoch)
+		}
+		for source, n := range h.CheckpointSources {
+			m.add("vecdb_index_source_checkpoint_lsn", "gauge", "Source coverage captured in the checkpoint.", fmt.Sprintf("{index_partition=%q,source=%q}", id, source), n)
+		}
+		for source, n := range h.FloorSources {
+			m.add("vecdb_index_source_retired_lsn", "gauge", "Source coverage whose graph entries have been retired.", fmt.Sprintf("{index_partition=%q,source=%q}", id, source), n)
 		}
 		for _, o := range s.ReplicaOwners[id].Owners {
 			labels := fmt.Sprintf("{index_partition=%q,replica=%q}", id, o.Partition)
@@ -157,6 +173,22 @@ func (c *ClusterService) localMetrics(m *metricText) error {
 			g.viewMu.RUnlock()
 			m.add("vecdb_graph_local_applied_sequence", "gauge", "Actual local applied sequence without waiting for the heartbeat progress report.", fmt.Sprintf("{index_partition=%q,replica=%q}", g.journal.id, entry.owner.Partition), sequence)
 			m.add("vecdb_graph_local_owner_epoch", "gauge", "Owner epoch of the local graph, paired with its applied sequence.", fmt.Sprintf("{index_partition=%q,replica=%q}", g.journal.id, entry.owner.Partition), entry.owner.Epoch)
+			if w := g.writer; w != nil {
+				w.mu.Lock()
+				remaining := max(float64(0), time.Until(w.deadline).Seconds())
+				valid, ready := 0, 0
+				if !w.retired && remaining > 0 {
+					valid = 1
+					if w.known {
+						ready = 1
+					}
+				}
+				w.mu.Unlock()
+				labels := fmt.Sprintf("{index_partition=%q,replica=%q}", g.journal.id, entry.owner.Partition)
+				m.add("vecdb_index_local_lease_valid", "gauge", "Local publisher lease permits work according to the monotonic deadline.", labels, valid)
+				m.add("vecdb_index_local_lease_remaining_seconds", "gauge", "Conservative local publisher lease remaining duration.", labels, remaining)
+				m.add("vecdb_index_local_head_ready", "gauge", "Confirmed cached graph head ready for leased appends.", labels, ready)
+			}
 			in := g.input
 			waiting := 0
 			if in.waiting.Load() {

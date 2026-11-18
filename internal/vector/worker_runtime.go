@@ -41,6 +41,11 @@ func (c *ClusterService) remove(entry *localPartition) {
 	if entry.cancel != nil {
 		entry.cancel()
 	}
+	entry.mu.RLock()
+	if entry.service != nil && entry.service.graphReplica != nil && entry.service.graphReplica.writer != nil {
+		entry.service.graphReplica.writer.retire()
+	}
+	entry.mu.RUnlock()
 	// Retire outside the heartbeat loop. Every user of the local graph holds
 	// entry.mu.RLock, so native memory is freed only after in-flight operations end.
 	go func() {
@@ -86,9 +91,12 @@ func (c *ClusterService) load(ctx context.Context, b PartitionBinding, entry *lo
 	if c.graphReplication {
 		service, e = newGraphService(ctx, &repo, c.objects, graphJournal{c.coordinator, b.Index, entry.owner})
 		if e == nil {
-			service.graphReplica.retention = c.consumerRetention
+			service.graphReplica.retention = c.consumerRetention || c.coordinator.referenceLogs
 			if c.layout.Routing != nil {
 				service.graphReplica.input = newRoutedInput(c)
+				if c.coordinator.leaseReads {
+					service.graphReplica.writer = &indexWriter{}
+				}
 			}
 		}
 	} else {
@@ -116,8 +124,13 @@ func (c *ClusterService) load(ctx context.Context, b PartitionBinding, entry *lo
 	}
 	entry.service = service
 	entry.mu.Unlock()
+	started := time.Now()
 	if _, e = c.coordinator.Update(ctx, entry.owner, true, false); e != nil && errors.Is(e, ErrFenced) {
 		c.remove(entry)
+	} else if e == nil && service.graphReplica != nil && service.graphReplica.writer != nil {
+		if current, err := c.coordinator.Plan(ctx, b.Index); err == nil {
+			_ = service.graphReplica.refreshLease(ctx, current, started)
+		}
 	}
 }
 func (c *ClusterService) SyncOwned(ctx context.Context) (err error) {
@@ -167,6 +180,7 @@ func (c *ClusterService) replicaTick(ctx context.Context) {
 	allowed := map[IndexPartitionID]PartitionBinding{}
 	versions := map[IndexPartitionID]uint64{}
 	publishers := map[IndexPartitionID]IndexPartitionID{}
+	plans := map[IndexPartitionID]ReplicaPlan{}
 	for _, b := range c.layout.Bindings {
 		p, e := c.coordinator.Plan(ctx, b.Index)
 		if e != nil {
@@ -177,6 +191,7 @@ func (c *ClusterService) replicaTick(ctx context.Context) {
 				allowed[a.Partition] = b
 				versions[a.Partition] = p.Version
 				publishers[a.Partition] = p.Publisher
+				plans[a.Partition] = p
 			}
 		}
 	}
@@ -210,9 +225,15 @@ func (c *ClusterService) replicaTick(ctx context.Context) {
 			}
 		}
 		entry.mu.RUnlock()
+		started := time.Now()
 		if _, e := c.coordinator.Update(ctx, entry.owner, ready, false); errors.Is(e, ErrFenced) {
 			c.remove(entry)
 		} else if e == nil && ready {
+			entry.mu.RLock()
+			if entry.service != nil && entry.service.graphReplica != nil {
+				_ = entry.service.graphReplica.refreshLease(ctx, plans[entry.owner.Partition], started)
+			}
+			entry.mu.RUnlock()
 			_ = c.coordinator.ReportReplica(ctx, allowed[entry.owner.Partition].Index, versions[entry.owner.Partition], entry.owner, "Ready", "", offset)
 			if journal != nil {
 				report := c.observations.pipeline.track("graph_progress_report", string(journal.id))

@@ -60,6 +60,9 @@ func (p *remotePartition) callOwnerThrough(ctx context.Context, op string, q Sea
 	}
 	if response.StatusCode != 200 {
 		if out.Code == "fenced" {
+			if out.SourceEpoch != nil {
+				return out, out.SourceEpoch
+			}
 			return partitionReply{}, ErrFenced
 		}
 		if out.Code == "not_visible" {

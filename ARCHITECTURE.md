@@ -1,6 +1,6 @@
 # 当前架构与分区设计
 
-本文整理截至 2026-11-16 的实现及设计取舍，是理解仓库的架构入口。重点描述 `CLUSTER_MODE=1 REPLICAS=2 INDEX_REPLICATION=graph`；默认 `INDEX_REPLICATION=independent` 仍保留，各副本独立构图。消费保留与图日志回收需另设 `CONSUMER_RETENTION=1`，所有角色配置一致并使用新 namespace。具体启动参数见 [CLI.md](CLI.md)。
+本文整理截至 2026-11-17 的实现及设计取舍，是理解仓库的架构入口。重点描述 `CLUSTER_MODE=1 REPLICAS=2 INDEX_REPLICATION=graph`；默认 `INDEX_REPLICATION=independent` 仍保留，各副本独立构图。消费保留与图日志回收需另设 `CONSUMER_RETENTION=1`，所有角色配置一致并使用新 namespace。具体启动参数见 [CLI.md](CLI.md)。
 
 本文下述一一映射是默认布局。现已增加可选聚类布局，数据/索引分区数量独立：见 [CLUSTER_ROUTING.md](CLUSTER_ROUTING.md)。该模式不保存逐事件路由计划，使用固定簇中心、来源处理器和持久化完成水位；split/merge 仍未实现。
 
@@ -15,7 +15,7 @@
 | 存储位置 | 保存内容 | 边界 |
 |---|---|---|
 | TiKV | 原始记录、数据日志、幂等凭证、图日志引用、快照清单、租约、分配、迁移任务、消费 ACK | 权威持久化数据与协调状态 |
-| SeaweedFS / S3 | 不可变图变更对象、完整图快照 | 图日志载荷与恢复基线 |
+| SeaweedFS / S3 | 完整图快照与重建 reset | 恢复基线 |
 | Worker 内存 | HNSW、最新记录视图、节点版本映射、属性倒排 | 可由快照及日志恢复的查询视图 |
 
 ## 2. 分区与部署：只画归属，不混入复制流程
@@ -48,30 +48,31 @@ DataPartition 没有应用层 Leader/Follower，也不等于 TiKV Region。底�
 ```mermaid
 flowchart LR
     D["TiKV：DataPartition 0<br/>有序数据日志"] -->|① 增量读取| A["索引 Leader A<br/>计算图变更"]
-    A -->|② 持久化并发布| L["持久化图变更<br/>TiKV：引用与发布水位<br/>SeaweedFS：变更内容"]
+    A -->|② 预校验后持久化| L["持久化即允许回放<br/>TiKV：图条目、结构变更<br/>来源水位和数据日志引用"]
+    L -->|③ 按序应用| AQ["A 的查询视图"]
     L -->|③ 拉取并应用| B["索引 Follower B<br/>重放图变更"]
 ```
 
-A 不直接向 B 复制进程内存。B 读取 TiKV 中的已发布图日志，再从 SeaweedFS 获取变更载荷。因此 A 故障后，已提交的变更仍可恢复。Follower 不重新执行 HNSW 插入时的邻居选择，但仍承担读取、校验和应用变更的成本。
+A 不直接向 B 复制进程内存。B 读取 TiKV 中的已持久化图日志，在同一 TiKV 快照读取图载荷及其引用的数据日志。因此 A 故障后，已提交的变更仍可恢复。Follower 不重新执行 HNSW 插入时的邻居选择，但仍承担读取、校验和应用变更的成本。
 
 详细提交顺序：
 
 1. 任意 Gateway 将记录、数据日志、分区 log-head 和幂等凭证写入同一个 TiKV 事务。支持 expected_revision 条件更新；提交结果不确定时用原 request_id 重试。
 2. 一一对应模式下，Leader 每 500 ms 从上次数据 offset 增量读取，每批最多 256 条。聚类投递模式改由来源处理器投递到队列，入队唤醒 Leader 连续消费，见第 6 节。
 3. Leader 在写锁内构图，捕获修改过的节点和记录等状态，再回退推测修改，避免查询提前看到未提交结果。
-4. 上传并校验不可变图对象，在带 fencing 的 TiKV 事务中提交图日志引用和数据消费位置。
-5. Leader 验证变更可重放，推进 Visible；不等待 Follower ACK。随后 Leader 应用已发布图变更。
-6. Follower 按顺序拉取已发布图日志、校验并应用，推进本地位置。
+4. Leader 先验证图变更可重放，再拆出向量、属性的数据日志引用。
+5. 带 fencing 的 TiKV 事务追加图条目，条目与图载荷分块、累计来源水位原子持久化；**持久化成功即允许回放**，没有第二个 ACK／Visible 发布事务。
+6. A、B 分别按序应用持久化日志，推进各自内存位置。B 不需要等下一条日志，也不需要等 A 应用。
 
 | 位置 | 含义 |
 |---|---|
 | 数据 offset | 一个 DataPartition 内的数据事件序号 |
 | 图 sequence | 一个 IndexPartition 内的图变更批次序号 |
 | Committed | 已持久化、接管后必须继续处理的图位置 |
-| Visible | 已发布、允许副本应用并查询的图位置 |
+| Visible | 兼容字段，等于 Committed；表示允许回放，不代表本地已经可查 |
 | 副本 position | 该副本实际已经应用的位置 |
 
-图位置包含数据 offset 和链式 hash；数据 offset 与图 sequence 不能混用。当前最多允许一批已提交但未发布的图变更，简化恢复并限制推测状态规模。
+图位置包含数据 offset 和链式 hash；数据 offset 与图 sequence 不能混用。Leader 一批完成预校验、持久化和本地 apply 后才构建下一批；没有“已提交但未发布”状态。控制 head 只在任期、检查点、清理时更新，最新位置和来源水位从尾记录派生。协议细节见 [GRAPH_JOURNAL.md](GRAPH_JOURNAL.md)。
 
 一致性约定：同一图位置应有相同的图结构、记录版本和删除状态；不同副本允许处于不同位置。原始写入成功表示 TiKV 提交成功，不表示所有索引副本立即可见。
 
@@ -86,9 +87,9 @@ A 不直接向 B 复制进程内存。B 读取 TiKV 中的已发布图日志，�
 Leader A 故障后的流程：
 
 1. Master 根据租约更新副本计划和 Publisher。租约时间使用 TiKV 事务时间，过期的是租约，epoch 是递增的身份代次。
-2. B 在有效 ownership 下领取新图任期，先追平已发布图，再完成已提交但尚未发布的批次。
-3. B 从 Committed.DataOffset 继续消费数据日志，构图并发布。
-4. 旧 A 的提交和发布受到事务内 ownership、Publisher 与 fencing 检查约束，不能凭旧身份继续修改权威状态。
+2. B 在有效 ownership 下领取新图任期，先追平全部已持久化图条目。
+3. B 从 Committed.DataOffset 继续消费数据日志，构图并追加图日志。
+4. 旧 A 的追加受到事务内 ownership、Publisher 与 fencing 检查约束，不能凭旧身份继续修改权威状态。
 
 Gateway 与 TiKV 可用时，接管不要求停止原始数据读写。有效的可服务副本可继续查询旧视图；没有可服务副本时搜索暂时不可用。路由重试有时间上限，不承诺任意故障下零中断。
 
@@ -98,11 +99,11 @@ Master 维护的 ReplicaPlan 区分 Desired、Serving、Publisher、Barrier 和 
 
 完整快照包含原生 HNSW、记录、节点版本映射、配置、构图随机数状态，以及图 sequence/hash 和数据 offset。恢复使用完整快照加增量图日志，不需要重新逐条构图。目前不是 RocksDB 式分层检查点，完整快照成本仍随分片大小增长。
 
-对外提供 data 和 graph 两种分页拉取流，分别对应数据变化和已发布图变化。Gateway 直接读取持久化日志，不依赖 Worker 在线。graph 流提供对象引用和邻接关系投影；HNSW 导航边不等于精确最近 N 个点。
+对外提供 data 和 graph 两种分页拉取流，分别对应数据变化和已持久化图变化。Gateway 直接读取持久化日志，不依赖 Worker 在线。graph 流提供 TiKV 图载荷、数据引用和邻接关系投影；HNSW 导航边不等于精确最近 N 个点。
 
 启用消费保留后，消费者以 session、epoch、ACK 和 TTL 登记进度。data 日志清理受检查点、副本保留约束和有效消费者 ACK 限制；graph 日志清理受图检查点和有效消费者 ACK 限制。登记、续租与清理通过事务冲突协调。落后副本遇到已回收日志时加载检查点，再追增量。
 
-对象先登记上传意图，提交图引用时转为 live；清理时先持久化 garbage 标记，再删除 S3 对象。删除失败和迟到上传可以重试处理。当前通过 `cluster prune` 有界触发，保留历史检查点、未登记旧对象和回收标记。订阅不承诺下游 exactly-once。协议见 [RPC.md](RPC.md) 和 [DESIGN.md](DESIGN.md#消费租约与图日志回收)。
+对象先登记上传意图，提交图引用时转为 live；清理时先持久化 garbage 标记，再删除 S3 对象。删除失败和迟到上传可以重试处理。后台按每片 30 MB / 3 分钟检查点及有界 GC 推进，也可通过 `cluster prune` 显式触发，保留历史检查点、未登记旧对象和回收标记。订阅不承诺下游 exactly-once。协议见 [RPC.md](RPC.md) 和 [DESIGN.md](DESIGN.md#消费租约与图日志回收)。
 
 ## 6. 设计决策：保留 DataPartition，支持可选聚类布局
 
@@ -119,9 +120,11 @@ flowchart LR
     I --> G["图变更日志<br/>原子提交来源完成水位"]
 ```
 
+聚类模式使用 Publisher lease 保护内存中的 owner、角色、图头和来源水位。正常消费批次不再读这些控制 key 或重复 Claim；后台续租和刷新计划。Master 切主必须等待旧 lease 到期，主动迁移先标记 lease_draining。图提交仍由 TiKV Index guard 隔离迟到旧请求；首次接管、未知提交和维护追加后重新建立持久化屏障并恢复缓存。详见 [图日志的租约处理路径](GRAPH_JOURNAL.md#租约保护的内存处理路径)。
+
 没有增加持久化索引输入日志，也不先保存逐事件路由结果。来源保留原始日志并承担重试；数据写入和图提交会异步唤醒来源处理器，来源读取持久化 commit_lsn，按各事件目标计算连续完成前缀，窗口完成后立即读下一窗口。500 ms 控制巡检负责租约与漏通知兜底。处理器故障后只需从完成位置恢复有界窗口。具体投递、去重、空洞、订阅及恢复协议见 [CLUSTER_ROUTING.md](CLUSTER_ROUTING.md)。
 
-每个本地索引副本有独立消费循环：Leader 由入队事件唤醒，逐批完成持久化和发布后立即取下一批，队列为空时阻塞等待。不同索引可以并行，单个索引仍有序提交；Follower 当前每 100 ms 追赶持久化图日志。切主计划变化和提交失败也能唤醒恢复流程。时延对比与观测见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md)。
+每个本地索引副本有独立消费循环：Leader 由入队事件唤醒，逐批完成持久化和本地 apply 后立即取下一批，队列为空时阻塞等待。不同索引可以并行，单个索引仍有序提交；Follower 当前每 100 ms 追赶持久化图日志。切主计划变化和提交失败也能唤醒恢复流程。时延对比与观测见 [PIPELINE_LATENCY.md](PIPELINE_LATENCY.md)。
 
 这一取舍减少一层日志持久化，但慢索引会通过来源窗口产生反压。未来若需要隔离积压，可再评估独立索引输入日志。
 

@@ -10,6 +10,9 @@ import (
 const graphFormat = "hnswlib-0.8.0-le64-v1"
 
 type IndexSnapshot struct {
+	SourceEpochs  map[string]uint64      `json:"source_epochs,omitempty"`
+	Sources       map[string]uint64      `json:"sources,omitempty"`
+	LogBytes      uint64                 `json:"log_bytes,omitempty"`
 	GraphState    []byte                 `json:"graph_state,omitempty"`
 	GraphSequence uint64                 `json:"graph_sequence,omitempty"`
 	GraphHash     string                 `json:"graph_hash,omitempty"`

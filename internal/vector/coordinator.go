@@ -43,6 +43,9 @@ type Ownership struct {
 	Ready     bool             `json:"ready"`
 }
 type Coordinator struct {
+	leaseReads      bool
+	referenceLogs   bool
+	data            map[DataPartitionID]*Repository
 	failureDomain   string
 	loadBalance     bool
 	balanceCooldown time.Duration

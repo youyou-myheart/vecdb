@@ -2,9 +2,12 @@ package vector
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	dto "github.com/prometheus/client_model/go"
 )
 
 func consumerTest(t *testing.T, step consumerStep) (*routedInput, context.CancelFunc, <-chan struct{}) {
@@ -104,39 +107,45 @@ func TestIndexConsumerWakeBetweenEmptyCheckAndWait(t *testing.T) {
 }
 
 func TestIndexConsumerRetriesWithoutNewDataAndCancels(t *testing.T) {
-	calls := make(chan int64, 8)
-	var count atomic.Int64
-	in, cancel, done := consumerTest(t, func(context.Context) (bool, bool, error) {
-		n := count.Add(1)
-		calls <- n
-		if n == 1 {
-			return true, false, injected
-		}
-		return true, false, nil
-	})
-	if receiveConsumer(t, calls) != 1 || receiveConsumer(t, calls) != 2 {
-		t.Fatal("failed IO not retried")
-	}
-	waitConsumerIdle(t, in)
-	cancel()
-	receiveConsumer(t, done)
-	if in.waiting.Load() {
-		t.Fatal("cancelled consumer still reported waiting")
+	for _, leader := range []bool{true, false} {
+		t.Run(fmt.Sprintf("leader_%v", leader), func(t *testing.T) {
+			calls := make(chan time.Time, 8)
+			count := 0
+			in, cancel, done := consumerTest(t, func(context.Context) (bool, bool, error) {
+				count++
+				calls <- time.Now()
+				if count == 1 {
+					return leader, true, injected // Errors must back off even after progress.
+				}
+				return leader, false, nil
+			})
+			failed := receiveConsumer(t, calls)
+			retried := receiveConsumer(t, calls)
+			if retried.Sub(failed) < initialIndexRetry {
+				t.Fatal("failed IO did not back off", retried.Sub(failed))
+			}
+			waitConsumerIdle(t, in)
+			cancel()
+			receiveConsumer(t, done)
+			if in.waiting.Load() {
+				t.Fatal("cancelled consumer still reported waiting")
+			}
+		})
 	}
 }
 
-func TestFollowerPollsAndDoesNotSpinOnOldQueue(t *testing.T) {
+func TestFollowerPollsAndWakesOnPromotion(t *testing.T) {
 	calls := make(chan struct{}, 8)
 	var leader atomic.Bool
 	in, _, _ := consumerTest(t, func(context.Context) (bool, bool, error) {
 		calls <- struct{}{}
-		return leader.Load(), !leader.Load(), nil
+		return leader.Load(), false, nil
 	})
 	receiveConsumer(t, calls)
 	waitConsumerIdle(t, in)
 	select {
 	case <-calls:
-		t.Fatal("Follower spun on stale input queue")
+		t.Fatal("idle Follower polled before its timer")
 	case <-time.After(20 * time.Millisecond):
 	}
 	receiveConsumer(t, calls) // Follower tails remote graph journal without admission.
@@ -154,17 +163,84 @@ func TestFollowerPollsAndDoesNotSpinOnOldQueue(t *testing.T) {
 }
 
 func TestConsumerContinuedInputCanBeCancelled(t *testing.T) {
-	calls := make(chan struct{}, 1)
-	_, cancel, done := consumerTest(t, func(context.Context) (bool, bool, error) {
-		select {
-		case calls <- struct{}{}:
-		default:
+	for _, leader := range []bool{true, false} {
+		t.Run(fmt.Sprintf("leader_%v", leader), func(t *testing.T) {
+			calls := make(chan struct{}, 1)
+			_, cancel, done := consumerTest(t, func(context.Context) (bool, bool, error) {
+				select {
+				case calls <- struct{}{}:
+				default:
+				}
+				return leader, true, nil
+			})
+			receiveConsumer(t, calls)
+			cancel()
+			receiveConsumer(t, done)
+		})
+	}
+}
+
+func TestFollowerDrainsUntilEmptyThenPolls(t *testing.T) {
+	calls := make(chan time.Time, 5)
+	count := 0 // Only the consumer goroutine accesses count.
+	in, cancel, done := consumerTest(t, func(ctx context.Context) (bool, bool, error) {
+		count++
+		calls <- time.Now()
+		if count == 5 {
+			// Hold the first idle poll so observations do not depend on how
+			// quickly the test goroutine is scheduled after that poll.
+			<-ctx.Done()
+			return false, false, ctx.Err()
 		}
-		return true, true, nil
+		return false, count <= 3, nil
 	})
-	receiveConsumer(t, calls)
+	for n := 0; n < 3; n++ {
+		receiveConsumer(t, calls)
+	}
+	empty := receiveConsumer(t, calls)
+	polled := receiveConsumer(t, calls)
 	cancel()
 	receiveConsumer(t, done)
+	if polled.Sub(empty) < followerPollInterval {
+		t.Fatal("Follower did not wait after an empty read", polled.Sub(empty))
+	}
+	for reason, want := range map[string]float64{"start": 1, "follower_continue": 3, "follower_poll": 1} {
+		var metric dto.Metric
+		if err := in.cluster.observations.pipeline.consumerWake.WithLabelValues("index-0000", reason).Write(&metric); err != nil {
+			t.Fatal(err)
+		}
+		if got := metric.GetCounter().GetValue(); got != want {
+			t.Fatalf("%s: got %v want %v", reason, got, want)
+		}
+	}
+}
+
+func TestFollowerStepContinuesOnReplayAndIgnoresStaleQueue(t *testing.T) {
+	f, c, source := routedFixture(t)
+	enableReferences(f)
+	a, b := f.services[0], f.services[1]
+	entry := &localPartition{owner: b.graphReplica.journal.owner, service: b}
+	// A demoted Leader may still have queued deliveries. They cannot keep a
+	// Follower busy or be used to generate graph mutations.
+	b.graphReplica.input.queue[0] = &queuedDelivery{}
+	for n := uint64(0); n < 2; n++ {
+		f.write(t, "v", n == 1)
+		if err := a.graphReplica.enqueue(f.ctx, deliveryFor(t, f, source, n)); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.Sync(f.ctx); err != nil {
+			t.Fatal(err)
+		}
+		leader, more, err := c.stepRoutedIndex(f.ctx, entry)
+		if err != nil || leader || !more || b.graphReplica.position != a.graphReplica.position {
+			t.Fatal("Follower did not request another tail after replay", leader, more, err)
+		}
+		equalGraph(t, a.Index, b.Index)
+		leader, more, err = c.stepRoutedIndex(f.ctx, entry)
+		if err != nil || leader || more || !b.graphReplica.input.hasQueued() {
+			t.Fatal("empty Follower tail spun on stale input", leader, more, err)
+		}
+	}
 }
 
 func TestConsumerSlowIndexDoesNotBlockAnotherIndex(t *testing.T) {
@@ -213,6 +289,10 @@ func TestUncertainGraphCommitWakesPublicationWithoutNewInput(t *testing.T) {
 	if err = g.enqueue(f.ctx, deliveryFor(t, f, owner, 0)); err != nil {
 		t.Fatal(err)
 	}
+	head, err = g.journal.Head(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	<-g.input.wake
 	f.db.commitErr = injected
 	f.db.committedDespiteError = true
@@ -222,7 +302,7 @@ func TestUncertainGraphCommitWakesPublicationWithoutNewInput(t *testing.T) {
 	f.db.commitErr = nil
 	f.db.committedDespiteError = false
 	if len(g.input.wake) != 1 || g.input.hasQueued() {
-		t.Fatal("pending publication failed to wake empty queue")
+		t.Fatal("durable replay failed to wake empty queue")
 	}
 	if err = s.Sync(f.ctx); err != nil {
 		t.Fatal(err)

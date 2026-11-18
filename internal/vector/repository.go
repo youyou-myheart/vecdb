@@ -173,13 +173,22 @@ func (r *Repository) Mutate(ctx context.Context, id string, m Mutation, deleted 
 		}
 	}
 }
-func (r *Repository) mutateOnce(ctx context.Context, id string, m Mutation, deleted bool) (Record, error) {
+
+type preparedMutation struct {
+	id       string
+	mutation Mutation
+	deleted  bool
+	digest   string
+	size     int
+}
+
+func (r *Repository) prepareMutation(id string, m Mutation, deleted bool) (preparedMutation, error) {
 	if id == "" || len(id) > 256 || m.RequestID == "" || len(m.RequestID) > 256 {
-		return Record{}, errors.New("id and request_id required, at most 256 bytes")
+		return preparedMutation{}, errors.New("id and request_id required, at most 256 bytes")
 	}
 	if !deleted {
 		if err := ValidateVector(m.Vector, r.Dimension); err != nil {
-			return Record{}, err
+			return preparedMutation{}, err
 		}
 	}
 	body, marshalErr := json.Marshal(struct {
@@ -188,38 +197,59 @@ func (r *Repository) mutateOnce(ctx context.Context, id string, m Mutation, dele
 		Deleted bool
 	}{id, m, deleted})
 	if marshalErr != nil {
-		return Record{}, marshalErr
+		return preparedMutation{}, marshalErr
 	}
-	digest := fmt.Sprintf("%x", sha256.Sum256(body))
-	tx, e := r.begin()
-	if e != nil {
-		return Record{}, e
+	return preparedMutation{id: id, mutation: m, deleted: deleted, digest: fmt.Sprintf("%x", sha256.Sum256(body)), size: len(body)}, nil
+}
+
+func (r *Repository) mutateOnce(ctx context.Context, id string, m Mutation, deleted bool) (Record, error) {
+	q, err := r.prepareMutation(id, m, deleted)
+	if err != nil {
+		return Record{}, err
+	}
+	tx, err := r.begin()
+	if err != nil {
+		return Record{}, err
 	}
 	defer tx.Rollback()
+	rec, changed, err := r.mutateIn(ctx, tx, q)
+	if err != nil || !changed {
+		return rec, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return Record{}, fmt.Errorf("commit not confirmed; retry same request_id: %w", err)
+	}
+	return rec, nil
+}
+
+// Semantic conflicts are detected before any Set, so a group can reject one
+// request without dropping unrelated valid requests. Storage errors abort it.
+func (r *Repository) mutateIn(ctx context.Context, tx transactionAPI, q preparedMutation) (Record, bool, error) {
+	id, m, deleted, digest := q.id, q.mutation, q.deleted, q.digest
 	reqKey := r.key("request", m.RequestID)
 	b, e := tx.Get(ctx, reqKey)
 	if e == nil {
 		var old receipt
 		if e = json.Unmarshal(b, &old); e != nil {
-			return Record{}, e
+			return Record{}, false, e
 		}
 		if old.Digest != digest {
-			return Record{}, ErrConflict
+			return Record{}, false, ErrConflict
 		}
-		return old.Record, nil
+		return old.Record, false, nil
 	}
 	if !tikverr.IsErrNotFound(e) {
-		return Record{}, e
+		return Record{}, false, e
 	}
 	old, e := readRecord(ctx, tx, r.key("record", id))
 	if e != nil && !errors.Is(e, ErrNotFound) {
-		return Record{}, e
+		return Record{}, false, e
 	}
 	if m.ExpectedRevision != nil && *m.ExpectedRevision != old.Revision {
-		return Record{}, ErrConflict
+		return Record{}, false, ErrConflict
 	}
 	if old.Revision == ^uint64(0) {
-		return Record{}, errors.New("record revision exhausted")
+		return Record{}, false, errors.New("record revision exhausted")
 	}
 	rec := Record{ID: id, Revision: old.Revision + 1, Vector: m.Vector, Payload: m.Payload, Deleted: deleted}
 	if deleted {
@@ -230,24 +260,20 @@ func (r *Repository) mutateOnce(ctx context.Context, id string, m Mutation, dele
 	ack, _ := json.Marshal(receipt{Digest: digest, Record: rec})
 	head, e := r.readCounter(ctx, tx, "log-head")
 	if e != nil {
-		return Record{}, e
+		return Record{}, false, e
 	}
 	if head == ^uint64(0) {
-		return Record{}, errors.New("log sequence exhausted")
+		return Record{}, false, errors.New("log sequence exhausted")
 	}
 	sequence := head + 1
 	event, _ := json.Marshal(LogEvent{sequence, rec})
 	counter, _ := json.Marshal(sequence)
 	for k, v := range map[string][]byte{string(r.key("record", id)): encoded, string(r.logKey(sequence)): event, r.Prefix + "log-head": counter, string(reqKey): ack} {
 		if e = tx.Set([]byte(k), v); e != nil {
-			return Record{}, e
+			return Record{}, false, e
 		}
 	}
-	// Commit errors are not blindly retried: caller retries with the same request ID.
-	if e = tx.Commit(ctx); e != nil {
-		return Record{}, fmt.Errorf("commit not confirmed; retry same request_id: %w", e)
-	}
-	return rec, nil
+	return rec, true, nil
 }
 func (r *Repository) Scan(ctx context.Context, kind string) ([]Record, error) {
 	tx, e := r.begin()
@@ -385,6 +411,9 @@ type transactionAPI interface {
 	Commit(context.Context) error
 	Rollback() error
 	Iter([]byte, []byte) (iteratorAPI, error)
+	// Last reads the last persisted pair in [start, end) at this snapshot.
+	// It does not scan the prefix or include this transaction's pending writes.
+	Last(context.Context, []byte, []byte) ([]byte, []byte, error)
 }
 type tikvTransaction struct{ *transaction.KVTxn }
 

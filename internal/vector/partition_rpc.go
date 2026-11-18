@@ -3,9 +3,11 @@ package vector
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"time"
 )
@@ -21,13 +23,14 @@ type partitionRPC struct {
 	Query       Search           `json:"query"`
 }
 type partitionReply struct {
-	GraphPosition *GraphPosition `json:"graph_position,omitempty"`
-	AppliedOffset uint64         `json:"applied_offset,omitempty"`
-	Hits          []Hit          `json:"hits,omitempty"`
-	Manifest      Manifest       `json:"manifest,omitempty"`
-	Floor         uint64         `json:"floor,omitempty"`
-	Error         string         `json:"error,omitempty"`
-	Code          string         `json:"code,omitempty"`
+	SourceEpoch   *SourceEpochError `json:"source_epoch,omitempty"`
+	GraphPosition *GraphPosition    `json:"graph_position,omitempty"`
+	AppliedOffset uint64            `json:"applied_offset,omitempty"`
+	Hits          []Hit             `json:"hits,omitempty"`
+	Manifest      Manifest          `json:"manifest,omitempty"`
+	Floor         uint64            `json:"floor,omitempty"`
+	Error         string            `json:"error,omitempty"`
+	Code          string            `json:"code,omitempty"`
 }
 
 func (c *ClusterService) InternalHandler() http.Handler {
@@ -55,6 +58,17 @@ func (c *ClusterService) InternalHandler() http.Handler {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
+		// Opt-in diagnostics for acceptance probes. Never log the authorization
+		// header, query vectors, or payload. A fixed-size hex ID is log-safe.
+		probeID := r.Header.Get("X-Vecdb-Probe-ID")
+		if len(probeID) != 32 {
+			probeID = ""
+		} else if _, err := hex.DecodeString(probeID); err != nil {
+			probeID = ""
+		}
+		if probeID != "" {
+			w.Header().Set("X-Vecdb-Probe-ID", probeID)
+		}
 		response, e := c.execute(ctx, req)
 		if e != nil {
 			response.Error = e.Error()
@@ -64,6 +78,14 @@ func (c *ClusterService) InternalHandler() http.Handler {
 			}
 			if errors.Is(e, ErrFenced) {
 				response.Code = "fenced"
+				errors.As(e, &response.SourceEpoch)
+			}
+			if req.Operation == "search" && probeID != "" {
+				partition := string(req.Partition)
+				if len(partition) > 128 {
+					partition = partition[:128] + "..."
+				}
+				log.Printf("partition_rpc_probe request_id=%s partition=%q epoch=%d status=503 code=%s error=%q", probeID, partition, req.Epoch, response.Code, response.Error)
 			}
 			w.WriteHeader(503)
 		}
@@ -88,8 +110,10 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 	if entry == nil || entry.owner.Epoch != req.Epoch {
 		return reply, ErrFenced
 	}
-	if e := c.coordinator.Check(ctx, entry.owner); e != nil {
-		return reply, e
+	if !(c.coordinator.leaseReads && req.Operation == "deliver") {
+		if e := c.coordinator.Check(ctx, entry.owner); e != nil {
+			return reply, e
+		}
 	}
 	entry.mu.RLock()
 	defer entry.mu.RUnlock()
@@ -142,7 +166,15 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 	if e != nil {
 		return partitionReply{}, e
 	}
-	if e = c.coordinator.Check(ctx, entry.owner); e != nil {
+	if c.coordinator.leaseReads && req.Operation == "deliver" {
+		if s.graphReplica.writer == nil {
+			return partitionReply{}, ErrFenced
+		}
+		_, _, e = s.graphReplica.writer.snapshot()
+	} else {
+		e = c.coordinator.Check(ctx, entry.owner)
+	}
+	if e != nil {
 		return partitionReply{}, e
 	}
 	return reply, nil

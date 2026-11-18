@@ -50,7 +50,7 @@ func (*backend) SearchContext(context.Context, vector.Search) ([]vector.Hit, err
 	return []vector.Hit{{ID: "a", Revision: 1, Distance: 0}}, nil
 }
 func (*backend) Status(context.Context) (vector.ClusterStatus, error) {
-	return vector.ClusterStatus{IndexReplication: "graph", GraphHeads: map[vector.IndexPartitionID]vector.GraphHead{"index-0000": {Term: 3, Committed: vector.GraphPosition{Sequence: 9007199254740993, DataOffset: 9007199254740994, Hash: "chain"}}}, GraphPositions: map[vector.IndexPartitionID]vector.GraphPosition{"replica": {Sequence: 7, DataOffset: 8, Hash: "old"}}, Ready: true, FailureDomain: "host", Node: vector.ClusterNode{HostID: "host-a", Zone: "zone-a", MemoryBudgetBytes: 1024}, Leader: vector.Ownership{Epoch: 9007199254740993, Phase: "Ready", LastError: "previous failure"}, ReplicaPlans: map[vector.IndexPartitionID]vector.ReplicaPlan{"index-0000": {Version: 7, TaskID: "task-7"}}, LogHeads: map[vector.IndexPartitionID]uint64{"index-0000": 9007199254740993}, ReplicaLag: map[vector.IndexPartitionID]uint64{"replica": 3}, RoutingCooldown: map[string]int64{"node/s": 1000}}, nil
+	return vector.ClusterStatus{IndexReplication: "graph", GraphHeads: map[vector.IndexPartitionID]vector.GraphHead{"index-0000": {SourceEpochs: map[string]uint64{"0": 9007199254740993}, CheckpointSourceEpochs: map[string]uint64{"0": 9007199254740992}, LogBytes: 9007199254740993, CheckpointBytes: 42, CheckpointSources: map[string]uint64{"0": 9007199254740993}, FloorSources: map[string]uint64{"0": 41}, Term: 3, Committed: vector.GraphPosition{Sequence: 9007199254740993, DataOffset: 9007199254740994, Hash: "chain"}}}, GraphPositions: map[vector.IndexPartitionID]vector.GraphPosition{"replica": {Sequence: 7, DataOffset: 8, Hash: "old"}}, Ready: true, FailureDomain: "host", Node: vector.ClusterNode{HostID: "host-a", Zone: "zone-a", MemoryBudgetBytes: 1024}, Leader: vector.Ownership{Epoch: 9007199254740993, Phase: "Ready", LastError: "previous failure"}, ReplicaPlans: map[vector.IndexPartitionID]vector.ReplicaPlan{"index-0000": {Version: 7, TaskID: "task-7"}}, LogHeads: map[vector.IndexPartitionID]uint64{"index-0000": 9007199254740993}, ReplicaLag: map[vector.IndexPartitionID]uint64{"replica": 3}, RoutingCooldown: map[string]int64{"node/s": 1000}}, nil
 }
 func (*backend) Checkpoint(context.Context) (vector.Manifest, error) {
 	return vector.Manifest{Generation: "snapshot", Offset: 9007199254740993, Partitions: map[string]vector.Manifest{"i": {Generation: "child"}}}, nil
@@ -110,7 +110,7 @@ func TestSDKAndGRPC(t *testing.T) {
 		t.Fatalf("%v %v", layout, e)
 	}
 	cluster, e := c.GetCluster(ctx, &pb.Empty{})
-	if e != nil || cluster.IndexReplication != "graph" || cluster.GraphHeads["index-0000"].Committed.Sequence != 9007199254740993 || cluster.GraphPositions["replica"].Hash != "old" || cluster.Leader.Epoch != 9007199254740993 || cluster.FailureDomain != "host" || cluster.Node.HostId != "host-a" || cluster.ReplicaPlans["index-0000"].TaskId != "task-7" || cluster.LogHeads["index-0000"] != 9007199254740993 {
+	if e != nil || cluster.IndexReplication != "graph" || cluster.GraphHeads["index-0000"].SourceEpochs["0"] != 9007199254740993 || cluster.GraphHeads["index-0000"].CheckpointSourceEpochs["0"] != 9007199254740992 || cluster.GraphHeads["index-0000"].LogBytes != 9007199254740993 || cluster.GraphHeads["index-0000"].CheckpointSources["0"] != 9007199254740993 || cluster.GraphHeads["index-0000"].FloorSources["0"] != 41 || cluster.GraphHeads["index-0000"].Committed.Sequence != 9007199254740993 || cluster.GraphPositions["replica"].Hash != "old" || cluster.Leader.Epoch != 9007199254740993 || cluster.FailureDomain != "host" || cluster.Node.HostId != "host-a" || cluster.ReplicaPlans["index-0000"].TaskId != "task-7" || cluster.LogHeads["index-0000"] != 9007199254740993 {
 		t.Fatalf("%v %v", cluster, e)
 	}
 	manifest, e := c.Rebuild(ctx, &pb.Empty{})
@@ -178,6 +178,9 @@ func (*backend) ReadChanges(_ context.Context, q vector.ChangeRequest) (vector.C
 	if q.Stream != "data" && q.Stream != "graph" {
 		return vector.ChangePage{}, vector.ErrInvalidSubscription
 	}
+	if q.Stream == "graph" {
+		return vector.ChangePage{Partition: q.Partition, Stream: q.Stream, Head: 1, Next: 1, Graph: []vector.GraphEntry{{SourceEpochs: map[string]uint64{"0": 9007199254740993}, Payload: &vector.GraphPayload{Size: 2, Chunks: 1, SHA256: "hash"}, PayloadData: []byte("{}"), LogBytes: 9007199254740993, CreatedMS: 1234, Position: vector.GraphPosition{Sequence: 1}, Sources: map[string]uint64{"0": 9007199254740993}}}}, nil
+	}
 	return vector.ChangePage{Partition: q.Partition, Stream: q.Stream, Next: 9007199254740993, Head: 9007199254740993, Data: []vector.LogEvent{{Sequence: 9007199254740993, Record: vector.Record{ID: "a", Revision: 3, Deleted: true}}}}, nil
 }
 func TestChangesGRPC(t *testing.T) {
@@ -189,6 +192,10 @@ func TestChangesGRPC(t *testing.T) {
 	page, e := c.ReadChanges(context.Background(), &pb.ChangeRequest{Partition: "index-0000", Stream: "data", After: 9007199254740992, Limit: 1})
 	if e != nil || page.Next != 9007199254740993 || len(page.Data) != 1 || !page.Data[0].Record.Deleted {
 		t.Fatal(page, e)
+	}
+	graph, e := c.ReadChanges(context.Background(), &pb.ChangeRequest{Partition: "index-0000", Stream: "graph"})
+	if e != nil || len(graph.Graph) != 1 || graph.Graph[0].SourceEpochs["0"] != 9007199254740993 || graph.Graph[0].Sources["0"] != 9007199254740993 || string(graph.Graph[0].PayloadData) != "{}" || graph.Graph[0].Payload.Size != 2 || graph.Graph[0].LogBytes != 9007199254740993 {
+		t.Fatal("graph source watermark lost precision", graph, e)
 	}
 	if _, e = c.ReadChanges(context.Background(), &pb.ChangeRequest{Stream: "bad"}); status.Code(e) != codes.InvalidArgument {
 		t.Fatal(e)

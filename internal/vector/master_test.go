@@ -139,3 +139,42 @@ func TestOpenClusterRejectsInvalidConfigBeforeStorage(t *testing.T) {
 		}
 	}
 }
+
+func TestMasterScheduleRetriesOnlyDefiniteConflictsAndRechecksFence(t *testing.T) {
+	for _, revoke := range []bool{false, true} {
+		f := newGraphFixture(t)
+		calls := 0
+		err := retryMasterSchedule(f.ctx, func(attempt int) error {
+			calls++
+			if attempt == 0 {
+				if revoke {
+					if _, e := f.c.Update(f.ctx, f.master, false, true); e != nil {
+						t.Fatal(e)
+					}
+				}
+				return indexWriteConflict()
+			}
+			return f.c.ScheduleReplicas(f.ctx, f.master, f.layout, nil, 2)
+		})
+		if calls != 2 || (revoke && !errors.Is(err, ErrFenced)) || (!revoke && err != nil) {
+			t.Fatal(calls, err)
+		}
+	}
+	for _, expected := range []error{injected, ErrFenced, ErrConflict} {
+		calls := 0
+		err := retryMasterSchedule(context.Background(), func(int) error { calls++; return expected })
+		if !errors.Is(err, expected) || calls != 1 {
+			t.Fatal(calls, err)
+		}
+	}
+	calls := 0
+	if err := retryMasterSchedule(context.Background(), func(int) error { calls++; return indexWriteConflict() }); err == nil || calls != 4 {
+		t.Fatal(calls, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	calls = 0
+	err := retryMasterSchedule(ctx, func(int) error { calls++; cancel(); return indexWriteConflict() })
+	if !errors.Is(err, context.Canceled) || calls != 1 {
+		t.Fatal(calls, err)
+	}
+}

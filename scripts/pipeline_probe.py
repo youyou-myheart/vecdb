@@ -4,23 +4,37 @@ import json
 import math
 import re
 import time
+import urllib.error
 import urllib.request
 
 SAMPLE = re.compile(r'^(\w+)(?:\{(.*)\})? ([^ ]+)(?: .*)?$')
 LABEL = re.compile(r'(\w+)=("(?:\\.|[^"\\])*")')
+PROGRESS = ('vecdb_graph_local_applied_sequence','vecdb_graph_local_owner_epoch')
 
 
-def parse_metrics(text):
+def parse_metrics(text, *, progress_only=False):
     histograms, queues, applied, applied_epochs, consumers, route_fallbacks, source_signals = {}, {}, {}, {}, {}, {}, {}
+    source_epochs = dict(advances={}, rejections={})
+    index_leases = {}
     for line in text.splitlines():
         if not line or line.startswith('#'): continue
+        # The timed frontier probe needs both gauges from every endpoint. Full
+        # histogram parsing remains in the before/after stage observations.
+        if progress_only and not line.startswith(PROGRESS): continue
         match = SAMPLE.fullmatch(line)
         if not match: raise ValueError('invalid metrics sample')
         name, encoded, value = match.groups()
         labels = {k: json.loads(v) for k,v in LABEL.findall(encoded or '')}
+        if name in PROGRESS:
+            value=int(value)  # These server-owned uint64 gauges use decimal integers.
+            if not 0<=value<=2**64-1 or not labels.get('replica'):
+                raise ValueError('invalid local progress gauge')
+            (applied if name==PROGRESS[0] else applied_epochs)[labels['replica']]=value
+            continue
         value = float(value)
-        if name.startswith('vecdb_pipeline_stage_seconds_') or name.startswith('vecdb_index_batch_records_'):
+        if name.startswith(('vecdb_pipeline_stage_seconds_', 'vecdb_index_batch_records_', 'vecdb_pipeline_batch_items_')):
             stage = labels.get('stage', 'batch_records')
+            if name.startswith('vecdb_pipeline_batch_items_'): stage = 'batch_items_'+stage
             key = stage+'/'+labels['outcome']
             h = histograms.setdefault(key, dict(count=0, sum=0, buckets={}))
             if name.endswith('_count'): h['count'] += value
@@ -29,35 +43,49 @@ def parse_metrics(text):
                 bound = labels['le']; h['buckets'][bound] = h['buckets'].get(bound,0)+value
         elif name.startswith('vecdb_index_queue_'):
             queues.setdefault(labels['replica'], {})[name.removeprefix('vecdb_index_queue_')] = value
-        elif name == 'vecdb_graph_local_applied_sequence':
-            applied[labels['replica']] = int(value)
-        elif name == 'vecdb_graph_local_owner_epoch':
-            applied_epochs[labels['replica']] = int(value)
+        elif name in ('vecdb_index_local_lease_valid', 'vecdb_index_local_lease_remaining_seconds', 'vecdb_index_local_head_ready'):
+            index_leases.setdefault(labels['replica'], {})[name.removeprefix('vecdb_index_local_')] = value
         elif name == 'vecdb_index_consumer_cycles_total':
             consumers.setdefault(labels['index_partition'], {}).setdefault('cycles', {})[labels['reason']] = int(value)
         elif name == 'vecdb_index_consumer_waiting':
             consumers.setdefault(labels['index_partition'], {})['waiting'] = int(value)
         elif name == 'vecdb_graph_commit_conflict_retries_total':
             consumers.setdefault(labels['index_partition'], {})['commit_conflict_retries'] = int(value)
+        elif name == 'vecdb_index_source_epoch_advances_total':
+            source_epochs['advances'].setdefault(labels['index_partition'], {})[labels['source']] = int(value)
+        elif name == 'vecdb_index_source_epoch_rejections_total':
+            source_epochs['rejections'].setdefault(labels['index_partition'], {})[labels['phase']] = int(value)
         elif name == 'vecdb_route_plan_fallback_total':
             route_fallbacks[labels['index_partition']] = int(value)
         elif name == 'vecdb_dispatch_wake_total':
             source_signals.setdefault(labels['data_partition'],{})[labels['reason']] = int(value)
-    return dict(histograms=histograms, queues=queues, applied=applied, applied_epochs=applied_epochs, consumers=consumers, route_fallbacks=route_fallbacks, source_signals=source_signals)
+    return dict(histograms=histograms, queues=queues, applied=applied, applied_epochs=applied_epochs, consumers=consumers, route_fallbacks=route_fallbacks, source_signals=source_signals, source_epochs=source_epochs, index_leases=index_leases)
 
 
-def collect(endpoints, token):
+def collect(endpoints, token, *, progress_only=False):
     def scrape(item):
         node, url = item
         start = time.monotonic()
         req = urllib.request.Request(url+'/metrics?scope=local', headers={'Authorization':'Bearer '+token})
         try:
             with urllib.request.urlopen(req, timeout=2) as response:
-                result = parse_metrics(response.read().decode())
+                text = response.read().decode()
+            received=time.monotonic()
+            result = parse_metrics(text,progress_only=progress_only)
+            result['http_seconds'] = received-start
+            result['parse_seconds'] = time.monotonic()-received
+            result['response_bytes'] = len(text.encode())
+            result['parse_mode'] = 'progress_only' if progress_only else 'full'
             result['scrape_seconds'] = time.monotonic()-start
             return node, result
+        except urllib.error.HTTPError as exc:
+            try: raw=exc.read(8193)
+            finally: exc.close()
+            return node, dict(error='HTTPError',http_status=exc.code,url=url+'/metrics?scope=local',
+                response_body=raw[:8192].decode('utf-8',errors='replace'),body_truncated=len(raw)>8192,
+                scrape_seconds=time.monotonic()-start)
         except (OSError, ValueError) as exc:
-            return node, dict(error=type(exc).__name__)
+            return node, dict(error=type(exc).__name__,error_message=str(exc),url=url+'/metrics?scope=local',scrape_seconds=time.monotonic()-start)
     with ThreadPoolExecutor(max_workers=len(endpoints) or 1) as pool:
         return dict(pool.map(scrape, endpoints.items()))
 

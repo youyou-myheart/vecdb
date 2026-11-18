@@ -11,7 +11,7 @@ import (
 )
 
 // One bounded in-flight batch per source. Only the graph leader drains it;
-// enqueue never waits for construction, object uploads or graph publication.
+// enqueue never waits for construction, object uploads or graph append.
 type routedInput struct {
 	cluster          *ClusterService
 	mu               sync.Mutex
@@ -77,30 +77,22 @@ func (g *graphReplica) enqueue(ctx context.Context, q Delivery) (err error) {
 	defer func() {
 		if err != nil {
 			in.cluster.observations.rejections.Add(1)
+			g.observeSourceEpochRejection("admission", err)
 		}
 	}()
-	tx, e := g.repo.begin()
+	var h GraphHead
+	var e error
+	if g.writer != nil {
+		h, e = g.admitLeased(ctx, q)
+	} else {
+		h, e = g.journal.admitSource(ctx, in.cluster, q)
+	}
 	if e != nil {
 		return e
 	}
-	defer tx.Rollback()
-	if e = g.journal.c.ReplicaFence(g.journal.id, g.journal.owner)(ctx, tx); e != nil {
-		return e
-	}
-	h, e := g.journal.headIn(ctx, tx)
-	if e != nil {
-		return e
-	}
-	if e = in.cluster.validateDelivery(ctx, tx, g.journal.id, q, h.Sources[fmt.Sprint(q.Source)]); e != nil {
-		return e
-	}
-	if q.Through <= h.Sources[fmt.Sprint(q.Source)] {
-		in.cluster.observations.duplicates.Add(1)
-		return nil
-	}
-	if e = in.cluster.validateDeliveryEvents(ctx, tx, g.journal.id, q); e != nil {
-		return e
-	}
+	// A durable epoch barrier is replayable even if admission later encounters
+	// backpressure or the request is an already committed duplicate.
+	in.notify()
 	raw, e := json.Marshal(q)
 	if e != nil {
 		return e
@@ -110,6 +102,14 @@ func (g *graphReplica) enqueue(ctx context.Context, q Delivery) (err error) {
 	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
+	if old := in.queue[q.Source]; old != nil && old.Owner.Epoch < q.Owner.Epoch {
+		in.bytes -= old.bytes
+		delete(in.queue, q.Source)
+	}
+	if q.Through <= h.Sources[fmt.Sprint(q.Source)] {
+		in.cluster.observations.duplicates.Add(1)
+		return nil
+	}
 	if old := in.queue[q.Source]; old != nil {
 		if sameOwner(old.Owner, q.Owner) && old.Previous == q.Previous && old.Through == q.Through {
 			in.cluster.observations.duplicates.Add(1)
@@ -127,7 +127,7 @@ func (g *graphReplica) enqueue(ctx context.Context, q Delivery) (err error) {
 		events[n] = LogEvent{Sequence: event.Sequence, Record: cloneRecord(event.Record)}
 	}
 	q.Events = events
-	// Queue ownership checks are repeated in the durable commit transaction.
+	// The accepted epoch is rechecked in the durable commit transaction.
 	in.queue[q.Source] = &queuedDelivery{Delivery: q, bytes: len(raw), admitted: time.Now()}
 	in.bytes += len(raw)
 	in.cluster.observations.admissions.Add(1)
@@ -165,6 +165,16 @@ func (g *graphReplica) commitRouted(ctx context.Context, s *Service, h GraphHead
 	if len(batch) == 0 {
 		return nil
 	}
+	// Wake every consumed source on failures, including validation failures
+	// before graph construction. A hint never substitutes for durable ACK reads.
+	defer func() {
+		if err != nil {
+			for _, q := range batch {
+				g.input.cluster.signalSource(q.Source, "retry", false)
+			}
+			g.input.notify()
+		}
+	}()
 	p := &g.input.cluster.observations.pipeline
 	partition := string(g.journal.id)
 	count := 0
@@ -179,15 +189,24 @@ func (g *graphReplica) commitRouted(ctx context.Context, s *Service, h GraphHead
 		p.init()
 		p.batch.WithLabelValues(partition, metricOutcome(err)).Observe(float64(count))
 	}()
-	tx, e := g.repo.begin()
-	if e != nil {
-		return e
+	var tx transactionAPI
+	var e error
+	if !g.fastAppend {
+		tx, e = g.repo.begin()
+		if e != nil {
+			return e
+		}
+		defer tx.Rollback()
 	}
-	defer tx.Rollback()
 	var inputs []Delivery
 	var records []Record
 	for _, q := range batch {
-		if e = g.input.cluster.validateDelivery(ctx, tx, g.journal.id, q.Delivery, h.Sources[fmt.Sprint(q.Source)]); e != nil {
+		if g.fastAppend {
+			e = validateAdmitted(h, q.Delivery)
+		} else {
+			e = g.input.cluster.validateDelivery(ctx, tx, g.journal.id, q.Delivery, h)
+		}
+		if e != nil {
 			return e
 		}
 		if q.Through <= h.Sources[fmt.Sprint(q.Source)] {
@@ -201,7 +220,11 @@ func (g *graphReplica) commitRouted(ctx context.Context, s *Service, h GraphHead
 	if len(inputs) == 0 {
 		return nil
 	}
-	return g.commitRecordBatch(ctx, s, h, records, inputs)
+	started := make([]time.Time, 0, len(batch))
+	for _, q := range batch {
+		started = append(started, q.admitted)
+	}
+	return g.commitRecordBatch(ctx, s, h, records, inputs, started...)
 }
 func (g *graphReplica) commitRecords(ctx context.Context, s *Service, h GraphHead, records []Record, q *Delivery) (err error) {
 	var inputs []Delivery
@@ -211,13 +234,13 @@ func (g *graphReplica) commitRecords(ctx context.Context, s *Service, h GraphHea
 	return g.commitRecordBatch(ctx, s, h, records, inputs)
 }
 
-func (g *graphReplica) commitRecordBatch(ctx context.Context, s *Service, h GraphHead, records []Record, inputs []Delivery) (err error) {
+func (g *graphReplica) commitRecordBatch(ctx context.Context, s *Service, h GraphHead, records []Record, inputs []Delivery, admitted ...time.Time) (err error) {
 	defer func() {
 		if err != nil {
 			g.input.notify()
 		}
 	}()
-	// Multiple revisions of one ID in a single unpublished batch collapse to
+	// Multiple revisions of one ID in a single input batch collapse to
 	// the last revision; native deltas contain one new active node per ID.
 	latest := map[string]int{}
 	for i, r := range records {
@@ -231,40 +254,18 @@ func (g *graphReplica) commitRecordBatch(ctx context.Context, s *Service, h Grap
 			compact = append(compact, r)
 		}
 	}
+	for _, started := range admitted {
+		if !started.IsZero() {
+			g.input.cluster.observations.pipeline.observe("index_queue_to_build", string(g.journal.id), time.Since(started), nil)
+		}
+	}
 	build := g.track("graph_build")
 	delta, e := s.Index.GenerateDelta(compact)
 	build(&e)
 	if e != nil {
 		return e
 	}
-	encode := g.track("graph_encode")
-	raw, e := json.Marshal(delta)
-	encode(&e)
-	if e != nil {
-		return e
-	}
-	m, e := g.saveBlob(ctx, deltaFormat, raw)
-	if e != nil {
-		return e
-	}
-	commit := g.track("graph_commit")
-	e = retryIndexCommit(ctx, func() error {
-		measure := g.track("graph_commit_attempt")
-		_, err := g.journal.commitInputs(ctx, h, h.Committed.DataOffset+1, "delta", m, inputs, g.input.cluster)
-		measure(&err)
-		return err
-	}, func() {
-		p := &g.input.cluster.observations.pipeline
-		p.init()
-		p.commitRetries.WithLabelValues(string(g.journal.id)).Inc()
-	})
-	commit(&e)
-	for _, q := range inputs {
-		// A hint, never an ACK: the source re-reads its durable watermarks.
-		// Unknown commit outcomes also deserve a prompt durable-state check.
-		g.input.cluster.signalSource(q.Source, "graph_commit", false)
-	}
-	return e
+	return g.appendDelta(ctx, s, h, h.Committed.DataOffset+1, delta, inputs)
 }
 
 // Scan authoritative records in bounded pages. Only remove stale local versions
@@ -272,7 +273,7 @@ func (g *graphReplica) commitRecordBatch(ctx context.Context, s *Service, h Grap
 // with ingestion and replicated as graph deltas, never edited on one replica only.
 func (g *graphReplica) scrub(ctx context.Context, s *Service) error {
 	c := g.input.cluster
-	h, e := g.journal.Head(ctx)
+	h, e := g.readHead(ctx)
 	if e != nil {
 		return e
 	}
@@ -286,7 +287,7 @@ func (g *graphReplica) scrub(ctx context.Context, s *Service) error {
 	if e = g.sync(ctx, s, false); e != nil {
 		return e
 	}
-	h, e = g.journal.Head(ctx)
+	h, e = g.readHead(ctx)
 	if e != nil {
 		return e
 	}
@@ -311,7 +312,16 @@ func (g *graphReplica) scrub(ctx context.Context, s *Service) error {
 	}
 	s.Index.mu.RUnlock()
 	if len(removes) > 0 {
-		if e = g.commitRecords(ctx, s, h, removes, nil); e != nil {
+		if g.writer != nil {
+			g.writer.op.Lock()
+			g.writer.invalidate()
+		}
+		e = g.commitRecords(ctx, s, h, removes, nil)
+		if g.writer != nil {
+			g.writer.op.Unlock()
+			g.input.notify()
+		}
+		if e != nil {
 			return e
 		}
 		c.observations.scrubRemoved.Add(uint64(len(removes)))

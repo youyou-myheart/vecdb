@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/rand"
 	"strings"
+	"time"
 
 	tikverr "github.com/tikv/client-go/v2/error"
 )
@@ -111,6 +113,7 @@ func (c *Coordinator) Schedule(ctx context.Context, leader Ownership, layout Par
 }
 
 type Master struct {
+	metrics     *pipelineMetrics
 	replicas    int
 	coordinator *Coordinator
 	node        ClusterNode
@@ -136,7 +139,17 @@ func (m *Master) Tick(ctx context.Context, nodes []ClusterNode) error {
 		return e
 	}
 	if m.replicas > 1 {
-		if e = m.coordinator.ScheduleReplicas(ctx, leader, m.layout, nodes, m.replicas); e != nil {
+		if e = retryMasterSchedule(ctx, func(attempt int) (err error) {
+			if m.metrics != nil {
+				defer m.metrics.track("master_schedule_attempt", "")(&err)
+			}
+			// Refresh nodes as well as fences/plans after a definite conflict.
+			current := nodes
+			if attempt > 0 {
+				current = nil
+			}
+			return m.coordinator.ScheduleReplicas(ctx, leader, m.layout, current, m.replicas)
+		}); e != nil {
 			return e
 		}
 		if m.layout.Routing != nil {
@@ -155,4 +168,22 @@ func (m *Master) Tick(ctx context.Context, nodes []ClusterNode) error {
 		return nil
 	}
 	return m.coordinator.Schedule(ctx, leader, m.layout, nodes)
+}
+
+// Master and Worker heartbeats can remain phase-aligned for many ticks. A
+// scheduling write conflict must get a fresh bounded chance within this tick;
+// waiting only for the next identical heartbeat can starve a drain forever.
+func retryMasterSchedule(ctx context.Context, schedule func(int) error) error {
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := schedule(attempt)
+		if !tikverr.IsErrWriteConflict(err) || attempt >= 3 {
+			return err
+		}
+		if !waitIndexRetry(ctx, time.Duration(5+rand.Intn(16))*time.Millisecond) {
+			return ctx.Err()
+		}
+	}
 }

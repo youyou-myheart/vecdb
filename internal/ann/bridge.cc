@@ -15,6 +15,7 @@ struct Index {
 };
 static char* fail(const std::exception& e){return strdup(e.what());}
 extern "C" {
+char* ann_vector(void*p,uint64_t label,float*out){try{auto&x=*static_cast<Index*>(p);std::shared_lock<std::shared_timed_mutex>lock(x.mu);auto found=x.graph->label_lookup_.find(label);if(found==x.graph->label_lookup_.end())throw std::runtime_error("missing patch vector label");memcpy(out,x.graph->getDataByInternalId(found->second),x.graph->data_size_);return nullptr;}catch(const std::exception&e){return fail(e);}}
 void* ann_new(int d,int m,int ef,char** error){try{return new Index(d,m,ef);}catch(const std::exception& e){*error=fail(e);return nullptr;}}
 void ann_free(void* p){delete static_cast<Index*>(p);}
 char* ann_add(void* p,uint64_t id,const float* v){try{auto& x=*static_cast<Index*>(p);std::unique_lock<std::shared_timed_mutex> lock(x.mu);if(x.capture && x.graph->label_lookup_.count(id))throw std::runtime_error("journal requires new labels");if(x.graph->cur_element_count==x.graph->max_elements_)x.graph->resizeIndex(x.graph->max_elements_*2);x.graph->addPoint(v,id);return nullptr;}catch(const std::exception& e){return fail(e);}}

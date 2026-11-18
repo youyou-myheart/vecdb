@@ -5,13 +5,33 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from capacity_explore import ClusteredData, recall_result
+from capacity_explore import ClusteredData, recall_result, retirement_ready, hot_source_ids
 from onebox_e2e import Oracle
 from resource_guard import GIB, ResourceGuard, clean_owned_state, host_sample, limit_reason, tree_bytes
 from visibility_probe import target_index
 
 
 class CapacityExplorationTest(unittest.TestCase):
+    def test_burst_has_distinct_ids_in_one_data_partition_and_preserves_anchors(self):
+        import hashlib
+        source,ids=hot_source_ids(2000,32)
+        self.assertEqual(len(set(ids)),32)
+        self.assertTrue(all(n<2000-128 for n in ids))
+        self.assertEqual({int.from_bytes(hashlib.sha256(f'v-{n:04d}'.encode()).digest()[:8],'big')%16 for n in ids},{source})
+        self.assertEqual(hot_source_ids(2000,32),(source,ids))
+        with self.assertRaises(ValueError): hot_source_ids(640,64)
+
+    def test_plan_removal_does_not_prove_local_retirement(self):
+        old=dict(partition='old',node='worker')
+        state=dict(fully_replicated=True,replica_owners={'index':dict(owners=[dict(partition='new')])})
+        local={'worker':dict(applied_epochs={'old':1})}
+        self.assertFalse(retirement_ready(state,local,'index',old))
+        self.assertFalse(retirement_ready(state,{},'index',old))
+        local['worker']['applied_epochs'].clear()
+        self.assertTrue(retirement_ready(state,local,'index',old))
+        state['replica_owners']['index']['owners'].append(old)
+        self.assertFalse(retirement_ready(state,local,'index',old))
+
     def test_dense_data_reproducible_routed_and_high_dimensional(self):
         for dimension in (16,64,256):
             data=ClusteredData(dimension,20261117)
