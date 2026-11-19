@@ -7,6 +7,8 @@ import (
 
 // Estimated vector/graph storage and query wall-time, not process RSS or CPU.
 type ShardLoad struct {
+	LiveRecords    uint64  `json:"live_records"`
+	RecordsKnown   bool    `json:"records_known"`
 	EstimatedBytes uint64  `json:"estimated_bytes"`
 	Busy           float64 `json:"busy"`
 }
@@ -28,7 +30,7 @@ func (c *ClusterService) sampleLoad() map[string]ShardLoad {
 			busy := float64(entry.queryNanos.Swap(0)) / 1e9 / elapsed
 			id := strings.SplitN(string(entry.owner.Partition), "~", 2)[0]
 			prior := c.lastLoad[id]
-			result[id] = ShardLoad{EstimatedBytes: bytes, Busy: .25*busy + .75*prior.Busy}
+			result[id] = ShardLoad{EstimatedBytes: bytes, Busy: .25*busy + .75*prior.Busy, LiveRecords: max(uint64(stats.Live), result[id].LiveRecords), RecordsKnown: true}
 		}
 		entry.mu.RUnlock()
 	}

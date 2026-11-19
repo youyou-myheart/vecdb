@@ -84,8 +84,26 @@ func (c *ClusterService) notifySourceLoop(ctx context.Context) {
 	}
 }
 
-func (c *ClusterService) notifySource(ctx context.Context, id DataPartitionID) error {
-	owner, err := c.coordinator.Resolve(ctx, sourceID(id))
+func (c *ClusterService) notifySource(ctx context.Context, id DataPartitionID) (err error) {
+	var owner Ownership
+	var state *ClusterStatus
+	defer func() {
+		if err != nil && state != nil {
+			c.expireSearchRoutes(state)
+		}
+	}()
+	if c.routeHintsEnabled() {
+		state, err = c.cachedSearchRoutes(ctx, false)
+		if err == nil {
+			owner = state.Owners[sourceID(id)]
+			if owner.Epoch == 0 {
+				c.expireSearchRoutes(state)
+				return ErrPartitionUnavailable
+			}
+		}
+	} else {
+		owner, err = c.coordinator.Resolve(ctx, sourceID(id))
+	}
 	if err != nil {
 		return err
 	}

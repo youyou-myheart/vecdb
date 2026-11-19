@@ -21,6 +21,9 @@ type remotePartition struct {
 
 func (p *remotePartition) call(ctx context.Context, op string, q Search) (partitionReply, error) {
 	c := p.cluster
+	if c.routeHintsEnabled() && cachedRouteOperation(op) {
+		return p.cachedRoutedCall(ctx, op, q, nil)
+	}
 	if c.replicas > 1 {
 		return p.replicaCall(ctx, op, q)
 	}
@@ -121,6 +124,9 @@ func (p *remotePartition) Rebuild(ctx context.Context) error {
 func (p *remotePartition) MaybeRebuild(ctx context.Context) error { return nil }
 
 func (p *remotePartition) replicaCall(ctx context.Context, op string, q Search) (partitionReply, error) {
+	if p.cluster.routeHintsEnabled() && cachedRouteOperation(op) {
+		return p.cachedRoutedCall(ctx, op, q, nil)
+	}
 	if p.cluster.graphReplication && (op == "search" || op == "sync") {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, 5*time.Second)

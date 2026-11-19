@@ -39,9 +39,15 @@ func (w *indexWriter) snapshot() (GraphHead, []byte, error) {
 	return cloneGraphHead(w.head), w.lease.token(), nil
 }
 func (w *indexWriter) authority(token []byte) error {
+	return w.appendAuthority(token, nil)
+}
+func (w *indexWriter) appendAuthority(token []byte, tx transactionAPI) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.retired || !time.Now().Before(w.deadline) || string(token) != string(w.lease.token()) {
+		return ErrFenced
+	}
+	if tx != nil && txnMillis(tx) >= w.lease.Expires {
 		return ErrFenced
 	}
 	return nil
@@ -289,7 +295,7 @@ func (g *graphReplica) admitLeased(ctx context.Context, q Delivery) (GraphHead, 
 		g.input.notify()
 		return h, ErrConflict
 	}
-	next, err := g.journal.admitSourceCached(ctx, g.input.cluster, q, h, token, func() error { return w.authority(token) })
+	next, err := g.journal.admitSourceCached(ctx, g.input.cluster, q, h, token, w)
 	if err != nil {
 		w.invalidate()
 		g.input.notify()

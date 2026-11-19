@@ -54,7 +54,10 @@ func (c *ClusterService) FollowerSearch(ctx context.Context, q Search) (Follower
 	}
 	ctx, cancel := context.WithTimeout(ctx, followerReadTimeout)
 	defer cancel()
-	ids := c.router.QueryIndexes(q)
+	ids, routeErr := c.PartitionedService.queryIndexes(q)
+	if routeErr != nil {
+		return FollowerSearchResult{}, routeErr
+	}
 	replies := make([]partitionReply, len(ids))
 	errs := make([]error, len(ids))
 	var wg sync.WaitGroup
@@ -88,6 +91,7 @@ func (c *ClusterService) FollowerSearch(ctx context.Context, q Search) (Follower
 		result.Hits = append(result.Hits, r.Hits...)
 		result.FollowerReads = append(result.FollowerReads, *r.FollowerRead)
 	}
+	result.Hits = deduplicateHits(result.Hits)
 	sort.Slice(result.Hits, func(i, j int) bool {
 		if result.Hits[i].Distance == result.Hits[j].Distance {
 			return result.Hits[i].ID < result.Hits[j].ID
@@ -101,6 +105,9 @@ func (c *ClusterService) FollowerSearch(ctx context.Context, q Search) (Follower
 }
 
 func (p *remotePartition) followerCall(ctx context.Context, q Search) (partitionReply, error) {
+	if p.cluster.routeHintsEnabled() {
+		return p.cachedRoutedCall(ctx, "follower_search", q, nil)
+	}
 	last := error(ErrPartitionUnavailable)
 	for round := 0; round < 2; round++ {
 		plan, err := p.routingPlan(ctx, "follower_search")

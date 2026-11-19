@@ -14,8 +14,8 @@ func (c *Coordinator) writeGuardKey(id IndexPartitionID) []byte {
 }
 func epochToken(epoch uint64) []byte { return strconv.AppendUint(nil, epoch, 10) }
 
-// Acquire has already fenced earlier append transactions. Only this worker may
-// allocate log positions from the snapshot taken after acquiring this epoch.
+// The snapshot after Acquire observes all older commits or their prewrite locks.
+// Only this worker allocates log positions until its confirmed lease expires.
 func (c *ClusterService) recoverWriter(ctx context.Context, id DataPartitionID, o Ownership) (_ *mutationGroup, err error) {
 	defer c.observations.pipeline.track("data_writer_recover", string(o.Partition))(&err)
 	repo := c.data[id]
@@ -28,7 +28,8 @@ func (c *ClusterService) recoverWriter(ctx context.Context, id DataPartitionID, 
 	if err != nil {
 		return nil, err
 	}
-	lease := &appendLease{owner: o, guard: c.coordinator.writeGuardKey(o.Partition), token: epochToken(o.Epoch)}
+	lease := &appendLease{owner: o, guard: c.coordinator.writeGuardKey(o.Partition), token: epochToken(o.Epoch),
+		boundCommitTS: c.coordinator.holdReleasedLeases}
 	lease.head.Store(head)
 	group := newMutationGroup(c.runCtx, repo, &c.observations.pipeline, string(o.Partition))
 	group.lease = lease
@@ -63,13 +64,21 @@ func (c *ClusterService) MutateOwned(ctx context.Context, namespace string, d Da
 		return Record{}, ErrFenced
 	}
 	defer c.observations.pipeline.track("data_owner_mutate", string(sourceID(d)))(&err)
+	group, err := c.localDataWriter(d, epoch, session)
+	if err != nil {
+		return Record{}, err
+	}
+	return group.mutate(ctx, id, m, deleted)
+}
+
+func (c *ClusterService) localDataWriter(d DataPartitionID, epoch uint64, session string) (*mutationGroup, error) {
 	c.writerMu.RLock()
 	group := c.writers[d]
 	c.writerMu.RUnlock()
-	if group == nil || group.lease.owner.Epoch != epoch || group.lease.owner.Session != session {
-		return Record{}, ErrFenced
+	if group == nil || group.lease.owner.Epoch != epoch || group.lease.owner.Session != session || group.lease.activeGrant() == nil {
+		return nil, ErrFenced
 	}
-	return group.mutate(ctx, id, m, deleted)
+	return group, nil
 }
 func (c *ClusterService) WriteNamespace() string { return c.root.Prefix }
 func (c *ClusterService) routeMutation(ctx context.Context, d DataPartitionID, id string, m Mutation, deleted bool) (Record, error) {

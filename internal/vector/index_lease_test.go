@@ -31,7 +31,7 @@ func leasedFixture(t *testing.T) (*graphFixture, *ClusterService, Ownership) {
 }
 
 // Count actual transaction operations, not just calls to the public Head API.
-// KV reads for immutable source data and the storage write guard remain allowed.
+// KV reads for immutable source data remain allowed.
 type noControlReadsTx struct {
 	transactionAPI
 	t *testing.T
@@ -39,7 +39,7 @@ type noControlReadsTx struct {
 
 func (x noControlReadsTx) Get(ctx context.Context, key []byte) ([]byte, error) {
 	k := string(key)
-	if strings.Contains(k, "cluster/owners/") || strings.Contains(k, "cluster/replica-plans/") || strings.HasSuffix(k, "/head") || strings.Contains(k, "cluster/fences/") {
+	if strings.Contains(k, "cluster/owners/") || strings.Contains(k, "cluster/replica-plans/") || strings.HasSuffix(k, "/head") || strings.Contains(k, "cluster/fences/") || strings.Contains(k, "cluster/index-guards/") {
 		x.t.Fatalf("hot path control read: %s", k)
 	}
 	return x.transactionAPI.Get(ctx, key)

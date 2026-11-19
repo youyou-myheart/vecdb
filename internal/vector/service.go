@@ -216,6 +216,9 @@ func (s *Service) MaybeRebuild(ctx context.Context) error {
 			return e
 		}
 	}
+	if s.graphReplica != nil && !s.Index.NeedsRebuild() {
+		return nil
+	}
 	if s.graphReplica != nil {
 		p, e := s.graphReplica.journal.c.Plan(ctx, s.graphReplica.journal.id)
 		if e != nil {

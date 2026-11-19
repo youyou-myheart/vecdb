@@ -27,12 +27,15 @@ type Token struct {
 	Revision uint64 `json:"revision"`
 }
 type Search struct {
-	Exact      bool              `json:"exact,omitempty"`
-	EFSearch   int               `json:"ef_search,omitempty"`
-	Vector     []float64         `json:"vector"`
-	K          int               `json:"k"`
-	Filter     map[string]string `json:"filter"`
-	MinVisible *Token            `json:"min_visible,omitempty"`
+	visibilityIndex IndexPartitionID
+	visibilityAll   bool
+	IndexPartitions []IndexPartitionID `json:"index_partitions,omitempty"`
+	Exact           bool               `json:"exact,omitempty"`
+	EFSearch        int                `json:"ef_search,omitempty"`
+	Vector          []float64          `json:"vector"`
+	K               int                `json:"k"`
+	Filter          map[string]string  `json:"filter"`
+	MinVisible      *Token             `json:"min_visible,omitempty"`
 }
 type Hit struct {
 	ID       string            `json:"id"`

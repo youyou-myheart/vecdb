@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type localPartition struct {
+	readLease       atomic.Pointer[replicaReadLease]
+	readRetired     atomic.Bool
 	cancel          context.CancelFunc
 	loadDone        chan struct{}
 	lastGraphReport atomic.Pointer[replicaGraphReport]
@@ -37,6 +40,7 @@ func (c *ClusterService) remove(entry *localPartition) {
 		return
 	}
 	delete(c.locals, entry.owner.Partition)
+	entry.retireReads()
 	c.retirementWG.Add(1)
 	c.mu.Unlock()
 	if entry.cancel != nil {
@@ -133,11 +137,14 @@ func (c *ClusterService) load(ctx context.Context, b PartitionBinding, entry *lo
 	entry.service = service
 	entry.mu.Unlock()
 	started := time.Now()
-	if _, e = c.coordinator.Update(ctx, entry.owner, true, false); e != nil && errors.Is(e, ErrFenced) {
+	if renewed, updateErr := c.coordinator.Update(ctx, entry.owner, true, false); updateErr != nil && errors.Is(updateErr, ErrFenced) {
 		c.remove(entry)
-	} else if e == nil && service.graphReplica != nil && service.graphReplica.writer != nil {
-		if current, err := c.coordinator.Plan(ctx, b.Index); err == nil {
-			_ = service.graphReplica.refreshLease(ctx, current, started)
+	} else if updateErr == nil {
+		entry.grantReadLease(started, renewed, time.Duration(c.coordinator.ttl)*time.Millisecond)
+		if service.graphReplica != nil && service.graphReplica.writer != nil {
+			if current, err := c.coordinator.Plan(ctx, b.Index); err == nil {
+				_ = service.graphReplica.refreshLease(ctx, current, started)
+			}
 		}
 	}
 }
@@ -157,6 +164,7 @@ func (c *ClusterService) SyncOwned(ctx context.Context) (err error) {
 		entry.mu.RUnlock()
 		if err != nil {
 			if errors.Is(err, ErrGraphCorrupt) {
+				entry.retireReads()
 				_, _ = c.coordinator.Update(ctx, entry.owner, false, true)
 				c.remove(entry)
 			}
@@ -217,6 +225,7 @@ func (entry *localPartition) reportGraphProgress(ctx context.Context, j graphJou
 }
 
 func (c *ClusterService) replicaTick(ctx context.Context) {
+	checkedPlans := map[IndexPartitionID]bool{}
 	allowed := map[IndexPartitionID]PartitionBinding{}
 	versions := map[IndexPartitionID]uint64{}
 	publishers := map[IndexPartitionID]IndexPartitionID{}
@@ -226,6 +235,7 @@ func (c *ClusterService) replicaTick(ctx context.Context) {
 		if e != nil {
 			continue
 		}
+		checkedPlans[b.Index] = true
 		for _, a := range p.Serving {
 			if a.Node == c.node.ID && a.Session == c.node.Session {
 				allowed[a.Partition] = b
@@ -237,8 +247,18 @@ func (c *ClusterService) replicaTick(ctx context.Context) {
 	}
 	for _, entry := range c.entries() {
 		if _, ok := allowed[entry.owner.Partition]; !ok {
-			_, e := c.coordinator.Update(ctx, entry.owner, false, true)
-			if e == nil || errors.Is(e, ErrFenced) {
+			logical := IndexPartitionID(strings.SplitN(string(entry.owner.Partition), "~", 2)[0])
+			if c.localReadLeases() && !checkedPlans[logical] {
+				// An unreadable plan is not a retirement decision. Do not renew
+				// authority; the previously confirmed local lease still expires.
+				continue
+			}
+			leased := c.localReadLeases()
+			if leased {
+				entry.retireReads()
+			}
+			_, releaseErr := c.coordinator.Update(ctx, entry.owner, false, true)
+			if leased || releaseErr == nil || errors.Is(releaseErr, ErrFenced) {
 				c.remove(entry)
 			}
 			continue
@@ -269,6 +289,7 @@ func (c *ClusterService) replicaTick(ctx context.Context) {
 		if renewed, e := c.coordinator.Update(ctx, entry.owner, ready, false); errors.Is(e, ErrFenced) {
 			c.remove(entry)
 		} else if e == nil && ready {
+			entry.grantReadLease(started, renewed, time.Duration(c.coordinator.ttl)*time.Millisecond)
 			entry.mu.RLock()
 			if entry.service != nil && entry.service.graphReplica != nil {
 				_ = entry.service.graphReplica.refreshLease(ctx, plans[entry.owner.Partition], started)

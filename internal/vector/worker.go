@@ -3,6 +3,7 @@ package vector
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // Worker follows durable master intent. It never computes placement itself.
@@ -20,7 +21,12 @@ func (w *Worker) Tick(ctx context.Context) {
 			continue
 		}
 		if a.Node != c.node.ID || a.Session != c.node.Session {
-			if _, e = c.coordinator.Update(ctx, entry.owner, false, true); e == nil || errors.Is(e, ErrFenced) {
+			leased := c.localReadLeases()
+			if leased {
+				entry.retireReads()
+			}
+			_, releaseErr := c.coordinator.Update(ctx, entry.owner, false, true)
+			if leased || releaseErr == nil || errors.Is(releaseErr, ErrFenced) {
 				c.remove(entry)
 			}
 			continue
@@ -28,8 +34,11 @@ func (w *Worker) Tick(ctx context.Context) {
 		entry.mu.RLock()
 		ready := entry.service != nil
 		entry.mu.RUnlock()
-		if _, e = c.coordinator.Update(ctx, entry.owner, ready, false); e != nil && errors.Is(e, ErrFenced) {
+		started := time.Now()
+		if renewed, updateErr := c.coordinator.Update(ctx, entry.owner, ready, false); updateErr != nil && errors.Is(updateErr, ErrFenced) {
 			c.remove(entry)
+		} else if updateErr == nil && ready {
+			entry.grantReadLease(started, renewed, time.Duration(c.coordinator.ttl)*time.Millisecond)
 		}
 	}
 	for _, b := range c.layout.Bindings {

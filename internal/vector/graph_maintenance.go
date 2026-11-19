@@ -60,7 +60,19 @@ func (c *ClusterService) runGraphMaintenance(ctx context.Context, entry *localPa
 				return
 			}
 			g := s.graphReplica
-			plan, err := c.coordinator.Plan(ctx, g.journal.id)
+			// A role hint only: checkpoint/GC still enforce ReplicaFence in
+			// their changing transaction, including the current publisher.
+			var plan ReplicaPlan
+			var err error
+			if c.routeHintsEnabled() {
+				var state *ClusterStatus
+				state, err = c.cachedSearchRoutes(ctx, false)
+				if err == nil {
+					plan = state.ReplicaPlans[g.journal.id]
+				}
+			} else {
+				plan, err = c.coordinator.Plan(ctx, g.journal.id)
+			}
 			if err != nil || plan.Publisher != entry.owner.Partition {
 				return
 			}

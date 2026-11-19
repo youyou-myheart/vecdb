@@ -53,7 +53,7 @@ func (g *graphReplica) appendDelta(ctx context.Context, s *Service, h GraphHead,
 			if e != nil {
 				return e
 			}
-			entry, err = g.journal.commitWithAuthority(ctx, h, offset, "delta", m, inputs, cluster, raw, token, func() error { return g.writer.authority(token) })
+			entry, err = g.journal.commitWithAuthority(ctx, h, offset, "delta", m, inputs, cluster, raw, token, g.writer)
 		} else if g.journal.c.referenceLogs {
 			entry, err = g.journal.commitPayload(ctx, h, offset, "delta", m, inputs, cluster, raw)
 		} else {

@@ -194,7 +194,7 @@ func (j graphJournal) commitInputs(ctx context.Context, base GraphHead, offset u
 func (j graphJournal) commitPayload(ctx context.Context, base GraphHead, offset uint64, kind string, object Manifest, inputs []Delivery, cluster *ClusterService, payload []byte) (GraphEntry, error) {
 	return j.commitWithAuthority(ctx, base, offset, kind, object, inputs, cluster, payload, nil, nil)
 }
-func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, offset uint64, kind string, object Manifest, inputs []Delivery, cluster *ClusterService, payload []byte, token []byte, check func() error) (GraphEntry, error) {
+func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, offset uint64, kind string, object Manifest, inputs []Delivery, cluster *ClusterService, payload []byte, token []byte, writer *indexWriter) (GraphEntry, error) {
 	var entry GraphEntry
 	tx, e := j.c.root.begin()
 	if e != nil {
@@ -209,16 +209,19 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 		native.SetEnable1PC(true)
 	}
 	var h GraphHead
-	if check == nil {
+	if writer == nil {
 		if e = j.c.ReplicaFence(j.id, j.owner)(ctx, tx); e != nil {
 			return entry, e
 		}
 		h, e = j.headIn(ctx, tx)
 	} else {
 		h = cloneGraphHead(base)
-		e = check()
+		e = writer.appendAuthority(token, tx)
 		if e == nil {
-			e = j.c.fenceIndexGuard(ctx, tx, j.id, token)
+			// A takeover cannot change the guard until the durable lease
+			// expires. The timestamp check rules out snapshots after expiry;
+			// this write serializes an already-started commit with takeover.
+			e = tx.Set(j.c.indexGuardKey(j.id), token)
 		}
 	}
 	if e != nil {
@@ -239,7 +242,7 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 		return entry, errors.New("reference delta requires a TiKV payload; reset requires an object")
 	}
 	for _, input := range inputs {
-		if check == nil {
+		if writer == nil {
 			e = cluster.validateDelivery(ctx, tx, j.id, input, h)
 		} else {
 			e = validateAdmitted(h, input)
@@ -286,8 +289,8 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 	if e = putJSON(tx, key, entry); e != nil {
 		return entry, e
 	}
-	if check != nil {
-		if e = check(); e != nil {
+	if writer != nil {
+		if e = writer.authority(token); e != nil {
 			return entry, e
 		}
 	}

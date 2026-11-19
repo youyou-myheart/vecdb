@@ -193,7 +193,7 @@ func (c *ClusterService) reconcileDispatcher(ctx context.Context, id DataPartiti
 	}
 	s.owner = o
 	s.deadline = leaseDeadline(started, time.Duration(c.coordinator.ttl)*time.Millisecond)
-	s.writer.lease.expires.Store(o.Expires)
+	s.writer.lease.grant.Store(&appendGrant{deadline: s.deadline, expires: o.Expires})
 	c.dispatchers[id] = s
 	c.writerMu.Lock()
 	c.writers[id] = s.writer
@@ -401,6 +401,11 @@ func (c *ClusterService) deliver(ctx context.Context, id IndexPartitionID, q Del
 			c.observations.deliveryErrors.Add(1)
 		}
 	}()
+	if c.routeHintsEnabled() {
+		p := remotePartition{cluster: c, id: id}
+		_, err = p.cachedRoutedCall(ctx, "deliver", Search{}, &q)
+		return err
+	}
 	plan, e := c.coordinator.Plan(ctx, id)
 	if e != nil {
 		return e

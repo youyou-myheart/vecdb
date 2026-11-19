@@ -1,19 +1,23 @@
 """Typed gRPC SDK. Responses are generated Protobuf messages; errors are grpc.RpcError."""
 import hashlib
+import math
 import threading
 import time
 
 import grpc
 from .v1 import vector_pb2 as messages
 from .v1.vector_pb2_grpc import VectorStoreStub
+from .query_route import ranked_partitions, initial_fanout
 
 
 class Client:
-    def __init__(self, target, token, *, timeout=30.0, tls=False, root_certificates=None):
+    def __init__(self, target, token, *, timeout=30.0, tls=False, root_certificates=None, search_refresh_interval=5.0):
         if not target or not token or timeout <= 0:
             raise ValueError('target, token and positive timeout required')
         if root_certificates is not None and not tls:
             raise ValueError('root_certificates requires tls=True')
+        if not math.isfinite(search_refresh_interval) or search_refresh_interval <= 0:
+            raise ValueError('search_refresh_interval must be positive')
         options = [('grpc.max_receive_message_length', 64 << 20),
                    ('grpc.max_send_message_length', 1 << 20),
                    ('grpc.enable_retries', 0)]
@@ -29,8 +33,19 @@ class Client:
         self.stub = VectorStoreStub(self.channel)
         self.timeout = timeout
         self.metadata = (('authorization', 'Bearer ' + token),)
+        self._search_refresh_interval = search_refresh_interval
+        self._search_snapshot = None
+        self._search_refresh_lock = threading.Lock()
+        self._search_stop = threading.Event()
+        self._search_thread = None
 
     def close(self):
+        self._search_stop.set()
+        with self._lock:
+            self._closed = True
+            thread = self._search_thread
+        if thread is not None:
+            thread.join()
         with self._lock:
             self._closed = True
             for entry in self._routes.values():
@@ -146,9 +161,77 @@ class Client:
             if not cursor:
                 return
 
-    def search(self, vector, *, k=10, filter=None, exact=False, ef_search=0, min_visible=None, timeout=None):
-        return self._call(self.stub.Search, messages.SearchRequest(vector=vector, k=k, filter=filter or {},
-            exact=exact, ef_search=ef_search, min_visible=min_visible), timeout)
+    def _refresh_search_routes(self, timeout):
+        try:
+            state = self._call(self.stub.GetSearchRoutes, messages.Empty(), min(timeout, 2.0))
+        except grpc.RpcError as error:
+            if error.code() != grpc.StatusCode.UNIMPLEMENTED:
+                return
+            try:
+                state = self._call(self.stub.GetCluster, messages.Empty(), min(timeout, 2.0))
+            except grpc.RpcError:
+                return
+        if isinstance(state, messages.ClusterStatus):
+            with self._lock:
+                self._search_snapshot = (state, time.monotonic())
+
+    def _search_refresh_loop(self):
+        while not self._search_stop.wait(self._search_refresh_interval):
+            self._refresh_search_routes(self.timeout)
+
+    def _search_routes(self, vector, timeout):
+        with self._search_refresh_lock:
+            with self._lock:
+                if self._closed:
+                    raise ValueError('client is closed')
+                first = self._search_thread is None
+            if first:
+                self._refresh_search_routes(timeout)
+                with self._lock:
+                    if not self._closed:
+                        self._search_thread = threading.Thread(target=self._search_refresh_loop, daemon=True)
+                        self._search_thread.start()
+            with self._lock:
+                snapshot = self._search_snapshot
+        if snapshot is None or time.monotonic()-snapshot[1] > max(30, 3*self._search_refresh_interval):
+            return []
+        return ranked_partitions(snapshot[0], vector)
+
+    def search(self, vector, *, k=10, filter=None, exact=False, ef_search=0, min_visible=None,
+               timeout=None, all_partitions=False, index_partitions=None):
+        """Search an eventual index view; nearest clusters are approximate.
+
+        exact=True/all_partitions=True scans all shards. No candidate TiKV reads.
+        Explicit index_partitions restricts exactness to those partitions.
+        """
+        duration = self.timeout if timeout is None else timeout
+        if duration <= 0:
+            raise ValueError('timeout must be positive')
+        deadline = time.monotonic()+duration
+        request = messages.SearchRequest(vector=vector, k=k, filter=filter or {},
+            exact=exact, ef_search=ef_search, min_visible=min_visible,
+            index_partitions=index_partitions or [])
+        ranked = []
+        if not (exact or all_partitions or min_visible or index_partitions):
+            ranked = self._search_routes(vector, duration)
+        count = initial_fanout(ranked, k)
+        while True:
+            if ranked:
+                del request.index_partitions[:]
+                request.index_partitions.extend(row[1] for row in ranked[:count])
+            result = self._call(self.stub.Search, request, max(deadline-time.monotonic(), 1e-9))
+            if not ranked or len(result.hits) >= k or count == len(ranked):
+                return result
+            count += 1  # Filters, moves and stale counts can reduce actual hits.
+
+    def search_by_id(self, id, *, timeout=None, **options):
+        """Read A's vector through Get (TiKV), then route a similarity search."""
+        duration = self.timeout if timeout is None else timeout
+        deadline = time.monotonic()+duration
+        record = self.get(id, timeout=duration)
+        if record.deleted:
+            raise ValueError('query record is deleted')
+        return self.search(record.vector, timeout=max(deadline-time.monotonic(), 1e-9), **options)
 
     def health(self, *, timeout=None):
         return self._call(self.stub.Health, messages.Empty(), timeout)

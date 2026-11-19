@@ -34,7 +34,7 @@ v13 聚类协议移除了图提交中的共享来源 fencing key 和 NOWAIT 悲�
 
 确定的 TiKV 乐观写冲突仍最多尝试 16 次，带短暂随机退避、复用载荷，每次重读图基线、Index 来源 epoch 和 replica fence。业务冲突、fencing 失败和未知提交结果不直接重试；没有 source NOWAIT 重试分支。`vecdb_graph_commit_conflict_retries_total`、`graph_commit_attempt` 保留，新增 `source_epoch_admission` 与来源 epoch 升级/拒绝计数。1PC 快速路径保留，跨 Region 自动回退 2PC；真实 TiKV 测试验证两种路径与新的来源隔离语义，不代表多 Region 容量验收。
 
-跨 Region 的图提交还可能让 ReplicaPlan 读取等待 2PC 锁。Gateway 的图查询在已有最近成功计划时，将新计划读取预算设为 100 ms；仅该读取超时时，才把最后一次成功读取的计划作为选副本的提示。地址提示不承担权限有效期；每次请求仍重新 Resolve 当前 owner，Worker 仍在查询前后校验租约和 epoch。计划年龄不能替代这些权威检查，也不能因为计划读取锁等待跨过一个任意缓存 TTL 就停止尝试仍然有效的副本。缓存不能用于 sync/checkpoint/prune/rebuild，不能授予构图或发布权限；不存在、损坏、空计划及调用者取消都不能被缓存掩盖。`vecdb_route_plan_fallback_total` 记录此回退，`route_plan/error` 继续保留底层超时证据。
+跨 Region 的图提交还可能让 ReplicaPlan 读取等待 2PC 锁。Gateway 的图查询在已有最近成功计划时，将新计划读取预算设为 100 ms；仅该读取超时时，才把最后一次成功读取的计划作为选副本的提示。地址提示不承担权限有效期；非租约读路径每次请求仍重新 Resolve 当前 owner；聚类图复制的普通查询使用轻量路由快照缓存地址，Worker 在查询前后校验本地读租约和 epoch（见 RPC.md）。计划年龄不能替代这些权威检查，也不能因为计划读取锁等待跨过一个任意缓存 TTL 就停止尝试仍然有效的副本。缓存不能用于 sync/checkpoint/prune/rebuild，不能授予构图或发布权限；不存在、损坏、空计划及调用者取消都不能被缓存掩盖。`vecdb_route_plan_fallback_total` 记录此回退，`route_plan/error` 继续保留底层超时证据。
 
 DataDispatcher 也使用事件提示：原始数据提交后，Gateway 在本机有界集合中标记来源，再由独立 goroutine 解析 owner、发送经过集群鉴权的 `wake_source`。业务 ACK 不等待这次网络调用。图提交尝试结束后同样通知来源重新读取持久化水位；包括结果不确定的事务，通知本身永远不能推进 completed。整个窗口完成后立即调度下一窗口。各来源提示合并、总空间受 DataPartition 数量约束；失败退避有上限。
 

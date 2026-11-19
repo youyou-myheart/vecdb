@@ -32,6 +32,9 @@ type ClusterConfig struct {
 	Roles                       string
 }
 type ClusterService struct {
+	cachedRouting      bool
+	localOwnerLeases   bool
+	searchRoutes       searchRouteCache
 	checkpointBytes    uint64
 	checkpointAge      time.Duration
 	maintenanceDone    chan struct{}
@@ -190,7 +193,7 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 		return nil, e
 	}
 	runCtx, cancel := context.WithCancel(ctx)
-	c := &ClusterService{runCtx: runCtx, consumerRetention: cfg.ConsumerRetention, graphReplication: cfg.IndexReplication == "graph", lastSample: time.Now(), replicas: cfg.Replicas, PartitionedService: &PartitionedService{layout: layout, router: IdentityPartitionRouter{layout}, data: map[DataPartitionID]*Repository{}, indexes: map[IndexPartitionID]PartitionIndex{}, dimension: root.Dimension}, coordinator: &Coordinator{leaseReads: cfg.Routing != nil, failureDomain: cfg.FailureDomain, loadBalance: cfg.Scheduler == "load", balanceCooldown: cfg.BalanceCooldown, root: root, ttl: cfg.LeaseTTL.Milliseconds()}, node: node, objects: objects, token: cfg.Token, root: root, locals: map[IndexPartitionID]*localPartition{}, cancel: cancel, done: make(chan struct{}), client: &http.Client{Timeout: 30 * time.Second}}
+	c := &ClusterService{cachedRouting: true, localOwnerLeases: true, runCtx: runCtx, consumerRetention: cfg.ConsumerRetention, graphReplication: cfg.IndexReplication == "graph", lastSample: time.Now(), replicas: cfg.Replicas, PartitionedService: &PartitionedService{layout: layout, router: IdentityPartitionRouter{layout}, data: map[DataPartitionID]*Repository{}, indexes: map[IndexPartitionID]PartitionIndex{}, dimension: root.Dimension}, coordinator: &Coordinator{leaseReads: cfg.Routing != nil, holdReleasedLeases: true, failureDomain: cfg.FailureDomain, loadBalance: cfg.Scheduler == "load", balanceCooldown: cfg.BalanceCooldown, root: root, ttl: cfg.LeaseTTL.Milliseconds()}, node: node, objects: objects, token: cfg.Token, root: root, locals: map[IndexPartitionID]*localPartition{}, cancel: cancel, done: make(chan struct{}), client: &http.Client{Timeout: 30 * time.Second}}
 	if cfg.Routing != nil {
 		c.router = clusterRouter{IdentityPartitionRouter{layout}, layout.Routing}
 		c.writers = make(map[DataPartitionID]*mutationGroup)
@@ -303,6 +306,9 @@ func (c *ClusterService) reconcile(ctx context.Context) {
 	}
 }
 func (c *ClusterService) Close() {
+	for _, e := range c.entries() {
+		e.retireReads()
+	}
 	c.cancel()
 	for _, group := range c.mutationGroups {
 		group.close()

@@ -38,10 +38,10 @@ bash scripts/acceptance-onebox-freshness.sh --freshness-rounds 20 --load-seconds
 | 常稳 | 4 个写线程、2 个读线程；默认持续 600 秒；每 ID 串行 CAS，跨 ID 并行；更新、跨簇移动、删除重插和幂等重试；常稳期间不允许请求重试错误 |
 | Gateway/Master 单故障 | 杀掉一个 Gateway，客户端切换另一入口；杀掉当前 Master，记录备用主 epoch 增长耗时；持续读写后恢复 |
 | 旧 Worker 恢复 | SIGSTOP 持有来源分片的 Worker，等待租约过期与新 epoch，然后 SIGCONT；旧进程不能使位点倒退 |
-| S3 暂停 | 暂停 SeaweedFS 8 秒，数据继续持久化、索引积压必须增长；恢复后全部副本追平 |
+| S3 暂停 | 暂停 SeaweedFS 8 秒，确认进程暂停且数据继续持久化，记录索引积压（引用日志路径可能为 0）；恢复后全部副本追平 |
 | TiKV 暂停 | 暂停 TiKV 8 秒，使客户端出现真实超时/服务错误；使用同一 request ID 重试不确定写入；恢复后无重复版本或丢失 |
 | 叠加故障 | 同时强杀 2 Worker、当前 Master 和一个 Gateway；另一个 Gateway 仍接收业务写入；恢复后逐条校验 |
-| 全 Worker 丢失 | 强杀全部 Worker，再持久化 512 次更新；确认至少 512 条来源积压，然后恢复所有 Worker |
+| 全 Worker 丢失 | 强杀全部 Worker，提交 512 次更新；确认无 owner 时没有成功 ACK，再恢复 Worker，等待全部请求重试成功并核验数据。当前 owner-routed 写入不能在所有数据 owner 停止时直接 ACK |
 | 连续故障 | 默认 6 轮 Worker/Master 强杀与重启；各轮之间不等分片追平，业务线程持续运行；最后统一收敛检查 |
 | 整套冷恢复 | 快照/GC 后再写 256 次尾部更新，SIGKILL 全部 7 个向量进程和 3 个存储进程；从原持久化目录启动并验证 |
 | 恢复后常稳 | 默认再持续 60 秒读写，最后对全部记录和两份查询入口进行完整校验 |

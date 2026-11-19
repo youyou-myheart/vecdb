@@ -36,6 +36,30 @@ func TestSourceSignalsCoalesceWithoutLosingPartitions(t *testing.T) {
 	}
 }
 
+func TestCachedSourceNotificationDoesNotResolveOwnerAgain(t *testing.T) {
+	f, c, source := routedFixture(t)
+	c.cachedRouting = true
+	c.dispatchSignals, c.outboundSignals = newSourceSignals(), newSourceSignals()
+	c.worker = &Worker{cluster: c}
+	c.token = "cached-notification-token"
+	server := httptest.NewServer(c.InternalHandler())
+	defer server.Close()
+	source.URL = server.URL
+	raw, _ := json.Marshal(source)
+	f.db.data[string(c.coordinator.ownerKey(source.Partition))] = raw
+	c.client = server.Client()
+	if _, err := c.cachedSearchRoutes(f.ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	f.r.beginTxn = func() (transactionAPI, error) { panic("cached source hint read metadata") }
+	if err := c.notifySource(f.ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	if ids := c.dispatchSignals.take(); len(ids) != 1 || ids[0] != 0 {
+		t.Fatal(ids)
+	}
+}
+
 func TestSourceNotificationIsAuthenticatedHint(t *testing.T) {
 	f, c, source := routedFixture(t)
 	c.dispatchSignals, c.outboundSignals = newSourceSignals(), newSourceSignals()

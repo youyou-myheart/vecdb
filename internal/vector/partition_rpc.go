@@ -130,6 +130,17 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 		}
 		return reply, err
 	}
+	if req.Operation == "prune_data" {
+		if req.Source == nil || req.Partition != sourceID(*req.Source) {
+			return reply, ErrFenced
+		}
+		group, err := c.localDataWriter(*req.Source, req.Epoch, req.Session)
+		if err != nil {
+			return reply, err
+		}
+		reply.Floor, err = c.pruneData(ctx, *req.Source, group.lease.owner)
+		return reply, err
+	}
 	if req.Operation == "wake_source" {
 		if !c.EventDrivenIndexing() || c.worker == nil || req.Source == nil || *req.Source < 0 || int(*req.Source) >= c.layout.DataPartitions || req.Partition != sourceID(*req.Source) {
 			return reply, ErrFenced
@@ -158,13 +169,18 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 	if entry.owner.Epoch != req.Epoch {
 		return reply, ErrFenced
 	}
-	if req.Operation == "follower_search" {
-		return c.executeFollowerRead(ctx, entry, req.Query)
-	}
-	if !(c.coordinator.leaseReads && req.Operation == "deliver") {
+	localOwner := c.localOwnerLeases || req.Operation == "search" && c.localReadLeases()
+	if localOwner {
+		if e := entry.checkReadLease(req); e != nil {
+			return reply, e
+		}
+	} else if req.Operation != "follower_search" && !(c.coordinator.leaseReads && req.Operation == "deliver") {
 		if e := c.coordinator.Check(ctx, entry.owner); e != nil {
 			return reply, e
 		}
+	}
+	if req.Operation == "follower_search" {
+		return c.executeFollowerRead(ctx, entry, req.Query)
 	}
 	entry.mu.RLock()
 	defer entry.mu.RUnlock()
@@ -222,7 +238,13 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 			return partitionReply{}, ErrFenced
 		}
 		_, _, e = s.graphReplica.writer.snapshot()
-	} else {
+		if e != nil {
+			return partitionReply{}, e
+		}
+	}
+	if localOwner {
+		e = entry.checkReadLease(req)
+	} else if !(c.coordinator.leaseReads && req.Operation == "deliver") {
 		e = c.coordinator.Check(ctx, entry.owner)
 	}
 	if e != nil {

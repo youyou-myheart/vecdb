@@ -516,10 +516,15 @@ class Onebox:
             p.send_signal(signal.SIGCONT); self.paused.discard(p.pid)
             self.stop_workload(); row.update(self.verify())
         with self.case('S3_pause_with_durable_writes') as row:
+            before=sum(d['head'] for d in self.state()['data_progress'].values())
             p=self.storage.current['seaweed']; p.send_signal(signal.SIGSTOP); self.paused.add(p.pid)
             self.start_workload(); self.hold(8)
             s=self.state(); row['peak_pending']=sum(d['head']-d['completed_lsn'] for d in s['data_progress'].values())
-            assert row['peak_pending']>0
+            row['durable_mutations_during_pause']=sum(d['head'] for d in s['data_progress'].values())-before
+            assert row['durable_mutations_during_pause']>0
+            assert subprocess.check_output(['ps','-o','stat=','-p',str(p.pid)],text=True).strip().startswith('T')
+            # Reference graph journals can keep applying from TiKV while S3 is
+            # paused; backlog is observed, not required to grow artificially.
             p.send_signal(signal.SIGCONT); self.paused.discard(p.pid)
             self.stop_workload(); row.update(self.verify())
         with self.case('TiKV_pause_and_uncertain_client_retries') as row:
@@ -532,12 +537,22 @@ class Onebox:
             self.start_workload(); self.kill([3,4,master,2]); self.hold(5)
             for slot in (master,3,4,2): self.launch(slot)
             self.stop_workload(); row.update(self.verify())
-        with self.case('all_workers_lost_raw_data_still_available') as row:
+        with self.case('all_workers_lost_writes_resume_after_owner_recovery') as row:
             self.checkpoint(); self.kill([3,4,5])
-            with ThreadPoolExecutor(max_workers=8) as pool: list(pool.map(lambda n:self.oracle.mutate(640+n%128),range(512)))
-            s=self.state(); row['peak_pending']=sum(d['head']-d['completed_lsn'] for d in s['data_progress'].values())
-            assert row['peak_pending']>=512
-            for slot in (3,4,5): self.launch(slot)
+            before=sum(d['head'] for d in self.state()['data_progress'].values())
+            # Data mutations require a live owner. Keep the requests pending,
+            # then restore owners before waiting on the executor's futures.
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                pending=[pool.submit(self.oracle.mutate,640+n%128) for n in range(512)]
+                try:
+                    self.hold(3)
+                    row['acks_without_workers']=sum(f.done() and f.exception() is None for f in pending)
+                    assert row['acks_without_workers']==0
+                finally:
+                    for slot in (3,4,5): self.launch(slot)
+                for future in pending: future.result()
+            row['resumed_mutations']=512
+            assert sum(d['head'] for d in self.state()['data_progress'].values())>=before+512
             row.update(self.verify())
         with self.case('continuous_failures_without_catchup_barriers') as row:
             self.start_workload(); row['rounds']=[]

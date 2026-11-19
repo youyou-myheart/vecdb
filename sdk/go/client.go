@@ -16,19 +16,28 @@ import (
 )
 
 type Options struct {
-	Timeout   time.Duration
-	TLSConfig *tls.Config
+	Timeout               time.Duration
+	TLSConfig             *tls.Config
+	SearchRefreshInterval time.Duration
 }
 type Client struct {
 	pb.VectorStoreClient
-	conn       *grpc.ClientConn
-	timeout    time.Duration
-	dialOpts   []grpc.DialOption
-	mu         sync.Mutex
-	closed     bool
-	partitions uint32
-	proxyOnly  bool
-	routes     map[uint32]*dataRoute
+	conn          *grpc.ClientConn
+	timeout       time.Duration
+	dialOpts      []grpc.DialOption
+	mu            sync.Mutex
+	closed        bool
+	partitions    uint32
+	proxyOnly     bool
+	routes        map[uint32]*dataRoute
+	queryMu       sync.Mutex
+	queryState    *pb.ClusterStatus
+	queryUpdated  time.Time
+	queryStarted  bool
+	queryClosed   bool
+	queryCancel   context.CancelFunc
+	queryWG       sync.WaitGroup
+	queryInterval time.Duration
 }
 
 // Dial uses plaintext when TLSConfig is nil (for trusted local deployments).
@@ -42,6 +51,12 @@ func Dial(ctx context.Context, target, token string, opts Options) (*Client, err
 	}
 	if opts.Timeout < 0 {
 		return nil, errors.New("timeout must be positive")
+	}
+	if opts.SearchRefreshInterval < 0 {
+		return nil, errors.New("search refresh interval must be positive")
+	}
+	if opts.SearchRefreshInterval == 0 {
+		opts.SearchRefreshInterval = 5 * time.Second
 	}
 	transport := insecure.NewCredentials()
 	var creds credentials.TransportCredentials = transport
@@ -60,9 +75,16 @@ func Dial(ctx context.Context, target, token string, opts Options) (*Client, err
 	if e != nil {
 		return nil, e
 	}
-	return &Client{VectorStoreClient: pb.NewVectorStoreClient(conn), conn: conn, dialOpts: dialOpts, timeout: opts.Timeout, routes: make(map[uint32]*dataRoute)}, nil
+	return &Client{VectorStoreClient: pb.NewVectorStoreClient(conn), conn: conn, dialOpts: dialOpts, timeout: opts.Timeout, routes: make(map[uint32]*dataRoute), queryInterval: opts.SearchRefreshInterval}, nil
 }
 func (c *Client) Close() error {
+	c.queryMu.Lock()
+	c.queryClosed = true
+	if c.queryCancel != nil {
+		c.queryCancel()
+	}
+	c.queryMu.Unlock()
+	c.queryWG.Wait()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.closed = true

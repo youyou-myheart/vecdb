@@ -132,7 +132,7 @@ func TestIndexLeaseTiKVLateAppendAfterTakeover(t *testing.T) {
 					return next.Sync(f.ctx)
 				}}, err
 			}
-			_, e = j.commitWithAuthority(f.ctx, h, 1, "delta", Manifest{}, []Delivery{q}, f.c, payload, token, func() error { return g.writer.authority(token) })
+			_, e = j.commitWithAuthority(f.ctx, h, 1, "delta", Manifest{}, []Delivery{q}, f.c, payload, token, g.writer)
 			if !fired || !tikverr.IsErrWriteConflict(e) {
 				t.Fatal("late transaction escaped storage fencing", e)
 			}
@@ -270,7 +270,7 @@ func TestIndexLeaseTiKVRecoveryFencesUnknownAppend(t *testing.T) {
 			return a.Sync(f.ctx)
 		}}, e
 	}
-	_, e = j.commitWithAuthority(f.ctx, h, 1, "delta", Manifest{}, []Delivery{q}, f.c, payload, token, func() error { return g.writer.authority(token) })
+	_, e = j.commitWithAuthority(f.ctx, h, 1, "delta", Manifest{}, []Delivery{q}, f.c, payload, token, g.writer)
 	if !fired || !tikverr.IsErrWriteConflict(e) {
 		t.Fatal("recovery did not fence in-flight unknown append", e)
 	}

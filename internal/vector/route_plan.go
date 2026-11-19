@@ -9,7 +9,7 @@ import (
 
 const routePlanReadBudget = 100 * time.Millisecond
 
-// A cached plan is only a read-routing hint. Every chosen replica must still
+// Legacy/non-lease routing: a cached plan is only a read-routing hint. Every chosen replica must still
 // pass Resolve and the Worker's before/after owner checks. Mutations and
 // maintenance never use this fallback to establish publisher authority.
 type routePlanCache struct {

@@ -43,16 +43,18 @@ type Ownership struct {
 	Epoch         uint64           `json:"epoch"`
 	Expires       int64            `json:"expires_ms"`
 	Ready         bool             `json:"ready"`
+	Released      bool             `json:"released,omitempty"`
 }
 type Coordinator struct {
-	leaseReads      bool
-	referenceLogs   bool
-	data            map[DataPartitionID]*Repository
-	failureDomain   string
-	loadBalance     bool
-	balanceCooldown time.Duration
-	root            *Repository
-	ttl             int64
+	leaseReads         bool
+	holdReleasedLeases bool
+	referenceLogs      bool
+	data               map[DataPartitionID]*Repository
+	failureDomain      string
+	loadBalance        bool
+	balanceCooldown    time.Duration
+	root               *Repository
+	ttl                int64
 }
 
 func (c *Coordinator) nodeKey(id string) []byte {
@@ -266,7 +268,7 @@ func (c *Coordinator) update(ctx context.Context, expected Ownership, ready, rel
 		return o, e
 	}
 	now := txnMillis(tx)
-	if !sameOwner(o, expected) || o.Expires <= now {
+	if !sameOwner(o, expected) || o.Released || o.Expires <= now {
 		return o, ErrFenced
 	}
 	if expected.Partition != masterLeaseID && !release {
@@ -282,10 +284,16 @@ func (c *Coordinator) update(ctx context.Context, expected Ownership, ready, rel
 		report(&o)
 	}
 	o.Ready = o.Ready || ready
-	o.Expires = now + c.ttl
 	if release {
-		o.Expires = 0
 		o.Ready = false
+		o.Released = true
+		// Publishing an unavailable route must not make an issued lease
+		// expire early. A successor still checks the old expiry in Acquire.
+		if !c.holdReleasedLeases {
+			o.Expires = 0
+		}
+	} else {
+		o.Expires = now + c.ttl
 	}
 	if e = putJSON(tx, c.ownerKey(o.Partition), o); e != nil {
 		return o, e
