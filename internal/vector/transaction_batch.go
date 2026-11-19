@@ -28,6 +28,15 @@ func batchGet(ctx context.Context, tx transactionAPI, keys [][]byte) (map[string
 	return out, nil
 }
 
+func (c *Coordinator) readControlKeys(ctx context.Context, keys [][]byte) (map[string][]byte, error) {
+	tx, err := c.root.begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	return batchGet(ctx, tx, keys)
+}
+
 // A batch's prefetched values plus its own writes. This preserves sequential
 // revisions and request-ID checks even when several operations target one ID.
 type prefetchedTransaction struct {

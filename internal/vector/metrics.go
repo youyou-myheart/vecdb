@@ -142,6 +142,27 @@ func (c *ClusterService) LocalMetrics() (string, error) {
 	return m.String(), nil
 }
 
+func (m *metricText) indexRecall(s *Service, replica IndexPartitionID) {
+	index, _, _ := strings.Cut(string(replica), "~")
+	labels := fmt.Sprintf("{index_partition=%q,replica=%q}", index, replica)
+	m.add("vecdb_index_exact_threshold", "gauge", "Maximum local matching record count for automatic exact search.", labels, s.Index.exactThreshold)
+	status := s.RecallStatus()
+	m.add("vecdb_index_recall_probes_total", "counter", "Completed background Recall@10 probes for this local index instance.", labels, status.Samples)
+	m.add("vecdb_index_recall_rebuilds_total", "counter", "Successful rebuilds triggered by sustained low recall on this local index instance.", labels, status.Rebuilds)
+	m.add("vecdb_index_recall_failures_total", "counter", "Failed background recall checks or recall-triggered rebuild attempts.", labels, status.Failures)
+	if status.Samples > 0 {
+		m.add("vecdb_index_recall_last_check_timestamp_seconds", "gauge", "Unix time of the last completed recall check.", labels, status.LastChecked.Unix())
+		m.add("vecdb_index_recall_at_10", "gauge", "Last measured shard-local Recall@10.", labels, status.Recall)
+		m.add("vecdb_index_recall_probe_queries", "gauge", "Number of queries in the last completed recall probe.", labels, status.Queries)
+		m.add("vecdb_index_recall_low_streak", "gauge", "Consecutive below-target measurements in the current decision window.", labels, status.LowStreak)
+		suppressed := 0
+		if status.Suppressed {
+			suppressed = 1
+		}
+		m.add("vecdb_index_recall_rebuild_suppressed", "gauge", "A rebuilt graph still missed the recall target. Waiting for new data before rebuilding again.", labels, suppressed)
+	}
+}
+
 func (c *ClusterService) localMetrics(m *metricText) error {
 	o := &c.observations
 	for _, v := range []struct {
@@ -166,6 +187,9 @@ func (c *ClusterService) localMetrics(m *metricText) error {
 	m.add("vecdb_dispatch_duration_seconds_total", "counter", "Cumulative local dispatch time including IO.", "", float64(o.dispatchNanos.Load())/1e9)
 	for _, entry := range c.entries() {
 		entry.mu.RLock()
+		if service := entry.service; service != nil && service.Index != nil {
+			m.indexRecall(service, entry.owner.Partition)
+		}
 		if service := entry.service; service != nil && service.graphReplica != nil && service.graphReplica.input != nil {
 			g := service.graphReplica
 			g.viewMu.RLock()
@@ -179,9 +203,10 @@ func (c *ClusterService) localMetrics(m *metricText) error {
 			m.add("vecdb_graph_local_owner_epoch", "gauge", "Owner epoch of the local graph, paired with its applied sequence.", fmt.Sprintf("{index_partition=%q,replica=%q}", g.journal.id, entry.owner.Partition), entry.owner.Epoch)
 			if w := g.writer; w != nil {
 				w.mu.Lock()
-				remaining := max(float64(0), time.Until(w.deadline).Seconds())
+				remaining := float64(0)
 				valid, ready := 0, 0
-				if !w.retired && remaining > 0 {
+				if grant, ok := w.leaderLease.Snapshot(); ok {
+					remaining = max(float64(0), time.Until(grant.Deadline).Seconds())
 					valid = 1
 					if w.known {
 						ready = 1

@@ -1,13 +1,18 @@
 package vector
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	tikverr "github.com/tikv/client-go/v2/error"
+	"github.com/tikv/client-go/v2/tikvrpc"
+	"github.com/tikv/client-go/v2/tikvrpc/interceptor"
 )
 
 func enableNativeLease(t *testing.T, f *epochTiKVFixture) {
@@ -15,12 +20,12 @@ func enableNativeLease(t *testing.T, f *epochTiKVFixture) {
 	f.c.coordinator.leaseReads = true
 	for _, s := range f.services {
 		g := s.graphReplica
-		g.writer = &indexWriter{}
+		g.writer = testIndexWriterWithReplicaLease(g)
 		plan, e := f.c.coordinator.Plan(f.ctx, g.journal.id)
 		if e != nil {
 			t.Fatal(e)
 		}
-		if e = g.refreshLease(f.ctx, plan, time.Now()); e != nil {
+		if e = g.refreshLease(f.ctx, plan); e != nil {
 			t.Fatal(e)
 		}
 		if e = s.Sync(f.ctx); e != nil {
@@ -125,8 +130,8 @@ func TestIndexLeaseTiKVLateAppendAfterTakeover(t *testing.T) {
 					}
 					t.Cleanup(next.Index.graph.Close)
 					next.graphReplica.input = newRoutedInput(f.c)
-					next.graphReplica.writer = &indexWriter{}
-					if err = next.graphReplica.refreshLease(f.ctx, planned, time.Now()); err != nil {
+					next.graphReplica.writer = testIndexWriterWithReplicaLease(next.graphReplica)
+					if err = next.graphReplica.refreshLease(f.ctx, planned); err != nil {
 						return err
 					}
 					return next.Sync(f.ctx)
@@ -157,7 +162,10 @@ func TestIndexLeaseTiKVRenewalSerializesDrain(t *testing.T) {
 	f := newEpochTiKVFixture(t, 1)
 	enableNativeLease(t, f)
 	g := f.services[0].graphReplica
-	oldDeadline := g.writer.deadline
+	oldGrant, ok := g.writer.leaderLease.Snapshot()
+	if !ok {
+		t.Fatal("publisher lease is not live")
+	}
 	repo := *f.r
 	coord := *f.c.coordinator
 	coord.root = &repo
@@ -183,7 +191,7 @@ func TestIndexLeaseTiKVRenewalSerializesDrain(t *testing.T) {
 	if _, e := coord.grantIndexLease(f.ctx, g.journal.id, g.journal.owner); !tikverr.IsErrWriteConflict(e) {
 		t.Fatal("renewal survived concurrent drain", e)
 	}
-	if g.writer.deadline != oldDeadline {
+	if grant, ok := g.writer.leaderLease.Snapshot(); !ok || grant != oldGrant {
 		t.Fatal("failed renewal extended local authority")
 	}
 	// Conversely, a switch based on an expired snapshot cannot pass a newer grant.
@@ -283,5 +291,81 @@ func TestIndexLeaseTiKVRecoveryFencesUnknownAppend(t *testing.T) {
 	durable, e := g.journal.Head(f.ctx)
 	if e != nil || durable.Committed != g.position || durable.Sources["0"] != 1 {
 		t.Fatal(durable, e)
+	}
+}
+
+// Recovery and a delayed append in the same lease generation must conflict
+// even though a normal delta no longer writes the index guard.
+func TestNativeGraphInsertAndRecoveryFence(t *testing.T) {
+	f := newEpochTiKVFixture(t, 1)
+	f.c.coordinator.holdReleasedLeases = true
+	enableNativeLease(t, f)
+	s := f.services[0]
+	g := s.graphReplica
+	h, token, err := g.writer.snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.r.begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	native, ok := g.journal.nativeAppend(tx)
+	if !ok {
+		t.Fatal("native insert disabled")
+	}
+	key := g.journal.key(fmt.Sprintf("entries/%020d", h.Committed.Sequence+1))
+	if err = native.insert(key, []byte("late")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = g.journal.claimLeased(f.ctx, token); err != nil {
+		t.Fatal(err)
+	}
+	if err = native.commitBeforeLeaseExpiry(f.ctx, g.writer.lease.Expires); err == nil {
+		t.Fatal("recovery failed to fence delayed insert")
+	}
+	q := f.delivery(t, false)
+	if err := g.enqueue(f.ctx, q); err != nil {
+		t.Fatal(err)
+	}
+	var guard, insert atomic.Bool
+	ctx := interceptor.WithRPCInterceptor(f.ctx, func(next interceptor.RPCInterceptorFunc) interceptor.RPCInterceptorFunc {
+		return func(target string, req *tikvrpc.Request) (*tikvrpc.Response, error) {
+			if req.Type == tikvrpc.CmdPrewrite {
+				for _, m := range req.Prewrite().Mutations {
+					if bytes.Equal(m.Key, g.journal.c.indexGuardKey(g.journal.id)) {
+						guard.Store(true)
+					}
+					if m.Op == kvrpcpb.Op_Insert && bytes.HasPrefix(m.Key, g.journal.key("entries/")) {
+						insert.Store(true)
+					}
+				}
+			}
+			return next(target, req)
+		}
+	})
+	if err = s.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if guard.Load() || !insert.Load() {
+		t.Fatal("expected immutable graph Insert without guard", guard.Load(), insert.Load())
+	}
+	h, err = g.journal.Head(f.ctx)
+	if err != nil || h.Sources["0"] != 1 {
+		t.Fatal(h, err)
+	}
+	replay, err := f.r.begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replay.Rollback()
+	native, _ = g.journal.nativeAppend(replay)
+	key = g.journal.key(fmt.Sprintf("entries/%020d", h.Committed.Sequence))
+	if err = native.insert(key, []byte("overwrite")); err != nil {
+		t.Fatal(err)
+	}
+	if err = native.commitBeforeLeaseExpiry(f.ctx, g.writer.lease.Expires); err == nil {
+		t.Fatal("duplicate graph slot overwritten")
 	}
 }

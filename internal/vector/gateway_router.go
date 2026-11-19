@@ -62,6 +62,7 @@ func (c *ClusterService) sendPartition(ctx context.Context, o Ownership, payload
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
+	setDeliveryHeader(req, payload.Delivery)
 	response, e := c.client.Do(req)
 	if e != nil {
 		return partitionReply{}, e

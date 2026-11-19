@@ -3,9 +3,7 @@ package vector
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	tikverr "github.com/tikv/client-go/v2/error"
@@ -14,7 +12,6 @@ import (
 const (
 	mutationGroupRecords = 32
 	mutationGroupBytes   = 2 << 20
-	guardWriteEvery      = 100
 )
 
 type mutationResult struct {
@@ -28,34 +25,12 @@ type mutationRequest struct {
 	result   chan mutationResult
 }
 
-type appendLease struct {
-	owner         Ownership
-	guard         []byte
-	token         []byte
-	boundCommitTS bool
-	head          atomic.Uint64
-	grant         atomic.Pointer[appendGrant]
-	// Only the partition's drainer counts confirmed, nonempty commits.
-	batchesSinceGuard int
-	// An ambiguous commit stops admission until the dispatcher recovers a new epoch.
-	uncertain atomic.Bool
-}
-
-type appendGrant struct {
-	deadline time.Time
-	expires  int64
-}
-
-func (l *appendLease) activeGrant() *appendGrant {
-	grant := l.grant.Load()
-	if grant == nil || l.uncertain.Load() || !time.Now().Before(grant.deadline) {
-		return nil
-	}
-	return grant
-}
-
 type mutationGroup struct {
+	proofs    graphCommitProofs
 	lease     *appendLease
+	rawWriter *rawShardWriter
+	rawCtx    context.Context
+	rawStop   context.CancelFunc
 	ctx       context.Context
 	repo      *Repository
 	metrics   *pipelineMetrics
@@ -95,7 +70,7 @@ func (b *mutationGroup) mutate(ctx context.Context, id string, m Mutation, delet
 			}
 			return Record{}, context.Canceled
 		}
-		if b.lease != nil && b.lease.activeGrant() == nil {
+		if b.lease != nil && !b.lease.InLeaderLease(nil) {
 			b.mu.Unlock()
 			return Record{}, ErrFenced
 		}
@@ -116,12 +91,22 @@ func (b *mutationGroup) mutate(ctx context.Context, id string, m Mutation, delet
 			if b.running {
 				b.queue = append(b.queue, r)
 				b.bytes += q.size
+				if b.rawWriter != nil && len(b.queue) == 1 {
+					b.signalLocked()
+				}
 			} else {
 				// The idle partition starts with this request. Requests
 				// arriving while it runs go into the next batch.
 				b.running = true
 				b.wg.Add(1)
-				go b.drain([]*mutationRequest{r})
+				if b.rawWriter == nil {
+					go b.drain([]*mutationRequest{r})
+				} else {
+					if b.rawCtx == nil {
+						b.rawCtx, b.rawStop = context.WithCancel(b.ctx)
+					}
+					go b.drainRaw(b.rawCtx, []*mutationRequest{r})
+				}
 			}
 			b.mu.Unlock()
 			select {
@@ -149,7 +134,10 @@ func (b *mutationGroup) close() {
 	b.mu.Lock()
 	b.closed = true
 	if b.lease != nil {
-		b.lease.grant.Store(nil)
+		b.lease.Retire()
+	}
+	if b.rawStop != nil {
+		b.rawStop()
 	}
 	b.signalLocked()
 	b.mu.Unlock()
@@ -230,7 +218,8 @@ func (r *Repository) mutateGroupOnce(ctx context.Context, batch []*mutationReque
 			}
 		}
 	}()
-	if lease != nil && lease.activeGrant() == nil {
+	var epoch uint64
+	if lease != nil && !lease.InLeaderLease(&epoch) {
 		return results, ErrFenced
 	}
 	tx, err := r.begin()
@@ -240,10 +229,8 @@ func (r *Repository) mutateGroupOnce(ctx context.Context, batch []*mutationReque
 	defer tx.Rollback()
 	var keys [][]byte
 	if lease != nil {
-		// Reject a snapshot taken at or after the durable lease expiry.
-		grant := lease.activeGrant()
-		if grant == nil || txnMillis(tx) >= grant.expires {
-			return results, ErrFenced
+		if _, err = lease.grantForTransaction(tx, epoch); err != nil {
+			return results, err
 		}
 	} else {
 		keys = append(keys, []byte(r.Prefix+"log-floor"))
@@ -270,43 +257,11 @@ func (r *Repository) mutateGroupOnce(ctx context.Context, batch []*mutationReque
 		changed = changed || wrote
 	}
 	if changed {
-		commit := tx.Commit
-		writeGuard := false
-		if lease != nil {
-			grant := lease.activeGrant()
-			if grant == nil {
-				return results, ErrFenced
-			}
-			// The fallback covers coordinators permitting early takeover
-			// and transactions without a commit timestamp limit.
-			writeGuard = true
-			if bounded, ok := tx.(interface {
-				commitBeforeLeaseExpiry(context.Context, int64) error
-			}); lease.boundCommitTS && ok {
-				commit = func(ctx context.Context) error {
-					return bounded.commitBeforeLeaseExpiry(ctx, grant.expires)
-				}
-				writeGuard = lease.batchesSinceGuard+1 >= guardWriteEvery
-			}
-			if writeGuard {
-				if err = tx.Set(lease.guard, lease.token); err != nil {
-					return results, err
-				}
-			}
-		}
-		if err = commit(ctx); err != nil {
-			if lease != nil && !tikverr.IsErrWriteConflict(err) {
-				lease.uncertain.Store(true)
-			}
-			return results, fmt.Errorf("commit not confirmed; retry same request_id: %w", err)
+		if err = lease.commit(ctx, tx, epoch); err != nil {
+			return results, err
 		}
 		if lease != nil {
 			lease.head.Store(tail.lsn)
-			if writeGuard {
-				lease.batchesSinceGuard = 0
-			} else {
-				lease.batchesSinceGuard++
-			}
 		}
 	}
 	return results, nil

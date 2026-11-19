@@ -2,10 +2,46 @@ package vector
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 )
+
+func (c *ClusterService) Get(ctx context.Context, id string) (Record, error) {
+	d := c.router.DataForID(id)
+	repo := c.data[d]
+	if !repo.usesRawShardData() {
+		return repo.Get(ctx, id)
+	}
+	if err := ctx.Err(); err != nil {
+		return Record{}, err
+	}
+	if group, ok := repo.raw.local.Load(repo.Prefix); ok {
+		r, err := group.(*mutationGroup).readOwnedRecord(id)
+		if !errors.Is(err, ErrFenced) {
+			return r, err
+		}
+	}
+	if c.routeHintsEnabled() {
+		if state, err := c.cachedSearchRoutes(ctx, false); err == nil {
+			o := state.Owners[sourceID(d)]
+			if o.Epoch != 0 {
+				reply, err := c.sendPartition(ctx, o, partitionRPC{Namespace: c.root.Prefix, Partition: o.Partition, Epoch: o.Epoch, Session: o.Session, Source: &d, Operation: "get_owned", ID: id})
+				if err == nil {
+					if reply.Record == nil {
+						return Record{}, ErrNotFound
+					}
+					return *reply.Record, nil
+				}
+				if errors.Is(err, ErrFenced) {
+					c.expireSearchRoutes(state)
+				}
+			}
+		}
+	}
+	return repo.Get(ctx, id)
+}
 
 func (c *ClusterService) Mutate(ctx context.Context, id string, m Mutation, deleted bool) (_ Record, err error) {
 	partition := c.router.DataForID(id)
@@ -29,7 +65,7 @@ func (c *ClusterService) Sync(ctx context.Context) error {
 	}
 	// Capture a finite data frontier; ongoing writes cannot extend this wait.
 	targets := map[DataPartitionID]uint64{}
-	tx, e := c.root.begin()
+	tx, e := c.data[0].beginDataRead(ctx)
 	if e != nil {
 		return e
 	}
@@ -43,24 +79,42 @@ func (c *ClusterService) Sync(ctx context.Context) error {
 	_ = tx.Rollback()
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
-	for {
-		tx, e = c.root.begin()
-		if e != nil {
-			return e
-		}
-		ready := true
-		for d, target := range targets {
-			n, err := c.completedIn(ctx, tx, d)
-			if err != nil {
-				_ = tx.Rollback()
-				return err
+	for len(targets) > 0 {
+		c.writerMu.RLock()
+		var keys [][]byte
+		for id, n := range targets {
+			group := c.writers[id]
+			if n == 0 || group != nil && group.lease.InLeaderLease(nil) && group.lease.indexed.Load() >= n {
+				delete(targets, id)
+				continue
 			}
-			if n < target {
-				ready = false
-			}
+			keys = append(keys, completedKey(c.data[id]))
 		}
+		c.writerMu.RUnlock()
+		if len(keys) == 0 {
+			break
+		}
+		tx, err := c.root.begin()
+		if err != nil {
+			return err
+		}
+		values, err := batchGet(ctx, tx, keys)
 		_ = tx.Rollback()
-		if ready {
+		if err != nil {
+			return err
+		}
+		for id, n := range targets {
+			var completed uint64
+			if value, ok := values[string(completedKey(c.data[id]))]; ok {
+				if err := json.Unmarshal(value, &completed); err != nil {
+					return err
+				}
+			}
+			if completed >= n {
+				delete(targets, id)
+			}
+		}
+		if len(targets) == 0 {
 			break
 		}
 		select {
@@ -90,8 +144,11 @@ func (c *ClusterService) SearchContext(ctx context.Context, q Search) ([]Hit, er
 		if r.Revision < q.MinVisible.Revision {
 			return nil, ErrNotVisible
 		}
-		if e = c.Sync(ctx); e != nil {
-			return nil, e
+		// Routed graph replicas enforce the token on their applied view.
+		if !c.graphReplication {
+			if e = c.Sync(ctx); e != nil {
+				return nil, e
+			}
 		}
 		if r.Deleted {
 			// Deletes are broadcast. Every selected replica must have applied
@@ -221,6 +278,46 @@ func (s *Service) searchRouted(ctx context.Context, q Search) ([]Hit, GraphPosit
 	defer g.viewMu.RUnlock()
 	hits, err := s.Index.Search(q)
 	return hits, g.position, err
+}
+
+// Wait on the replica that must actually serve the token. No partition or
+// index lock is held while waiting for its graph consumer to apply a revision.
+func (c *ClusterService) searchVisibleReplica(ctx context.Context, entry *localPartition, q Search) (partitionReply, error) {
+	for ctx.Err() == nil {
+		entry.mu.RLock()
+		s := entry.service
+		if entry.retired || s == nil || s.graphReplica == nil || s.graphReplica.input == nil {
+			entry.mu.RUnlock()
+			return partitionReply{}, ErrFenced
+		}
+		g := s.graphReplica
+		started := time.Now()
+		hits, pos, err := s.searchRouted(ctx, q)
+		entry.queryNanos.Add(time.Since(started).Nanoseconds())
+		if !errors.Is(err, ErrNotVisible) {
+			entry.mu.RUnlock()
+			return partitionReply{Hits: hits, GraphPosition: &pos, AppliedOffset: pos.DataOffset}, err
+		}
+		g.viewMu.Lock()
+		if g.position != pos {
+			g.viewMu.Unlock()
+			entry.mu.RUnlock()
+			continue
+		}
+		if g.appliedChange == nil {
+			g.appliedChange = make(chan struct{})
+		}
+		change := g.appliedChange
+		g.viewMu.Unlock()
+		g.input.notify()
+		entry.mu.RUnlock()
+		select {
+		case <-ctx.Done():
+			return partitionReply{}, ctx.Err()
+		case <-change:
+		}
+	}
+	return partitionReply{}, ctx.Err()
 }
 
 func (p *PartitionedService) clusteredSource(q ChangeRequest) (*Repository, error) {

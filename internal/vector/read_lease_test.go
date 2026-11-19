@@ -8,7 +8,7 @@ import (
 )
 
 func testReadEntry() (*localPartition, partitionRPC) {
-	o := Ownership{Partition: "index-0000~a", Node: "a", Session: "s", Epoch: 3, Ready: true}
+	o := Ownership{Partition: "index-0000~a", Node: "a", Session: "s", Epoch: 3, Ready: true, Expires: time.Now().Add(time.Second).UnixMilli()}
 	e := &localPartition{owner: o}
 	e.grantReadLease(time.Now(), o, time.Second)
 	return e, partitionRPC{Partition: o.Partition, Session: o.Session, Epoch: o.Epoch, Operation: "search"}
@@ -24,8 +24,9 @@ func TestReadLeaseExpiresAndRejectsOldIncarnation(t *testing.T) {
 			t.Fatal("old incarnation accepted")
 		}
 	}
-	e.grantReadLease(time.Now().Add(-2*time.Second), e.owner, time.Second)
-	if !errors.Is(e.checkReadLease(q), ErrFenced) {
+	delayed := &localPartition{owner: e.owner}
+	delayed.grantReadLease(time.Now().Add(-2*time.Second), e.owner, time.Second)
+	if !errors.Is(delayed.checkReadLease(q), ErrFenced) {
 		t.Fatal("late renewal created authority")
 	}
 	e.retireReads()
@@ -62,10 +63,44 @@ func TestSearchUsesLocalLeaseAndRechecksAfterQuery(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	e.readLease.Store(&replicaReadLease{owner: e.owner, deadline: time.Now().Add(-time.Second)})
+	e.retireReads()
 	index.mu.Unlock()
 	if err := <-done; !errors.Is(err, ErrFenced) {
-		t.Fatal("query crossed deadline", err)
+		t.Fatal("query crossed retirement", err)
+	}
+}
+
+func TestFollowerSearchRechecksLocalReadLease(t *testing.T) {
+	f, c, _, follower, _ := followerFixture(t)
+	o := follower.graphReplica.journal.owner
+	o.Ready = true
+	entry := c.locals[o.Partition]
+	c.localOwnerLeases = true
+	entry.grantReadLease(time.Now(), o, time.Minute)
+	req := partitionRPC{
+		Namespace: f.r.Prefix, Partition: o.Partition, Epoch: o.Epoch, Session: o.Session,
+		Operation: "follower_search", Query: Search{Vector: []float64{1, 2}, K: 1},
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.execute(f.ctx, req)
+		done <- err
+	}()
+	queue := follower.graphReplica.readQueue()
+	waitFollowerState(t, queue, func(q *followerReadQueue) bool {
+		for waiter := range q.pending {
+			if waiter.target != nil {
+				return true
+			}
+		}
+		return false
+	})
+	entry.retireReads()
+	if err := follower.Sync(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, ErrFenced) {
+		t.Fatal("follower query crossed retirement", err)
 	}
 }
 
@@ -75,8 +110,11 @@ func TestFailedRenewalDoesNotExtendReadLease(t *testing.T) {
 	o := s.graphReplica.journal.owner
 	o.Ready = true
 	e := &localPartition{owner: o, service: s}
-	e.grantReadLease(time.Now().Add(-2*time.Second), o, time.Second)
-	old := e.readLease.Load()
+	e.grantReadLease(time.Now(), o, time.Hour)
+	old, ok := e.readLease.Snapshot()
+	if !ok {
+		t.Fatal("missing confirmed authority")
+	}
 	var node ClusterNode
 	for _, n := range f.nodes {
 		if n.ID == o.Node && n.Session == o.Session {
@@ -86,11 +124,8 @@ func TestFailedRenewalDoesNotExtendReadLease(t *testing.T) {
 	c := &ClusterService{root: f.r, coordinator: f.c, node: node, replicas: 2, graphReplication: true, locals: map[IndexPartitionID]*localPartition{o.Partition: e}, PartitionedService: &PartitionedService{layout: f.layout}}
 	f.db.getFail = string(f.c.ownerKey(o.Partition))
 	c.replicaTick(f.ctx)
-	if now := e.readLease.Load(); now == nil || !now.deadline.Equal(old.deadline) {
+	if now, ok := e.readLease.Snapshot(); !ok || now != old {
 		t.Fatal("failed renewal changed local authority", now)
-	}
-	if !errors.Is(e.checkReadLease(partitionRPC{Partition: o.Partition, Epoch: o.Epoch, Session: o.Session}), ErrFenced) {
-		t.Fatal("expired owner served after failed renewal")
 	}
 }
 
@@ -101,12 +136,15 @@ func TestUnknownPlanDoesNotRetireOrExtendConfirmedReadLease(t *testing.T) {
 	o := s.graphReplica.journal.owner
 	o.Ready = true
 	e := &localPartition{owner: o, service: s}
-	e.grantReadLease(time.Now(), o, time.Second)
-	old := e.readLease.Load()
+	e.grantReadLease(time.Now(), o, time.Hour)
+	old, ok := e.readLease.Snapshot()
+	if !ok {
+		t.Fatal("missing confirmed authority")
+	}
 	c := &ClusterService{root: f.r, coordinator: f.c, replicas: 2, graphReplication: true, locals: map[IndexPartitionID]*localPartition{o.Partition: e}, PartitionedService: &PartitionedService{layout: f.layout}}
 	f.db.getFail = string(f.c.planKey("index-0000"))
 	c.replicaTick(f.ctx)
-	if e.readRetired.Load() || e.readLease.Load() != old {
+	if now, ok := e.readLease.Snapshot(); !ok || now != old {
 		t.Fatal("unknown plan retired/extended confirmed authority")
 	}
 }

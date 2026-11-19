@@ -208,24 +208,37 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 	if native, ok := tx.(interface{ SetEnable1PC(bool) }); ok {
 		native.SetEnable1PC(true)
 	}
+	native, bounded := j.nativeAppend(tx)
+	bounded = bounded && writer != nil
 	var h GraphHead
-	if writer == nil {
-		if e = j.c.ReplicaFence(j.id, j.owner)(ctx, tx); e != nil {
+	leasedReset := writer != nil && kind == "reset"
+	if writer == nil || leasedReset {
+		if e = j.c.fencePublisher(ctx, tx, j.id, j.owner, leasedReset); e != nil {
 			return entry, e
 		}
 		h, e = j.headIn(ctx, tx)
+		if e != nil {
+			return entry, e
+		}
 	} else {
 		h = cloneGraphHead(base)
-		e = writer.appendAuthority(token, tx)
-		if e == nil {
+	}
+	if writer != nil {
+		if e = writer.appendAuthority(token, tx); e != nil {
+			return entry, e
+		}
+		if leasedReset {
+			// The grant can roll over in storage during the object upload.
+			// Its replacement may not yet be installed by the local writer.
+			e = j.c.fenceIndexGuard(ctx, tx, j.id, token)
+		} else if !bounded {
 			// A takeover cannot change the guard until the durable lease
-			// expires. The timestamp check rules out snapshots after expiry;
-			// this write serializes an already-started commit with takeover.
+			// expires. Touch it to serialize an already-started commit with takeover.
 			e = tx.Set(j.c.indexGuardKey(j.id), token)
 		}
-	}
-	if e != nil {
-		return entry, e
+		if e != nil {
+			return entry, e
+		}
 	}
 	for _, input := range inputs {
 		if e = checkSourceEpoch(h, input); e != nil {
@@ -278,6 +291,25 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 	}
 	entry.Position.Hash = entryHash(entry)
 	key := j.key(fmt.Sprintf("entries/%020d", entry.Position.Sequence))
+	if bounded {
+		encoded, err := json.Marshal(entry)
+		if err != nil {
+			return entry, err
+		}
+		if err = native.insert(key, encoded); err != nil {
+			return entry, err
+		}
+		expires, err := writer.commitExpiry(token)
+		if err != nil {
+			return entry, err
+		}
+		err = native.commitBeforeLeaseExpiry(ctx, expires)
+		var exists *tikverr.ErrKeyExist
+		if errors.As(err, &exists) {
+			err = ErrConflict
+		}
+		return entry, err
+	}
 	if _, e = tx.Get(ctx, key); e == nil {
 		return entry, ErrConflict
 	} else if !tikverr.IsErrNotFound(e) {

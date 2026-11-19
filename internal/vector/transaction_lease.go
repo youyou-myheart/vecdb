@@ -4,9 +4,25 @@ import (
 	"context"
 
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
+	"github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/tikvrpc"
 	"github.com/tikv/client-go/v2/tikvrpc/interceptor"
 )
+
+// Bound the commit timestamp and use TiKV Insert for immutable journal slots.
+func (j graphJournal) nativeAppend(tx transactionAPI) (tikvTransaction, bool) {
+	if !j.c.holdReleasedLeases || !j.c.referenceLogs {
+		return tikvTransaction{}, false
+	}
+	if mixed, ok := tx.(*rawSnapshotTransaction); ok {
+		tx = mixed.transactionAPI
+	}
+	native, ok := tx.(tikvTransaction)
+	return native, ok
+}
+func (t tikvTransaction) insert(key, value []byte) error {
+	return t.GetMemBuffer().SetWithFlags(key, value, kv.SetPresumeKeyNotExists)
+}
 
 // A successor starts its recovery snapshot at or after expires. Use 2PC so
 // all keys, including every log entry, are prewritten before choosing commitTS.

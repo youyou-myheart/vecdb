@@ -224,19 +224,23 @@ func (c *Coordinator) Progress(ctx context.Context, expected Ownership, offset u
 }
 func (c *Coordinator) ReplicaFence(id IndexPartitionID, owner Ownership) func(context.Context, transactionAPI) error {
 	return func(ctx context.Context, tx transactionAPI) error {
-		if e := c.Fence(owner)(ctx, tx); e != nil {
-			return e
-		}
-		p, e := c.planIn(ctx, tx, id)
-		if e != nil {
-			return e
-		}
-		if p.Publisher != owner.Partition {
-			return ErrFenced
-		}
-		// Serialize publisher changes and membership changes with publication/pruning.
-		return putJSON(tx, c.planKey(id), p)
+		return c.fencePublisher(ctx, tx, id, owner, false)
 	}
+}
+
+func (c *Coordinator) fencePublisher(ctx context.Context, tx transactionAPI, id IndexPartitionID, owner Ownership, rejectDrain bool) error {
+	if e := c.Fence(owner)(ctx, tx); e != nil {
+		return e
+	}
+	p, e := c.planIn(ctx, tx, id)
+	if e != nil {
+		return e
+	}
+	if p.Publisher != owner.Partition || (rejectDrain && p.LeaseDraining) {
+		return ErrFenced
+	}
+	// Serialize publisher changes and membership changes with publication/pruning.
+	return putJSON(tx, c.planKey(id), p)
 }
 func (c *Coordinator) RetainReplicas(id IndexPartitionID) func(context.Context, transactionAPI, uint64) (uint64, error) {
 	return func(ctx context.Context, tx transactionAPI, end uint64) (uint64, error) {

@@ -72,9 +72,7 @@ func (g *graphReplica) appendDelta(ctx context.Context, s *Service, h GraphHead,
 	commit(&e)
 	g.observeSourceEpochRejection("commit", e)
 	for _, q := range inputs {
-		// A hint, never an ACK: the source re-reads its durable watermarks.
-		// Unknown commit outcomes also deserve a prompt durable-state check.
-		g.input.cluster.signalSource(q.Source, "graph_commit", false)
+		cluster.signalGraphCommit(g.journal.id, q, e)
 	}
 	if g.fastAppend {
 		if e == nil {

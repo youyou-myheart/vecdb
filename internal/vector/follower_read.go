@@ -145,7 +145,7 @@ func (g *graphReplica) followerAuthority() error {
 	w := g.writer
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.retired || !time.Now().Before(w.replicaDeadline) || w.publisher == "" || w.publisher == g.journal.owner.Partition || time.Now().Before(w.deadline) {
+	if !w.replicaLive() || w.publisher == "" || w.publisher == g.journal.owner.Partition || w.leaderLease.InLeaderLease(nil) {
 		return ErrFenced
 	}
 	return nil
@@ -161,8 +161,7 @@ func (g *graphReplica) leaderApplied() (GraphPosition, error) {
 	w := g.writer
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	now := time.Now()
-	if w.retired || !w.known || !now.Before(w.deadline) || !now.Before(w.replicaDeadline) {
+	if !w.known || !w.leaderLease.InLeaderLease(nil) || !w.replicaLive() {
 		return GraphPosition{}, ErrFenced
 	}
 	return g.position, nil
@@ -185,6 +184,12 @@ func (g *graphReplica) captureLeaderApplied(ctx context.Context) (GraphPosition,
 	}
 	if r.GraphPosition == nil {
 		return GraphPosition{}, ErrPartitionUnavailable
+	}
+	g.viewMu.RLock()
+	behind := g.position.Sequence < r.GraphPosition.Sequence
+	g.viewMu.RUnlock()
+	if behind {
+		g.input.notify()
 	}
 	return *r.GraphPosition, nil
 }

@@ -1,31 +1,27 @@
 package vector
 
-import "time"
+import (
+	"time"
 
-// Installed only after a confirmed owner renewal. The monotonic deadline starts
-// before storage IO, so a delayed/unknown response cannot manufacture authority.
-type replicaReadLease struct {
-	owner    Ownership
-	deadline time.Time
-}
+	"example.com/vector-storage/internal/lease"
+)
 
+// Only a confirmed renewal for this ready replica can establish read authority.
 func (e *localPartition) grantReadLease(start time.Time, owner Ownership, ttl time.Duration) {
-	if !owner.Ready || !sameOwner(e.owner, owner) || e.readRetired.Load() {
+	if !owner.Ready || owner.Released || !sameOwner(e.owner, owner) {
 		return
 	}
-	e.readLease.Store(&replicaReadLease{owner: owner, deadline: leaseDeadline(start, ttl)})
+	e.readLease.Confirm(start, lease.Grant{Epoch: owner.Epoch, Expires: owner.Expires, Remaining: ttl})
 }
 
 func (e *localPartition) retireReads() {
-	e.readRetired.Store(true)
-	e.readLease.Store(nil)
+	e.readLease.Retire()
 }
 
 func (e *localPartition) checkReadLease(req partitionRPC) error {
-	l := e.readLease.Load()
-	if e.readRetired.Load() || l == nil || !time.Now().Before(l.deadline) ||
-		!sameOwner(l.owner, e.owner) || req.Partition != l.owner.Partition ||
-		req.Epoch != l.owner.Epoch || req.Session != l.owner.Session {
+	var epoch uint64
+	if req.Partition != e.owner.Partition || req.Session != e.owner.Session ||
+		!e.readLease.InLeaderLease(&epoch) || req.Epoch != epoch {
 		return ErrFenced
 	}
 	return nil

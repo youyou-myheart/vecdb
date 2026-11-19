@@ -65,7 +65,8 @@ func TestDispatchPollsOnlyRequiredGraphTails(t *testing.T) {
 func TestDispatcherIdleAndCachedWindowMetadataIO(t *testing.T) {
 	f, c, o := routedFixture(t)
 	lease := &appendLease{}
-	s := &dataDispatcher{owner: o, writer: &mutationGroup{lease: lease}, deadline: time.Now().Add(time.Minute)}
+	confirmAppendGrant(t, lease, o.Epoch, o.Expires, time.Minute)
+	s := &dataDispatcher{owner: o, writer: &mutationGroup{lease: lease}}
 	c.dispatchers = map[DataPartitionID]*dataDispatcher{0: s}
 	if err := c.loadDispatchWindow(f.ctx, 0, s); err != nil {
 		t.Fatal(err)
@@ -85,9 +86,9 @@ func TestDispatcherIdleAndCachedWindowMetadataIO(t *testing.T) {
 	if err := c.loadDispatchWindow(f.ctx, 0, s); err != nil || calls != 0 {
 		t.Fatal("cached window reread", err, calls)
 	}
-	s.deadline = time.Now().Add(-time.Second)
+	lease.Retire()
 	if c.dispatchSelected(f.ctx, []DataPartitionID{0}, false) || calls != 0 {
-		t.Fatal("expired wake renewed authority", calls)
+		t.Fatal("retired wake renewed authority", calls)
 	}
 }
 func TestReplicaProgressReportsOnlyConfirmedChanges(t *testing.T) {
@@ -194,7 +195,11 @@ func TestDataMaintenanceSelectsOwnedHealthyWriters(t *testing.T) {
 	c := &ClusterService{writers: make(map[DataPartitionID]*mutationGroup)}
 	for _, id := range []DataPartitionID{1, 3} {
 		lease := &appendLease{owner: Ownership{Partition: sourceID(id), Epoch: 7}}
-		lease.uncertain.Store(id == 3)
+		confirmAppendGrant(t, lease, lease.owner.Epoch, 1<<60, time.Minute)
+		if id == 3 {
+			lease.Retire()
+			lease.uncertain.Store(true)
+		}
 		c.writers[id] = &mutationGroup{lease: lease}
 	}
 	owners := c.localDataOwners()

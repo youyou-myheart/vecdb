@@ -28,6 +28,7 @@ func runIndexConsumer(ctx context.Context, in *routedInput, partition string, st
 	p := &in.cluster.observations.pipeline
 	retry := initialIndexRetry
 	reason := "start"
+	pollDelay := followerPollInterval
 	for ctx.Err() == nil {
 		// Discard a notification already covered by the next queue check. Any
 		// enqueue racing with the subsequent empty check leaves a new token.
@@ -56,6 +57,7 @@ func runIndexConsumer(ctx context.Context, in *routedInput, partition string, st
 		}
 		retry = initialIndexRetry
 		if more {
+			pollDelay = followerPollInterval
 			reason = "continue"
 			if !leader {
 				reason = "follower_continue"
@@ -65,7 +67,7 @@ func runIndexConsumer(ctx context.Context, in *routedInput, partition string, st
 		var timer *time.Timer
 		var poll <-chan time.Time
 		if !leader {
-			timer = time.NewTimer(followerPollInterval)
+			timer = time.NewTimer(pollDelay)
 			poll = timer.C
 		}
 		in.waiting.Store(true)
@@ -74,8 +76,10 @@ func runIndexConsumer(ctx context.Context, in *routedInput, partition string, st
 		case <-ctx.Done():
 		case <-in.wake:
 			reason = "notification"
+			pollDelay = followerPollInterval
 		case <-poll:
 			reason = "follower_poll"
+			pollDelay = min(2*pollDelay, time.Second)
 		}
 		idle(nil)
 		in.waiting.Store(false)

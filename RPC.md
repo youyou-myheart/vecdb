@@ -40,7 +40,9 @@ Go/Python SDK 首次写某数据分片时从 Gateway 获取路由，随后复用
 
 `Put.expected_revision` / `Delete.expected_revision` 是 optional：省略表示无版本条件，0 表示记录当前版本必须为 0，正值表示 CAS 更新/删除。SDK 的 insert 自动携带 0；update 要求正版本。每次逻辑写操作使用新的 request_id，重试保持 request_id 和所有请求参数不变。SDK 不主动重试写入；遇到超时，写入可能已提交，使用同一请求 ID 查询/重试，不能假定失败意味着没有写入。
 
-List 的 limit=0 使用默认 100，最大 1000。可能出现空 records 但仍有 next_cursor，必须继续读取直到游标为空。每页是独立事务视图，跨页不是时间点快照，详见 CLI.md 的列表语义。
+`DATA_BACKEND=raw` 的 namespace 在数据分片内对 `request_id` 判重。返回 `Durable=true` 时，最终版本和回执已经随该分片的日志持久化。`Get` 读取连续持久化前缀，索引投递从后台发布头继续推进。 [RawKV 写入协议](CLUSTER_ROUTING.md#rawkv-数据写入)
+
+List 的 limit=0 使用默认 100，最大 1000。可能出现空 records 但仍有 next_cursor，必须继续读取直到游标为空。TxnKV 每页读取一次事务视图，RawKV 每页按访问顺序读取各分片的视图。客户端需要跨页导出一致数据时，应使用检查点和订阅日志。详见 CLI.md 的列表语义。
 
 Search 的 k 必须为 1..1000。`index_partitions` 可选择逻辑索引分片，空列表为全部分片；重复、未知分片及与 min_visible 同时使用均拒绝。结果来自副本已应用的索引，不逐候选回查 TiKV，允许旧版本与延迟删除。min_visible 使用写入响应 token，同步索引并检查指定记录版本；不是跨记录事务快照。
 
@@ -247,20 +249,20 @@ GetCluster 的 GraphHead 新增 `source_epochs`（字段 13）和 `checkpoint_so
 | 路径 | 已省去或合并 | 必须保留的读取/检查 |
 |---|---|---|
 | Health / GetLayout | 原本就是内存读取 | 无动态元数据读取 |
-| Get / SDK search_by_id 的 Get | 不解析 owner；按 ID 直接定位数据分区 | 当前记录本身的 TiKV 读取 |
-| List | 使用内存布局、一次页面快照 | 记录扫描及游标校验 |
-| Put / Delete | SDK/Gateway 缓存数据 owner，Worker 用本地租约接单，不逐批读取任期 guard | CAS、幂等凭证、每 100 个成功批次顺带写一次 guard、租约限定的提交时间戳、提交未知后的恢复 |
+| Get / SDK search_by_id 的 Get | 按 ID 定位数据分区，RawKV 优先读取租约内的 owner 内存视图 | owner 不可用时从 Raw WAL 恢复，TxnKV 读取记录键 |
+| List | 使用内存布局，RawKV 页面按分片固定日志视图 | 记录扫描及游标校验 |
+| Put / Delete | SDK/Gateway 缓存数据 owner，Worker 用本地租约接单，不逐批读取任期 guard | RawKV 每个非空批次一次 BatchPut，任期内从内存确认连续位点；TxnKV 每 100 个成功批次写一次 guard，并限定提交时间戳 |
 | ResolveWriteRoute | 仅冷启动/过期路由发现使用，SDK 缓存按分区复用 | 明确的重新发现必须读取当前 owner |
 | Search | 缓存选片/副本地址；普通查询使用确认续租的本地读租约 | 旧 hot 非图协议仍保留其 ReadThrough 数据头屏障 |
 | FollowerSearch | 不再逐请求读取计划与 owner | 每批重新捕获 Leader applied 位点、Follower 等待与身份校验 |
-| min_visible | HTTP/gRPC 不重复 Sync；路由层复用已读取记录的目标分片 | 一次有限可见性屏障；删除 token 必须传给所有查询分片，检查所选副本的墓碑版本 |
+| min_visible | HTTP/gRPC 不重复 Sync；路由层复用已读取记录的目标分片 | 图副本从已应用视图验证目标版本，删除 token 传给全部查询分片 |
 | GetSearchRoutes | 节点、计划、owner 在一次快照内批量扫描并缓存 | 冷启动、过期/失败刷新；不缓存授予权限的结论 |
 | Checkpoint / Rebuild / Prune / Sync | 缓存 Publisher 地址；数据 Prune 发给 source owner；Worker 从本地已确认的 lease 验证任期 | 实际提交内的 ReplicaFence、guard、保留水位 |
 | ReadChanges | 内存布局定位，无额外 owner 发现 | 同一 MVCC 快照内的 head/floor、日志内容与 reset 判定 |
 | ManageConsumer | 无额外地址解析 | acquire/ACK/release 的 epoch、租约、head/floor 必须与 GC 串行化 |
 | GetCluster / 全局 metrics | 不参与正常 SDK 查询；无需为选片生成全量状态 | 显式运维观测保持即时读取；只需本机指标可用 scope=local |
-| 内部 deliver | 每批不再 Plan + Resolve，复用 Publisher 地址 | SourceEpoch 接纳、索引写 guard、结果不确定不自动重放 |
-| 内部 wake_source | 不再每次 Resolve 来源 owner | 只是唤醒提示，不据此推进持久化水位；失败失效地址提示 |
+| 内部 deliver | 每批不再 Plan + Resolve，复用 Publisher 地址 | 来源任期接纳、完整区间覆盖、图追加任期内提交 |
+| 内部 wake_source | 不再每次 Resolve 来源 owner | 成功提交的图回执携带来源任期与累计 LSN，普通唤醒只触发检查 |
 | applied_position | 原本只读取有效本地租约下的内存位点 | 每个 Follower 批次仍须重新捕获，不能跨请求缓存屏障 |
 | 后台重建检查/维护 | 无需重建时不查询计划；定时维护复用角色提示 | 控制循环续租/接管保持权威读取；GC/快照提交仍检查最新事务状态 |
 

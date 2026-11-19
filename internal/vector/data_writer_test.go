@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"example.com/vector-storage/internal/lease"
 )
 
 type countingTail struct {
@@ -25,6 +27,13 @@ func (tx boundedAppendTestTx) commitBeforeLeaseExpiry(ctx context.Context, _ int
 	return tx.Commit(ctx)
 }
 
+func confirmAppendGrant(t *testing.T, l *appendLease, epoch uint64, expires int64, remaining time.Duration) {
+	t.Helper()
+	if !l.Confirm(time.Now(), lease.Grant{Epoch: epoch, Expires: expires, Remaining: remaining}) {
+		t.Fatal("test lease was not confirmed")
+	}
+}
+
 func TestOwnedWriteGuardEvery100ConfirmedBatches(t *testing.T) {
 	ctx := context.Background()
 	repo, db := newFakeRepo()
@@ -35,7 +44,7 @@ func TestOwnedWriteGuardEvery100ConfirmedBatches(t *testing.T) {
 	}
 	const key = "cluster/write-epochs/data-0000"
 	lease := &appendLease{boundCommitTS: true, guard: []byte(key), token: []byte("1")}
-	lease.grant.Store(&appendGrant{deadline: time.Now().Add(time.Minute), expires: 1 << 60})
+	confirmAppendGrant(t, lease, 1, 1<<60, time.Minute)
 	db.getFail = key
 	request := func(i int) []*mutationRequest {
 		id := fmt.Sprint(i)
@@ -80,7 +89,7 @@ func TestOwnerAppendRecoveryAndTailReads(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				g.lease.grant.Store(&appendGrant{deadline: time.Now().Add(time.Minute), expires: db.nowMillis + 1000})
+				confirmAppendGrant(t, g.lease, epoch, db.nowMillis+1000, time.Minute)
 				return g.lease
 			}
 			l := take(1)
@@ -120,8 +129,9 @@ func TestOwnerAppendRecoveryAndTailReads(t *testing.T) {
 			}
 			// Simulate a suspended writer whose local clock still admits the
 			// old grant, but whose next transaction starts after PD expiry.
-			l.uncertain.Store(false)
-			if err := appendOne(l, "stale"); !errors.Is(err, ErrFenced) {
+			stale := &appendLease{owner: l.owner, guard: l.guard, token: l.token}
+			confirmAppendGrant(t, stale, l.owner.Epoch, 2000, time.Minute)
+			if err := appendOne(stale, "stale"); !errors.Is(err, ErrFenced) {
 				t.Fatal(err)
 			}
 			if next.head.Load() != 5 || reads != 2 {
@@ -147,16 +157,59 @@ func TestExpiredAppendGrantStopsBeforeTiKV(t *testing.T) {
 	repo, _ := newFakeRepo()
 	group := newMutationGroup(ctx, repo, &pipelineMetrics{}, "data-0000")
 	defer group.close()
-	lease := &appendLease{}
-	group.lease = lease
-	lease.grant.Store(&appendGrant{deadline: time.Now().Add(-time.Second), expires: 1 << 60})
+	group.lease = &appendLease{}
+	if group.lease.Confirm(time.Now().Add(-time.Second), lease.Grant{Epoch: 1, Expires: 1 << 60, Remaining: time.Second}) {
+		t.Fatal("expired grant confirmed")
+	}
 	repo.beginTxn = func() (transactionAPI, error) { t.Fatal("expired owner started a transaction"); return nil, injected }
 	m := Mutation{RequestID: "a", Vector: []float64{1, 2}}
 	if _, err := group.mutate(ctx, "a", m, false); !errors.Is(err, ErrFenced) {
 		t.Fatal(err)
 	}
-	if _, err := repo.appendGroup(ctx, []*mutationRequest{preparedRequest(t, repo, "a", m, false)}, lease); !errors.Is(err, ErrFenced) {
+	if _, err := repo.appendGroup(ctx, []*mutationRequest{preparedRequest(t, repo, "a", m, false)}, group.lease); !errors.Is(err, ErrFenced) {
 		t.Fatal(err)
+	}
+}
+
+func TestMutateOwnedRejectsAcknowledgmentAfterLeaseLoss(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := newFakeRepo()
+	layout, err := newLayout(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &ClusterService{
+		runCtx:             ctx,
+		root:               repo,
+		coordinator:        &Coordinator{root: repo},
+		writers:            make(map[DataPartitionID]*mutationGroup),
+		PartitionedService: &PartitionedService{data: map[DataPartitionID]*Repository{0: repo}, router: IdentityPartitionRouter{layout}},
+	}
+	owner := Ownership{Partition: sourceID(0), Epoch: 1, Session: "s"}
+	group, err := c.recoverWriter(ctx, 0, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer group.close()
+	confirmAppendGrant(t, group.lease, owner.Epoch, 1<<60, time.Minute)
+	c.writers[0] = group
+	group.onCommit = group.lease.Retire
+	m := Mutation{RequestID: "a", Vector: []float64{1, 2}}
+	if _, err := c.MutateOwned(ctx, repo.Prefix, 0, owner.Epoch, owner.Session, "a", m, false); !errors.Is(err, ErrFenced) {
+		t.Fatal("acknowledged write after lease loss", err)
+	}
+	c.retireWriter(0)
+	owner.Epoch++
+	next, err := c.recoverWriter(ctx, 0, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.close()
+	confirmAppendGrant(t, next.lease, owner.Epoch, 1<<60, time.Minute)
+	c.writers[0] = next
+	record, err := c.MutateOwned(ctx, repo.Prefix, 0, owner.Epoch, owner.Session, "a", m, false)
+	if err != nil || record.Revision != 1 || next.lease.head.Load() != 1 {
+		t.Fatal("retry did not reuse the durable receipt", record, err)
 	}
 }
 
@@ -170,7 +223,7 @@ func TestOwnedWritesSubmitFirstThenCombineQueuedBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cancel(); group.close() })
-	group.lease.grant.Store(&appendGrant{deadline: time.Now().Add(time.Minute), expires: 1 << 60})
+	confirmAppendGrant(t, group.lease, group.lease.owner.Epoch, 1<<60, time.Minute)
 	begin := repo.beginTxn
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once

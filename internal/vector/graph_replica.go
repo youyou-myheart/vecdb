@@ -17,13 +17,15 @@ type graphBlobs interface {
 	loadBytes(context.Context, Manifest) ([]byte, error)
 }
 type graphReplica struct {
-	followerReads *followerReadQueue // Under viewMu; position publication wakes waiters.
+	lastReset     recallRebuildResult // Protected by Service.syncMu.
+	followerReads *followerReadQueue  // Under viewMu; position publication wakes waiters.
 	writer        *indexWriter
 	fastAppend    bool // Under Service.syncMu and writer.op.
 	input         *routedInput
 	retention     bool
 	checkpointMu  sync.Mutex
 	viewMu        sync.RWMutex
+	appliedChange chan struct{}
 	journal       graphJournal
 	repo          *Repository
 	objects       graphBlobs
@@ -35,6 +37,10 @@ type graphReplica struct {
 }
 
 func newGraphService(ctx context.Context, r *Repository, o ObjectAPI, j graphJournal) (*Service, error) {
+	return newGraphServiceWithPolicy(ctx, r, o, j, IndexPolicy{})
+}
+
+func newGraphServiceWithPolicy(ctx context.Context, r *Repository, o ObjectAPI, j graphJournal, policy IndexPolicy) (*Service, error) {
 	blobs, ok := o.(graphBlobs)
 	if !ok {
 		return nil, errors.New("graph journal object adapter unavailable")
@@ -75,6 +81,7 @@ func newGraphService(ctx context.Context, r *Repository, o ObjectAPI, j graphJou
 		g.position = head.CheckpointPosition
 		s.cursor = g.position.DataOffset
 	}
+	s.setIndexPolicy(policy)
 	if e = g.catchUp(ctx, s, head.Visible); e != nil {
 		return nil, e
 	}
@@ -139,6 +146,7 @@ func (g *graphReplica) apply(s *Service, d *GraphDelta, state *IndexSnapshot, po
 	if fresh != nil {
 		s.Index.mu.Lock()
 		s.Index.replaceGraphLocked(fresh)
+		g.lastReset = recallRebuildResult{Epoch: s.Index.epoch, DataOffset: pos.DataOffset}
 		s.Index.mu.Unlock()
 	} else if d != nil {
 		if e = s.Index.ApplyDelta(*d, false); e != nil {
@@ -146,6 +154,10 @@ func (g *graphReplica) apply(s *Service, d *GraphDelta, state *IndexSnapshot, po
 		}
 	}
 	g.position = pos
+	if g.appliedChange != nil {
+		close(g.appliedChange)
+		g.appliedChange = nil
+	}
 	s.cursor = pos.DataOffset
 	if g.followerReads != nil {
 		g.followerReads.applied(pos)
@@ -204,12 +216,12 @@ func (g *graphReplica) validateDelta(s *Service, d GraphDelta) (err error) {
 // elected leader completes a committed entry before touching the data journal.
 func (g *graphReplica) sync(ctx context.Context, s *Service, rebuild bool) error {
 	if g.writer != nil {
-		return g.syncLeased(ctx, s, rebuild)
+		return g.syncLeased(ctx, s, rebuild, 0)
 	}
-	return g.syncSlow(ctx, s, rebuild)
+	return g.syncSlow(ctx, s, rebuild, nil)
 }
 
-func (g *graphReplica) syncSlow(ctx context.Context, s *Service, rebuild bool) (err error) {
+func (g *graphReplica) syncSlow(ctx context.Context, s *Service, rebuild bool, resetToken []byte) (err error) {
 	defer g.track("graph_sync")(&err)
 	// Explicit sync/rebuild paths can fail after a durable commit. Wake the
 	// consumer even if no new data arrives so durable replay can recover.
@@ -276,7 +288,11 @@ func (g *graphReplica) syncSlow(ctx context.Context, s *Service, rebuild bool) (
 			if err != nil {
 				return err
 			}
-			entry, err := g.journal.Commit(ctx, head, s.cursor, "reset", m)
+			var writer *indexWriter
+			if resetToken != nil {
+				writer = g.writer
+			}
+			entry, err := g.journal.commitWithAuthority(ctx, head, s.cursor, "reset", m, nil, nil, nil, resetToken, writer)
 			if err != nil {
 				return err
 			}

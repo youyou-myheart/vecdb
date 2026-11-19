@@ -111,7 +111,7 @@ func TestTiKVDataAppendCommitRetryCannotCrossLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writer.lease.grant.Store(&appendGrant{deadline: time.Now().Add(time.Second), expires: old.Expires})
+	confirmAppendGrant(t, writer.lease, old.Epoch, old.Expires, time.Second)
 	expiryTS := uint64(old.Expires) << 18
 	q := preparedRequest(t, f.r, "delayed", Mutation{RequestID: "delayed", Vector: []float64{1, 2}}, false)
 	var successor *mutationGroup
@@ -159,7 +159,7 @@ func TestTiKVDataAppendCommitRetryCannotCrossLease(t *testing.T) {
 				if err != nil || successor.lease.head.Load() != 0 {
 					t.Fatal("successor recovered an uncommitted append", err)
 				}
-				successor.lease.grant.Store(&appendGrant{deadline: time.Now().Add(time.Second), expires: owner.Expires})
+				confirmAppendGrant(t, successor.lease, owner.Epoch, owner.Expires, time.Second)
 				resp, err := next(target, req)
 				if err != nil {
 					t.Fatal(err)
@@ -292,7 +292,7 @@ func TestTiKVInflightAppendFencedAtTakeover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g.lease.grant.Store(&appendGrant{deadline: time.Now().Add(time.Second), expires: successor.Expires})
+	confirmAppendGrant(t, g.lease, successor.Epoch, successor.Expires, time.Second)
 	if _, err = f.r.appendGroup(f.ctx, []*mutationRequest{q}, g.lease); err != nil || g.lease.head.Load() != 1 {
 		t.Fatal(err, g.lease.head.Load())
 	}

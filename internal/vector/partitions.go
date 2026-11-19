@@ -144,6 +144,14 @@ type PartitionedService struct {
 }
 
 func OpenPartitionedService(ctx context.Context, root *Repository, objects ObjectAPI, count int) (*PartitionedService, error) {
+	return OpenPartitionedServiceWithIndexPolicy(ctx, root, objects, count, IndexPolicy{})
+}
+
+func OpenPartitionedServiceWithIndexPolicy(ctx context.Context, root *Repository, objects ObjectAPI, count int, policy IndexPolicy) (*PartitionedService, error) {
+	if err := policy.Validate(); err != nil {
+		return nil, err
+	}
+	policy = policy.clone()
 	if err := root.ensureMode(ctx, false); err != nil {
 		return nil, err
 	}
@@ -170,7 +178,7 @@ func OpenPartitionedService(ctx context.Context, root *Repository, objects Objec
 		if count > 1 {
 			indexRepo.IndexPrefix = fmt.Sprintf("%sindex/%s/", root.Prefix, indexID)
 		}
-		service, err := NewService(ctx, &indexRepo, objects)
+		service, err := openIndexService(ctx, &indexRepo, objects, policy, nil)
 		if err != nil {
 			return nil, err
 		}

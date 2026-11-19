@@ -34,7 +34,7 @@ func (r *Repository) logKey(n uint64) []byte { return []byte(fmt.Sprintf("%slog/
 
 // logHead looks up one tail key at the caller's snapshot. GC atomically
 // records the last removed LSN, including when the entire log is compacted.
-func (r *Repository) logHead(ctx context.Context, tx transactionAPI) (uint64, error) {
+func (r *Repository) logHead(ctx context.Context, tx dataReader) (uint64, error) {
 	prefix := r.Prefix + "log/"
 	key, err := tx.LastKey(ctx, []byte(prefix), []byte(r.Prefix+"log0"))
 	if tikverr.IsErrNotFound(err) {
@@ -53,7 +53,7 @@ func (r *Repository) logHead(ctx context.Context, tx transactionAPI) (uint64, er
 	return n, nil
 }
 
-func (r *Repository) readCounter(ctx context.Context, tx transactionAPI, name string) (uint64, error) {
+func (r *Repository) readCounter(ctx context.Context, tx dataReader, name string) (uint64, error) {
 	b, e := tx.Get(ctx, []byte(r.Prefix+name))
 	if tikverr.IsErrNotFound(e) {
 		return 0, nil
@@ -66,7 +66,7 @@ func (r *Repository) readCounter(ctx context.Context, tx transactionAPI, name st
 	return n, e
 }
 func (r *Repository) Bootstrap(ctx context.Context) ([]Record, uint64, error) {
-	tx, e := r.begin()
+	tx, e := r.beginDataRead(ctx)
 	if e != nil {
 		return nil, 0, e
 	}
@@ -75,7 +75,7 @@ func (r *Repository) Bootstrap(ctx context.Context) ([]Record, uint64, error) {
 	if e != nil {
 		return nil, 0, e
 	}
-	// The head and every record are read at one TiKV transaction snapshot.
+	// The head and every record are read at the same data snapshot.
 	rows, e := r.scanTxn(ctx, tx, "record")
 	return rows, head, e
 }
@@ -87,7 +87,7 @@ func (r *Repository) readEvents(ctx context.Context, after, through uint64, limi
 	if limit < 1 || limit > LogBatchSize {
 		return out, errors.New("invalid log batch size")
 	}
-	tx, e := r.begin()
+	tx, e := r.beginDataRead(ctx)
 	if e != nil {
 		return out, e
 	}
@@ -95,14 +95,14 @@ func (r *Repository) readEvents(ctx context.Context, after, through uint64, limi
 	return r.readEventsIn(ctx, tx, after, through, limit, byteLimit)
 }
 
-func (r *Repository) readEventsIn(ctx context.Context, tx transactionAPI, after, through uint64, limit, byteLimit int) (LogBatch, error) {
+func (r *Repository) readEventsIn(ctx context.Context, tx dataReader, after, through uint64, limit, byteLimit int) (LogBatch, error) {
 	head, e := r.logHead(ctx, tx)
 	if e != nil {
 		return LogBatch{}, e
 	}
 	return r.readEventsAtHead(ctx, tx, after, through, head, limit, byteLimit)
 }
-func (r *Repository) readEventsAtHead(ctx context.Context, tx transactionAPI, after, through, head uint64, limit, byteLimit int) (LogBatch, error) {
+func (r *Repository) readEventsAtHead(ctx context.Context, tx dataReader, after, through, head uint64, limit, byteLimit int) (LogBatch, error) {
 	out := LogBatch{Head: head}
 	var e error
 	out.Floor, e = r.readCounter(ctx, tx, "log-floor")
@@ -171,6 +171,11 @@ func (r *Repository) readEventsAtHead(ctx context.Context, tx transactionAPI, af
 func (r *Repository) PruneEvents(ctx context.Context, limit int) (uint64, error) {
 	if limit < 1 || limit > LogBatchSize {
 		return 0, errors.New("invalid prune batch size")
+	}
+	if r.usesRawShardData() {
+		// Raw WAL entries also back record and receipt recovery. Keep the
+		// entire history until a durable checkpoint can replace it.
+		return 0, ctx.Err()
 	}
 	tx, e := r.begin()
 	if e != nil {

@@ -7,7 +7,7 @@
 
 聚类投递模式的 Index Leader 已改成事件消费：每个本地 IndexPartition 副本有一个消费 goroutine，由分片加载启动，随 owner context 取消而退出。成功入队通过容量为 1 的 channel 通知消费者；有积压就连续处理下一批，空队列阻塞等待通知。正常 Leader 队列不再使用 500 ms 或 10 ms 定时轮询。
 
-Follower 成功回放后如果图位点前进，立即开始下一轮 tail，重新读取持久化图头，追赶上一轮读取期间追加的日志；直到一次 tail 没有推进位点，才等待 100 ms 后重试。每轮之间释放锁、重新检查 owner 和计划，错误沿用退避重试。Follower 的继续条件只看本轮回放进度，不看降级后可能残留的 Leader 输入队列。`vecdb_index_consumer_cycles_total{reason="follower_continue"}` 记录这种立即重读，`reason="follower_poll"` 记录空闲后的轮询。空闲时新日志的发现仍可能等待这 100 ms，本次没有增加跨节点推送通知。
+Follower 成功回放后如果图位点前进，立即开始下一轮 tail，重新读取持久化图头，追赶上一轮读取期间追加的日志；直到一次 tail 没有推进位点，才开始空闲轮询，间隔从 100 ms 退避至 1 秒。每轮之间释放锁、重新检查 owner 和计划，错误沿用退避重试。Follower 的继续条件只看本轮回放进度，不看降级后可能残留的 Leader 输入队列。`vecdb_index_consumer_cycles_total{reason="follower_continue"}` 记录这种立即重读，`reason="follower_poll"` 记录空闲后的轮询。空闲时新日志的发现仍可能等待这 100 ms，本次没有增加跨节点推送通知。
 
 ```mermaid
 flowchart LR
@@ -36,9 +36,9 @@ v13 聚类协议移除了图提交中的共享来源 fencing key 和 NOWAIT 悲�
 
 跨 Region 的图提交还可能让 ReplicaPlan 读取等待 2PC 锁。Gateway 的图查询在已有最近成功计划时，将新计划读取预算设为 100 ms；仅该读取超时时，才把最后一次成功读取的计划作为选副本的提示。地址提示不承担权限有效期；非租约读路径每次请求仍重新 Resolve 当前 owner；聚类图复制的普通查询使用轻量路由快照缓存地址，Worker 在查询前后校验本地读租约和 epoch（见 RPC.md）。计划年龄不能替代这些权威检查，也不能因为计划读取锁等待跨过一个任意缓存 TTL 就停止尝试仍然有效的副本。缓存不能用于 sync/checkpoint/prune/rebuild，不能授予构图或发布权限；不存在、损坏、空计划及调用者取消都不能被缓存掩盖。`vecdb_route_plan_fallback_total` 记录此回退，`route_plan/error` 继续保留底层超时证据。
 
-DataDispatcher 也使用事件提示：原始数据提交后，Gateway 在本机有界集合中标记来源，再由独立 goroutine 解析 owner、发送经过集群鉴权的 `wake_source`。业务 ACK 不等待这次网络调用。图提交尝试结束后同样通知来源重新读取持久化水位；包括结果不确定的事务，通知本身永远不能推进 completed。整个窗口完成后立即调度下一窗口。各来源提示合并、总空间受 DataPartition 数量约束；失败退避有上限。
+DataDispatcher 在数据持久化后收到本地唤醒。索引确认图提交后，同机 owner 直接接收内存回执，跨机通过 `wake_source` 发送源任期、目标索引和累计提交位置。来源按实际目标推进连续前缀，并合并写入完成检查点。未知提交只触发检查，丢失的回执由持久图日志补齐。
 
-Follower 没有来源输入事件，当前仍以 100 ms 间隔追赶远端持久化图日志，转为 Leader 后关闭该轮询等待。DataDispatcher 保留 500 ms 控制巡检，用于租约管理、故障恢复和漏通知兜底；健康路径不等待它。旧的一一对应 pull 模式仍使用旧同步器。
+Follower 没有来源输入事件，通过带退避的空闲轮询追赶远端持久化图日志。Follower 查询捕获到更新的 Leader 位点时会立即唤醒消费者，转为 Leader 后关闭该轮询等待。DataDispatcher 保留 500 ms 控制巡检，用于租约管理、故障恢复和漏通知兜底；健康路径不等待它。旧的一一对应 pull 模式仍使用旧同步器。
 
 原生对象适配器在启动时完成一次独立 probe 对象的 PUT、GET、校验和 DELETE，成功后本进程的副本才宣布加载就绪。只检查 bucket 存在不足以证明 SeaweedFS 的 volume/filer lock ring 已可写。并发副本共用一次成功检查；失败不缓存，取消或清理失败不能标记就绪。该检查不构图、不等待业务日志，也不是持续健康缓存。
 
