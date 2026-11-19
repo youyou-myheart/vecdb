@@ -6,8 +6,10 @@ import (
 	"errors"
 	"math/rand"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"example.com/vector-storage/internal/lease"
 	tikverr "github.com/tikv/client-go/v2/error"
 )
 
@@ -118,28 +120,67 @@ type Master struct {
 	coordinator *Coordinator
 	node        ClusterNode
 	layout      PartitionLayout
+	owner       Ownership // Accessed by the control loop and released after it stops.
+	leader      atomic.Pointer[lease.Handle]
+}
+
+func (m *Master) InLeaderLease(epoch *uint64) bool {
+	state := m.leader.Load()
+	return state != nil && state.InLeaderLease(epoch)
+}
+
+func (m *Master) retireLeader() {
+	if state := m.leader.Load(); state != nil {
+		state.Retire()
+		m.leader.Store(nil)
+	}
+}
+
+func (m *Master) releaseLease(ctx context.Context) {
+	m.retireLeader()
+	_ = m.coordinator.releaseOwner(ctx, m.owner, nil)
+	m.owner = Ownership{}
 }
 
 func (m *Master) Tick(ctx context.Context, nodes []ClusterNode) error {
-	leader, e := m.coordinator.Resolve(ctx, masterLeaseID)
-	if e != nil {
-		if !errors.Is(e, ErrFenced) && !tikverr.IsErrNotFound(e) {
-			return e
-		}
-		leader, e = m.coordinator.Acquire(ctx, masterLeaseID, m.node)
-		if e != nil {
-			return e
-		}
+	leader, started, err := m.coordinator.campaignOwner(ctx, m.node, masterLeaseID, m.owner, nil, nil)
+	if m.owner.Epoch != 0 && (errors.Is(err, ErrFenced) || tikverr.IsErrNotFound(err)) {
+		m.retireLeader()
+		m.owner = Ownership{}
+		leader, started, err = m.coordinator.campaignOwner(ctx, m.node, masterLeaseID, m.owner, nil, nil)
 	}
-	if leader.Node != m.node.ID || leader.Session != m.node.Session {
+	if errors.Is(err, ErrConflict) {
 		return nil
 	}
-	leader, e = m.coordinator.Update(ctx, leader, true, false)
-	if e != nil {
-		return e
+	if err != nil {
+		return err
 	}
+	m.owner = leader
+	state := m.leader.Load()
+	if state == nil {
+		state = &lease.Handle{}
+		m.leader.Store(state)
+	}
+	state.Confirm(started, lease.Grant{
+		Epoch: leader.Epoch, Expires: leader.Expires, Remaining: time.Duration(m.coordinator.ttl) * time.Millisecond,
+	})
+	var epoch uint64
+	if !m.InLeaderLease(&epoch) || epoch != leader.Epoch {
+		return ErrFenced
+	}
+	if err := m.schedule(ctx, leader, nodes); err != nil {
+		return err
+	}
+	var after uint64
+	if !m.InLeaderLease(&after) || after != epoch {
+		return ErrFenced
+	}
+	return nil
+}
+
+func (m *Master) schedule(ctx context.Context, leader Ownership, nodes []ClusterNode) error {
 	if m.replicas > 1 {
-		if e = retryMasterSchedule(ctx, func(attempt int) (err error) {
+		if e := retryMasterSchedule(ctx, func(attempt int) (err error) {
 			if m.metrics != nil {
 				defer m.metrics.track("master_schedule_attempt", "")(&err)
 			}
@@ -153,7 +194,7 @@ func (m *Master) Tick(ctx context.Context, nodes []ClusterNode) error {
 			return e
 		}
 		if m.layout.Routing != nil {
-			nodes, e = m.coordinator.Nodes(ctx)
+			nodes, e := m.coordinator.Nodes(ctx)
 			if e != nil {
 				return e
 			}

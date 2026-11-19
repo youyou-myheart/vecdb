@@ -203,7 +203,8 @@ func newHandler(repo recordAPI, service searchAPI, dim int, token, namespace str
 			reply(w, 400, map[string]string{"error": e.Error()})
 			return
 		}
-		if q.MinVisible != nil {
+		owner, owns := service.(interface{ HandlesMinVisible() bool })
+		if q.MinVisible != nil && (!owns || !owner.HandlesMinVisible()) {
 			if e := service.Sync(r.Context()); e != nil {
 				reply(w, 503, map[string]string{"error": e.Error()})
 				return

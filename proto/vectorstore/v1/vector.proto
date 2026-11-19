@@ -15,6 +15,8 @@ service VectorStore {
   rpc FollowerSearch(SearchRequest) returns (SearchResponse);
   rpc Health(Empty) returns (HealthResponse);
   rpc GetCluster(Empty) returns (ClusterStatus);
+  // Lightweight centers/counts/replica hints, omitting graph and data progress.
+  rpc GetSearchRoutes(Empty) returns (ClusterStatus);
   rpc GetLayout(Empty) returns (Layout);
   rpc Checkpoint(Empty) returns (Manifest);
   rpc Rebuild(Empty) returns (Manifest);
@@ -30,7 +32,7 @@ message MutationResponse { bool durable=1; Token token=2; }
 message GetRequest { string id=1; }
 message ListRequest { uint32 limit=1; string cursor=2; bool include_deleted=3; }
 message ListResponse { repeated Record records=1; string next_cursor=2; }
-message SearchRequest { repeated double vector=1; uint32 k=2; map<string,string> filter=3; bool exact=4; uint32 ef_search=5; Token min_visible=6; }
+message SearchRequest { repeated double vector=1; uint32 k=2; map<string,string> filter=3; bool exact=4; uint32 ef_search=5; Token min_visible=6; repeated string index_partitions=7; }
 message Hit { string id=1; uint64 revision=2; double distance=3; map<string,string> payload=4; }
 message SearchResponse { repeated Hit hits=1; bool partial=2; repeated FollowerReadInfo follower_reads=3; }
 message FollowerReadInfo {
@@ -51,7 +53,7 @@ message PruneResponse { map<string,uint64> partitions=1; optional uint64 retaine
 message ReplicaPlan { repeated Assignment desired=1; repeated Assignment serving=2; uint64 barrier=3; string publisher=4; uint64 version=5; string task_id=6; bool lease_draining=7; }
 message ReplicaOwners { repeated Owner owners=1; }
 
-message ShardLoad { uint64 estimated_bytes=1; double busy=2; }
+message ShardLoad { uint64 estimated_bytes=1; double busy=2; uint64 live_records=3; bool records_known=4; }
 
 message GraphPosition { uint64 sequence=1; uint64 data_offset=2; string hash=3; }
 message GraphHead { uint64 term=1; Owner leader=2; GraphPosition committed=3; GraphPosition visible=4; Manifest checkpoint=5; GraphPosition checkpoint_position=6; GraphPosition floor=7; map<string,uint64> sources=8; uint64 log_bytes=9; uint64 checkpoint_bytes=10; map<string,uint64> checkpoint_sources=11; map<string,uint64> floor_sources=12; map<string,uint64> source_epochs=13; map<string,uint64> checkpoint_source_epochs=14; }

@@ -5,11 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	tikverr "github.com/tikv/client-go/v2/error"
+	"github.com/tikv/client-go/v2/tikvrpc"
+	"github.com/tikv/client-go/v2/tikvrpc/interceptor"
 )
 
 func TestTiKVMutationGroupsCompetingGateways(t *testing.T) {
@@ -87,6 +92,110 @@ func TestTiKVMutationGroupsCompetingGateways(t *testing.T) {
 	}
 }
 
+func TestTiKVDataAppendCommitRetryCannotCrossLease(t *testing.T) {
+	f := newEpochTiKVFixture(t, 0)
+	// Put the log and record/receipt on different Regions.
+	if ids, err := f.r.Client.SplitRegions(f.ctx, [][]byte{[]byte(f.r.Prefix + "record/")}, false, nil); err != nil || len(ids) == 0 {
+		t.Fatal("split write regions", ids, err)
+	}
+	f.c.runCtx = f.ctx
+	coord := f.c.coordinator
+	coord.holdReleasedLeases = true
+	coord.ttl = 1500
+	old, err := coord.Update(f.ctx, f.source, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coord.ttl = 60000
+	writer, err := f.c.recoverWriter(f.ctx, 0, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmAppendGrant(t, writer.lease, old.Epoch, old.Expires, time.Second)
+	expiryTS := uint64(old.Expires) << 18
+	q := preparedRequest(t, f.r, "delayed", Mutation{RequestID: "delayed", Vector: []float64{1, 2}}, false)
+	var successor *mutationGroup
+	commits := 0
+	var prewrites sync.Map
+	ctx := interceptor.WithRPCInterceptor(f.ctx, func(next interceptor.RPCInterceptorFunc) interceptor.RPCInterceptorFunc {
+		return func(target string, req *tikvrpc.Request) (*tikvrpc.Response, error) {
+			switch req.Type {
+			case tikvrpc.CmdPrewrite:
+				p := req.Prewrite()
+				prewrites.Store(req.Context.RegionId, struct{}{})
+				if p.TryOnePc || p.UseAsyncCommit {
+					t.Fatal("short commit path skipped the lease bound")
+				}
+				for _, mutation := range p.Mutations {
+					if string(mutation.Key) == string(coord.writeGuardKey(old.Partition)) {
+						t.Fatal("data batch still wrote the guard")
+					}
+				}
+			case tikvrpc.CmdCommit:
+				commits++
+				commit := req.Commit()
+				if commits == 2 {
+					if commit.CommitVersion < expiryTS {
+						t.Fatal("retry stayed below the expiry after takeover")
+					}
+					break // The actual lease interceptor must reject this RPC.
+				}
+				if commits != 1 || commit.CommitVersion >= expiryTS {
+					t.Fatal("expected an initial commit timestamp inside the lease")
+				}
+				// The commit is delayed after all data keys were prewritten.
+				// Let a new owner acquire and recover while those locks exist.
+				var owner Ownership
+				for {
+					owner, err = coord.Acquire(f.ctx, old.Partition, f.node)
+					if err == nil {
+						break
+					}
+					if !errors.Is(err, ErrConflict) || !waitIndexRetry(f.ctx, 25*time.Millisecond) {
+						t.Fatal(err)
+					}
+				}
+				successor, err = f.c.recoverWriter(f.ctx, 0, owner)
+				if err != nil || successor.lease.head.Load() != 0 {
+					t.Fatal("successor recovered an uncommitted append", err)
+				}
+				confirmAppendGrant(t, successor.lease, owner.Epoch, owner.Expires, time.Second)
+				resp, err := next(target, req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				actual, ok := resp.Resp.(*kvrpcpb.CommitResponse)
+				if !ok || actual.GetError() == nil {
+					t.Fatal("TiKV accepted a late commit after the successor read the tail")
+				}
+				// Exercise the retry even when recovery rolled back the lock
+				// and TiKV returned a terminal error instead of CommitTsExpired.
+				return &tikvrpc.Response{Resp: &kvrpcpb.CommitResponse{
+					Error: &kvrpcpb.KeyError{CommitTsExpired: &kvrpcpb.CommitTsExpired{
+						StartTs: commit.StartVersion, AttemptedCommitTs: commit.CommitVersion, MinCommitTs: expiryTS,
+					}},
+				}}, nil
+			}
+			return next(target, req)
+		}
+	})
+	if _, err = f.r.appendGroup(ctx, []*mutationRequest{q}, writer.lease); err == nil ||
+		!strings.Contains(err.Error(), "data writer lease expired before commit") || commits != 2 {
+		t.Fatal("expected the commit RPC limit to reject the retry", err, commits)
+	}
+	regions := 0
+	prewrites.Range(func(_, _ any) bool { regions++; return true })
+	if regions < 2 {
+		t.Fatal("expected a transaction spanning at least two Regions", regions)
+	}
+	if _, err = f.r.Get(f.ctx, "delayed"); !errors.Is(err, ErrNotFound) {
+		t.Fatal("late append became visible", err)
+	}
+	if _, err = f.r.appendGroup(f.ctx, []*mutationRequest{q}, successor.lease); err != nil || successor.lease.head.Load() != 1 {
+		t.Fatal(err, successor.lease.head.Load())
+	}
+}
+
 // Both optimistic appenders choose LSN 1. Even after GC deletes the winning
 // row, the loser must conflict, then restart at floor+1 in a fresh snapshot.
 func TestTiKVDataLogAppendRacingCompaction(t *testing.T) {
@@ -161,16 +270,12 @@ func TestTiKVInflightAppendFencedAtTakeover(t *testing.T) {
 	}
 	defer tx.Rollback()
 	guard := f.c.coordinator.writeGuardKey(f.source.Partition)
-	epoch, err := tx.Get(f.ctx, guard)
-	if err != nil {
-		t.Fatal(err)
-	}
 	cursor := appendCursor{known: true}
 	q := preparedRequest(t, f.r, "delayed", Mutation{RequestID: "delayed", Vector: []float64{1, 2}}, false)
 	if _, wrote, err := f.r.mutateIn(f.ctx, tx, q.preparedMutation, &cursor); err != nil || !wrote {
 		t.Fatal(err)
 	}
-	if err = tx.Set(guard, epoch); err != nil {
+	if err = tx.Set(guard, epochToken(f.source.Epoch)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = f.c.coordinator.Update(f.ctx, f.source, false, true); err != nil {
@@ -187,7 +292,7 @@ func TestTiKVInflightAppendFencedAtTakeover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g.lease.expires.Store(successor.Expires)
+	confirmAppendGrant(t, g.lease, successor.Epoch, successor.Expires, time.Second)
 	if _, err = f.r.appendGroup(f.ctx, []*mutationRequest{q}, g.lease); err != nil || g.lease.head.Load() != 1 {
 		t.Fatal(err, g.lease.head.Load())
 	}

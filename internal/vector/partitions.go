@@ -144,6 +144,14 @@ type PartitionedService struct {
 }
 
 func OpenPartitionedService(ctx context.Context, root *Repository, objects ObjectAPI, count int) (*PartitionedService, error) {
+	return OpenPartitionedServiceWithIndexPolicy(ctx, root, objects, count, IndexPolicy{})
+}
+
+func OpenPartitionedServiceWithIndexPolicy(ctx context.Context, root *Repository, objects ObjectAPI, count int, policy IndexPolicy) (*PartitionedService, error) {
+	if err := policy.Validate(); err != nil {
+		return nil, err
+	}
+	policy = policy.clone()
 	if err := root.ensureMode(ctx, false); err != nil {
 		return nil, err
 	}
@@ -170,7 +178,7 @@ func OpenPartitionedService(ctx context.Context, root *Repository, objects Objec
 		if count > 1 {
 			indexRepo.IndexPrefix = fmt.Sprintf("%sindex/%s/", root.Prefix, indexID)
 		}
-		service, err := NewService(ctx, &indexRepo, objects)
+		service, err := openIndexService(ctx, &indexRepo, objects, policy, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -248,12 +256,19 @@ func (p *PartitionedService) SearchContext(ctx context.Context, q Search) ([]Hit
 	if q.EFSearch < 0 || q.EFSearch > 4096 {
 		return nil, errors.New("ef_search must be 0..4096")
 	}
-	ids := p.router.QueryIndexes(q)
+	ids, err := p.queryIndexes(q)
+	if err != nil {
+		return nil, err
+	}
 	results := make([][]Hit, len(ids))
 	errs := make([]error, len(ids))
 	var wg sync.WaitGroup
 	var visibilityIndex IndexPartitionID
-	if q.MinVisible != nil {
+	if q.MinVisible != nil && q.visibilityAll {
+		// The deleted ID has no single vector destination.
+	} else if q.MinVisible != nil && q.visibilityIndex != "" {
+		visibilityIndex = q.visibilityIndex
+	} else if q.MinVisible != nil {
 		var e error
 		record := Record{ID: q.MinVisible.ID}
 		if p.layout.Routing != nil {
@@ -277,7 +292,7 @@ func (p *PartitionedService) SearchContext(ctx context.Context, q Search) ([]Hit
 				return
 			}
 			local := q
-			if id != visibilityIndex {
+			if id != visibilityIndex && !q.visibilityAll {
 				local.MinVisible = nil
 			}
 			if searcher, ok := index.(interface {
@@ -306,6 +321,7 @@ func (p *PartitionedService) SearchContext(ctx context.Context, q Search) ([]Hit
 		}
 		all = append(all, results[j]...)
 	}
+	all = deduplicateHits(all)
 	sort.Slice(all, func(a, b int) bool {
 		if all[a].Distance == all[b].Distance {
 			return all[a].ID < all[b].ID
@@ -354,3 +370,44 @@ func (p *PartitionedService) PruneState(ctx context.Context) (any, error) {
 }
 
 func (p *PartitionedService) VectorDimension() int { return p.dimension }
+
+var ErrInvalidSearchPartitions = errors.New("invalid search partitions")
+
+func (p *PartitionedService) queryIndexes(q Search) ([]IndexPartitionID, error) {
+	ids := p.router.QueryIndexes(q)
+	if len(q.IndexPartitions) == 0 {
+		return ids, nil
+	}
+	if len(q.IndexPartitions) > len(ids) || q.MinVisible != nil {
+		return nil, ErrInvalidSearchPartitions
+	}
+	allowed := make(map[IndexPartitionID]bool, len(ids))
+	for _, id := range ids {
+		allowed[id] = true
+	}
+	seen := make(map[IndexPartitionID]bool)
+	for _, id := range q.IndexPartitions {
+		if !allowed[id] || seen[id] {
+			return nil, ErrInvalidSearchPartitions
+		}
+		seen[id] = true
+	}
+	return q.IndexPartitions, nil
+}
+
+// A move can be visible on two lagging shards. Prefer the newest returned
+// revision, then distance; this does not make an eventual view authoritative.
+func deduplicateHits(hits []Hit) []Hit {
+	best := make(map[string]Hit, len(hits))
+	for _, h := range hits {
+		old, ok := best[h.ID]
+		if !ok || h.Revision > old.Revision || h.Revision == old.Revision && h.Distance < old.Distance {
+			best[h.ID] = h
+		}
+	}
+	out := make([]Hit, 0, len(best))
+	for _, h := range best {
+		out = append(out, h)
+	}
+	return out
+}

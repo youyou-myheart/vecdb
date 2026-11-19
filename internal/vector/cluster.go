@@ -15,10 +15,12 @@ import (
 )
 
 type ClusterConfig struct {
+	IndexPolicy                 IndexPolicy
 	WriteEndpoint               string
 	GraphCheckpointBytes        uint64
 	GraphCheckpointAge          time.Duration
 	Routing                     *ClusterRouting
+	DataBackend                 string
 	ConsumerRetention           bool
 	IndexReplication            string
 	HostID, Zone, FailureDomain string
@@ -32,6 +34,11 @@ type ClusterConfig struct {
 	Roles                       string
 }
 type ClusterService struct {
+	indexPolicy        IndexPolicy
+	cachedRouting      bool
+	localOwnerLeases   bool
+	searchRoutes       searchRouteCache
+	placement          placementCache
 	checkpointBytes    uint64
 	checkpointAge      time.Duration
 	maintenanceDone    chan struct{}
@@ -74,6 +81,22 @@ type ClusterService struct {
 }
 
 func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI, count int, cfg ClusterConfig) (*ClusterService, error) {
+	if err := cfg.IndexPolicy.Validate(); err != nil {
+		return nil, err
+	}
+	if cfg.DataBackend == "" {
+		cfg.DataBackend = "txn"
+	}
+	if cfg.DataBackend != "txn" && cfg.DataBackend != "raw" {
+		return nil, errors.New("DATA_BACKEND must be txn or raw")
+	}
+	rawBackend := cfg.DataBackend == "raw"
+	if rawBackend && cfg.Routing == nil {
+		return nil, errors.New("DATA_BACKEND=raw requires cluster routing")
+	}
+	if rawBackend && cfg.ConsumerRetention {
+		return nil, errors.New("DATA_BACKEND=raw does not support consumer retention")
+	}
 	if cfg.GraphCheckpointBytes == 0 {
 		cfg.GraphCheckpointBytes = DefaultGraphCheckpointBytes
 	}
@@ -156,7 +179,7 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 		if cfg.IndexReplication != "graph" || cfg.Replicas != 2 {
 			return nil, errors.New("cluster routing requires graph replication and two replicas")
 		}
-		layout, e = root.ensureRoutedLayout(ctx, count, cfg.Routing, cfg.Scheduler, cfg.FailureDomain, cfg.ConsumerRetention)
+		layout, e = root.ensureRoutedLayoutWithBackend(ctx, count, cfg.Routing, cfg.Scheduler, cfg.FailureDomain, cfg.ConsumerRetention, rawBackend)
 	} else {
 		layout, e = root.ensureLayout(ctx, count)
 	}
@@ -189,8 +212,23 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 	if e = root.ensureScheduler(ctx, cfg.Scheduler, cfg.BalanceCooldown); e != nil {
 		return nil, e
 	}
+	started := false
+	if rawBackend {
+		raw, err := openRawDataStore(ctx, root.pd, root.Prefix)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if !started {
+				_ = raw.Close()
+			}
+		}()
+		rawRoot := *root
+		rawRoot.raw = raw
+		root = &rawRoot
+	}
 	runCtx, cancel := context.WithCancel(ctx)
-	c := &ClusterService{runCtx: runCtx, consumerRetention: cfg.ConsumerRetention, graphReplication: cfg.IndexReplication == "graph", lastSample: time.Now(), replicas: cfg.Replicas, PartitionedService: &PartitionedService{layout: layout, router: IdentityPartitionRouter{layout}, data: map[DataPartitionID]*Repository{}, indexes: map[IndexPartitionID]PartitionIndex{}, dimension: root.Dimension}, coordinator: &Coordinator{leaseReads: cfg.Routing != nil, failureDomain: cfg.FailureDomain, loadBalance: cfg.Scheduler == "load", balanceCooldown: cfg.BalanceCooldown, root: root, ttl: cfg.LeaseTTL.Milliseconds()}, node: node, objects: objects, token: cfg.Token, root: root, locals: map[IndexPartitionID]*localPartition{}, cancel: cancel, done: make(chan struct{}), client: &http.Client{Timeout: 30 * time.Second}}
+	c := &ClusterService{indexPolicy: cfg.IndexPolicy.clone(), cachedRouting: true, localOwnerLeases: true, runCtx: runCtx, consumerRetention: cfg.ConsumerRetention, graphReplication: cfg.IndexReplication == "graph", lastSample: time.Now(), replicas: cfg.Replicas, PartitionedService: &PartitionedService{layout: layout, router: IdentityPartitionRouter{layout}, data: map[DataPartitionID]*Repository{}, indexes: map[IndexPartitionID]PartitionIndex{}, dimension: root.Dimension}, coordinator: &Coordinator{leaseReads: cfg.Routing != nil, holdReleasedLeases: true, failureDomain: cfg.FailureDomain, loadBalance: cfg.Scheduler == "load", balanceCooldown: cfg.BalanceCooldown, root: root, ttl: cfg.LeaseTTL.Milliseconds()}, node: node, objects: objects, token: cfg.Token, root: root, locals: map[IndexPartitionID]*localPartition{}, cancel: cancel, done: make(chan struct{}), client: &http.Client{Timeout: 30 * time.Second}}
 	if cfg.Routing != nil {
 		c.router = clusterRouter{IdentityPartitionRouter{layout}, layout.Routing}
 		c.writers = make(map[DataPartitionID]*mutationGroup)
@@ -253,10 +291,11 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 		go c.notifySourceLoop(runCtx)
 	}
 	go c.run(runCtx, cfg.LeaseTTL/3)
-	if c.graphReplication && cfg.Routing != nil && c.worker != nil {
+	if c.graphReplication && cfg.Routing != nil && c.worker != nil && !rawBackend {
 		c.maintenanceDone = make(chan struct{})
 		go c.dataMaintenanceLoop(runCtx)
 	}
+	started = true
 	return c, nil
 }
 func (c *ClusterService) run(ctx context.Context, interval time.Duration) {
@@ -303,6 +342,9 @@ func (c *ClusterService) reconcile(ctx context.Context) {
 	}
 }
 func (c *ClusterService) Close() {
+	for _, e := range c.entries() {
+		e.retireReads()
+	}
 	c.cancel()
 	for _, group := range c.mutationGroups {
 		group.close()
@@ -320,14 +362,17 @@ func (c *ClusterService) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	for _, e := range c.entries() {
-		_, _ = c.coordinator.Update(ctx, e.owner, false, true)
+		_ = c.coordinator.releaseOwner(ctx, e.owner, nil)
 		c.remove(e)
 	}
 	c.retirementWG.Wait()
 	c.flushRetirements(ctx)
 	if c.master != nil {
-		if leader, e := c.coordinator.Resolve(ctx, masterLeaseID); e == nil && leader.Node == c.node.ID && leader.Session == c.node.Session {
-			_, _ = c.coordinator.Update(ctx, leader, false, true)
+		c.master.releaseLease(ctx)
+	}
+	if c.root.raw != nil {
+		if err := c.root.raw.Close(); err != nil {
+			log.Printf("close raw data store: %v", err)
 		}
 	}
 }

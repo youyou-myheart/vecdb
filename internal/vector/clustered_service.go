@@ -2,10 +2,46 @@ package vector
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 )
+
+func (c *ClusterService) Get(ctx context.Context, id string) (Record, error) {
+	d := c.router.DataForID(id)
+	repo := c.data[d]
+	if !repo.usesRawShardData() {
+		return repo.Get(ctx, id)
+	}
+	if err := ctx.Err(); err != nil {
+		return Record{}, err
+	}
+	if group, ok := repo.raw.local.Load(repo.Prefix); ok {
+		r, err := group.(*mutationGroup).readOwnedRecord(id)
+		if !errors.Is(err, ErrFenced) {
+			return r, err
+		}
+	}
+	if c.routeHintsEnabled() {
+		if state, err := c.cachedSearchRoutes(ctx, false); err == nil {
+			o := state.Owners[sourceID(d)]
+			if o.Epoch != 0 {
+				reply, err := c.sendPartition(ctx, o, partitionRPC{Namespace: c.root.Prefix, Partition: o.Partition, Epoch: o.Epoch, Session: o.Session, Source: &d, Operation: "get_owned", ID: id})
+				if err == nil {
+					if reply.Record == nil {
+						return Record{}, ErrNotFound
+					}
+					return *reply.Record, nil
+				}
+				if errors.Is(err, ErrFenced) {
+					c.expireSearchRoutes(state)
+				}
+			}
+		}
+	}
+	return repo.Get(ctx, id)
+}
 
 func (c *ClusterService) Mutate(ctx context.Context, id string, m Mutation, deleted bool) (_ Record, err error) {
 	partition := c.router.DataForID(id)
@@ -29,7 +65,7 @@ func (c *ClusterService) Sync(ctx context.Context) error {
 	}
 	// Capture a finite data frontier; ongoing writes cannot extend this wait.
 	targets := map[DataPartitionID]uint64{}
-	tx, e := c.root.begin()
+	tx, e := c.data[0].beginDataRead(ctx)
 	if e != nil {
 		return e
 	}
@@ -43,24 +79,42 @@ func (c *ClusterService) Sync(ctx context.Context) error {
 	_ = tx.Rollback()
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
-	for {
-		tx, e = c.root.begin()
-		if e != nil {
-			return e
-		}
-		ready := true
-		for d, target := range targets {
-			n, err := c.completedIn(ctx, tx, d)
-			if err != nil {
-				_ = tx.Rollback()
-				return err
+	for len(targets) > 0 {
+		c.writerMu.RLock()
+		var keys [][]byte
+		for id, n := range targets {
+			group := c.writers[id]
+			if n == 0 || group != nil && group.lease.InLeaderLease(nil) && group.lease.indexed.Load() >= n {
+				delete(targets, id)
+				continue
 			}
-			if n < target {
-				ready = false
-			}
+			keys = append(keys, completedKey(c.data[id]))
 		}
+		c.writerMu.RUnlock()
+		if len(keys) == 0 {
+			break
+		}
+		tx, err := c.root.begin()
+		if err != nil {
+			return err
+		}
+		values, err := batchGet(ctx, tx, keys)
 		_ = tx.Rollback()
-		if ready {
+		if err != nil {
+			return err
+		}
+		for id, n := range targets {
+			var completed uint64
+			if value, ok := values[string(completedKey(c.data[id]))]; ok {
+				if err := json.Unmarshal(value, &completed); err != nil {
+					return err
+				}
+			}
+			if completed >= n {
+				delete(targets, id)
+			}
+		}
+		if len(targets) == 0 {
 			break
 		}
 		select {
@@ -90,13 +144,23 @@ func (c *ClusterService) SearchContext(ctx context.Context, q Search) ([]Hit, er
 		if r.Revision < q.MinVisible.Revision {
 			return nil, ErrNotVisible
 		}
-		if e = c.Sync(ctx); e != nil {
-			return nil, e
+		// Routed graph replicas enforce the token on their applied view.
+		if !c.graphReplication {
+			if e = c.Sync(ctx); e != nil {
+				return nil, e
+			}
 		}
 		if r.Deleted {
-			q.MinVisible = nil
+			// Deletes are broadcast. Every selected replica must have applied
+			// the tombstone; clearing the token could expose a lagging copy.
+			q.MinVisible = &Token{ID: r.ID, Revision: r.Revision}
+			q.visibilityAll = true
 		} else {
 			q.MinVisible = &Token{ID: r.ID, Revision: r.Revision}
+			q.visibilityIndex, e = c.router.IndexForRecord(c.router.DataForID(r.ID), r)
+			if e != nil {
+				return nil, e
+			}
 		}
 	}
 	return c.PartitionedService.SearchContext(ctx, q)
@@ -165,79 +229,95 @@ func (c *ClusterService) PruneState(ctx context.Context) (any, error) {
 		return nil, e
 	}
 	floors := map[string]uint64{}
-	for d, r := range c.data {
-		owner, err := c.coordinator.Resolve(ctx, sourceID(d))
+	routes, err := c.cachedSearchRoutes(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	for d := range c.data {
+		id := sourceID(d)
+		owner := routes.Owners[id]
+		if owner.Epoch == 0 {
+			c.expireSearchRoutes(routes)
+			return nil, ErrPartitionUnavailable
+		}
+		reply, err := c.sendPartition(ctx, owner, partitionRPC{Namespace: c.root.Prefix, Partition: id, Session: owner.Session, Epoch: owner.Epoch, Source: &d, Operation: "prune_data"})
 		if err != nil {
+			c.expireSearchRoutes(routes)
 			return nil, err
 		}
-		repo := *r
-		repo.Fence = c.coordinator.Fence(owner)
-		repo.Retain = func(ctx context.Context, tx transactionAPI, end uint64) (uint64, error) {
-			n, e := c.completedIn(ctx, tx, d)
-			if e != nil {
-				return 0, e
-			}
-			return c.retainGraphReferences(ctx, tx, d, min(end, n))
-		}
-		var n uint64
-		err = retryIndexCommit(ctx, func() error { var e error; n, e = repo.PruneEvents(ctx, LogBatchSize); return e }, func() {})
-		if err != nil {
-			return nil, err
-		}
-		floors[string(sourceID(d))] = n
+		floors[string(id)] = reply.Floor
 	}
 	return map[string]any{"partitions": floors}, nil
 }
 
-func (s *Service) searchRouted(ctx context.Context, q Search) ([]Hit, GraphPosition, error) {
-	g := s.graphReplica
-	c := g.input.cluster
-	want := q.K
-	// Filter stale/misplaced candidates against one authoritative KV snapshot per
-	// attempt. Expand candidates when obsolete entries occupy the local top K.
-	for {
-		g.viewMu.RLock()
-		hits, e := s.Index.Search(q)
-		pos := g.position
-		g.viewMu.RUnlock()
-		if e != nil {
-			return nil, pos, e
+func (c *ClusterService) pruneData(ctx context.Context, d DataPartitionID, owner Ownership) (floor uint64, err error) {
+	repo := *c.data[d]
+	repo.Fence = c.coordinator.Fence(owner)
+	repo.Retain = func(ctx context.Context, tx transactionAPI, end uint64) (uint64, error) {
+		done, err := c.completedIn(ctx, tx, d)
+		if err != nil {
+			return 0, err
 		}
-		tx, e := c.root.begin()
-		if e != nil {
-			return nil, pos, e
-		}
-		result := make([]Hit, 0, want)
-		for _, hit := range hits {
-			repo := c.data[c.router.DataForID(hit.ID)]
-			r, err := readRecord(ctx, tx, repo.key("record", hit.ID))
-			if errors.Is(err, ErrNotFound) {
-				c.observations.staleCandidates.Add(1)
-				continue
-			}
-			if err != nil {
-				_ = tx.Rollback()
-				return nil, pos, err
-			}
-			if !r.Deleted && r.Revision == hit.Revision && c.layout.Routing.target(r.Vector) == g.journal.id {
-				result = append(result, hit)
-				if len(result) == want {
-					break
-				}
-			} else {
-				c.observations.staleCandidates.Add(1)
-			}
-		}
-		_ = tx.Rollback()
-		if q.K == 1000 && len(result) < want && len(hits) == q.K {
-			c.observations.exactFallbacks.Add(1)
-			return s.searchCurrentExact(ctx, q, want)
-		}
-		if len(result) >= want || len(hits) < q.K {
-			return result, pos, nil
-		}
-		q.K = min(1000, q.K*2)
+		return c.retainGraphReferences(ctx, tx, d, min(end, done))
 	}
+	err = retryIndexCommit(ctx, func() error {
+		floor, err = repo.PruneEvents(ctx, LogBatchSize)
+		return err
+	}, func() {})
+	return floor, err
+}
+
+// Search reads the replica's applied in-memory view. No authoritative record
+// reads: updates, moves and deletes may remain visible until this replica applies.
+func (s *Service) searchRouted(ctx context.Context, q Search) ([]Hit, GraphPosition, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, GraphPosition{}, err
+	}
+	g := s.graphReplica
+	g.viewMu.RLock()
+	defer g.viewMu.RUnlock()
+	hits, err := s.Index.Search(q)
+	return hits, g.position, err
+}
+
+// Wait on the replica that must actually serve the token. No partition or
+// index lock is held while waiting for its graph consumer to apply a revision.
+func (c *ClusterService) searchVisibleReplica(ctx context.Context, entry *localPartition, q Search) (partitionReply, error) {
+	for ctx.Err() == nil {
+		entry.mu.RLock()
+		s := entry.service
+		if entry.retired || s == nil || s.graphReplica == nil || s.graphReplica.input == nil {
+			entry.mu.RUnlock()
+			return partitionReply{}, ErrFenced
+		}
+		g := s.graphReplica
+		started := time.Now()
+		hits, pos, err := s.searchRouted(ctx, q)
+		entry.queryNanos.Add(time.Since(started).Nanoseconds())
+		if !errors.Is(err, ErrNotVisible) {
+			entry.mu.RUnlock()
+			return partitionReply{Hits: hits, GraphPosition: &pos, AppliedOffset: pos.DataOffset}, err
+		}
+		g.viewMu.Lock()
+		if g.position != pos {
+			g.viewMu.Unlock()
+			entry.mu.RUnlock()
+			continue
+		}
+		if g.appliedChange == nil {
+			g.appliedChange = make(chan struct{})
+		}
+		change := g.appliedChange
+		g.viewMu.Unlock()
+		g.input.notify()
+		entry.mu.RUnlock()
+		select {
+		case <-ctx.Done():
+			return partitionReply{}, ctx.Err()
+		case <-change:
+		}
+	}
+	return partitionReply{}, ctx.Err()
 }
 
 func (p *PartitionedService) clusteredSource(q ChangeRequest) (*Repository, error) {
@@ -260,47 +340,5 @@ func (p *PartitionedService) clusteredSource(q ChangeRequest) (*Repository, erro
 	return nil, fmt.Errorf("%w: use data-NNNN for data and index-NNNN for graph", ErrInvalidSubscription)
 }
 
-// A bounded ANN budget must not turn stale entries into a silently truncated
-// exact result. This uncommon fallback scans the local view with authoritative
-// revision checks; cleanup normally removes the need for it.
-func (s *Service) searchCurrentExact(ctx context.Context, q Search, want int) ([]Hit, GraphPosition, error) {
-	g := s.graphReplica
-	c := g.input.cluster
-	tx, e := c.root.begin()
-	if e != nil {
-		return nil, GraphPosition{}, e
-	}
-	defer tx.Rollback()
-	g.viewMu.RLock()
-	defer g.viewMu.RUnlock()
-	s.Index.mu.RLock()
-	defer s.Index.mu.RUnlock()
-	best := make(topK, 0, want)
-	allowed := s.Index.postings.selectIDs(q.Filter)
-	for id, r := range s.Index.records {
-		if e = ctx.Err(); e != nil {
-			return nil, g.position, e
-		}
-		if r.Deleted {
-			continue
-		}
-		if allowed != nil {
-			if _, ok := allowed[id]; !ok {
-				continue
-			}
-		}
-		repo := c.data[c.router.DataForID(id)]
-		current, err := readRecord(ctx, tx, repo.key("record", id))
-		if errors.Is(err, ErrNotFound) {
-			continue
-		}
-		if err != nil {
-			return nil, g.position, err
-		}
-		if current.Deleted || current.Revision != r.Revision || c.layout.Routing.target(current.Vector) != g.journal.id {
-			continue
-		}
-		best.offer(candidate{r.ID, r.Revision, l2(q.Vector, r.Vector)}, want)
-	}
-	return materialize(best, s.Index.records), g.position, nil
-}
+// Routed SearchContext owns the one finite visibility barrier.
+func (c *ClusterService) HandlesMinVisible() bool { return c.layout.Routing != nil }

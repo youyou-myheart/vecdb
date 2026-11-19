@@ -15,11 +15,12 @@ import (
 type sourceSignals struct {
 	mu   sync.Mutex
 	ids  map[DataPartitionID]struct{}
+	acks map[DataPartitionID]map[IndexPartitionID]graphCommitAck
 	wake chan struct{}
 }
 
 func newSourceSignals() *sourceSignals {
-	return &sourceSignals{ids: map[DataPartitionID]struct{}{}, wake: make(chan struct{}, 1)}
+	return &sourceSignals{ids: map[DataPartitionID]struct{}{}, acks: make(map[DataPartitionID]map[IndexPartitionID]graphCommitAck), wake: make(chan struct{}, 1)}
 }
 
 func (s *sourceSignals) add(id DataPartitionID) {
@@ -33,6 +34,124 @@ func (s *sourceSignals) add(id DataPartitionID) {
 	case s.wake <- struct{}{}:
 	default:
 	}
+}
+
+// Each proof names the data-owner incarnation that supplied the committed
+// input. Delivery admission alone never generates a proof.
+type graphCommitAck struct {
+	Index   IndexPartitionID `json:"index"`
+	Session string           `json:"session"`
+	Epoch   uint64           `json:"epoch"`
+	Through uint64           `json:"through"`
+}
+type graphCommitProof struct {
+	through uint64
+	offered uint64
+	checked time.Time
+}
+type graphCommitProofs struct {
+	mu      sync.RWMutex
+	byIndex map[IndexPartitionID]graphCommitProof
+}
+
+func (p *graphCommitProofs) record(id IndexPartitionID, n uint64, polled bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	old, found := p.byIndex[id]
+	if found && n <= old.through && !polled {
+		return
+	}
+	if p.byIndex == nil {
+		p.byIndex = make(map[IndexPartitionID]graphCommitProof)
+	}
+	old.through = max(n, old.through)
+	old.checked = time.Now()
+	p.byIndex[id] = old
+}
+
+// Start the lost-ACK timer when a target actually has work in flight.
+// A retry of the same delivery must not postpone reconciliation.
+func (p *graphCommitProofs) noteDelivery(id IndexPartitionID, through uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	proof := p.byIndex[id]
+	if through <= max(proof.through, proof.offered) {
+		return
+	}
+	if proof.offered <= proof.through {
+		proof.checked = time.Now()
+	}
+	proof.offered = through
+	if p.byIndex == nil {
+		p.byIndex = make(map[IndexPartitionID]graphCommitProof)
+	}
+	p.byIndex[id] = proof
+}
+func (p *graphCommitProofs) read(id IndexPartitionID) graphCommitProof {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.byIndex[id]
+}
+func (s *sourceSignals) addAck(id DataPartitionID, ack graphCommitAck) {
+	s.mu.Lock()
+	acks := s.acks[id]
+	if acks == nil {
+		acks = make(map[IndexPartitionID]graphCommitAck)
+		s.acks[id] = acks
+	}
+	old := acks[ack.Index]
+	if ack.Epoch > old.Epoch || old.Epoch == ack.Epoch && ack.Through > old.Through {
+		acks[ack.Index] = ack
+	}
+	s.mu.Unlock()
+}
+func (s *sourceSignals) takeAcks(id DataPartitionID) []graphCommitAck {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]graphCommitAck, 0, len(s.acks[id]))
+	for _, a := range s.acks[id] {
+		out = append(out, a)
+	}
+	delete(s.acks, id)
+	return out
+}
+
+func (c *ClusterService) receiveGraphAcks(id DataPartitionID, acks []graphCommitAck) {
+	for _, ack := range acks {
+		group, err := c.localDataWriter(id, ack.Epoch, ack.Session)
+		if err == nil {
+			c.recordGraphAck(group, ack)
+		}
+	}
+}
+
+func (c *ClusterService) recordGraphAck(group *mutationGroup, ack graphCommitAck) {
+	if _, known := c.indexes[ack.Index]; known && ack.Through <= group.lease.head.Load() {
+		group.proofs.record(ack.Index, ack.Through, false)
+	}
+}
+
+// Deliver the result directly to a co-located source while its incarnation
+// still holds the lease. A retired group cannot advance its successor's proofs.
+func (c *ClusterService) signalGraphCommit(index IndexPartitionID, q Delivery, commitErr error) {
+	if c.outboundSignals == nil {
+		return
+	}
+	ack := graphCommitAck{Index: index, Epoch: q.Owner.Epoch, Session: q.Owner.Session, Through: q.Through}
+	if q.Owner.Node == c.node.ID && q.Owner.Session == c.node.Session {
+		group, err := c.localDataWriter(q.Source, ack.Epoch, ack.Session)
+		if err == nil && sameOwner(group.lease.owner, q.Owner) {
+			if commitErr == nil {
+				c.recordGraphAck(group, ack)
+			}
+			c.signalSource(q.Source, "graph_commit", true)
+			return
+		}
+	}
+	if commitErr == nil {
+		c.outboundSignals.addAck(q.Source, ack)
+	}
+	c.signalSource(q.Source, "graph_commit", false)
 }
 
 func (s *sourceSignals) take() []DataPartitionID {
@@ -84,16 +203,36 @@ func (c *ClusterService) notifySourceLoop(ctx context.Context) {
 	}
 }
 
-func (c *ClusterService) notifySource(ctx context.Context, id DataPartitionID) error {
-	owner, err := c.coordinator.Resolve(ctx, sourceID(id))
+func (c *ClusterService) notifySource(ctx context.Context, id DataPartitionID) (err error) {
+	acks := c.outboundSignals.takeAcks(id)
+	var owner Ownership
+	var state *ClusterStatus
+	defer func() {
+		if err != nil && state != nil {
+			c.expireSearchRoutes(state)
+		}
+	}()
+	if c.routeHintsEnabled() {
+		state, err = c.cachedSearchRoutes(ctx, false)
+		if err == nil {
+			owner = state.Owners[sourceID(id)]
+			if owner.Epoch == 0 {
+				c.expireSearchRoutes(state)
+				return ErrPartitionUnavailable
+			}
+		}
+	} else {
+		owner, err = c.coordinator.Resolve(ctx, sourceID(id))
+	}
 	if err != nil {
 		return err
 	}
 	if owner.Node == c.node.ID && owner.Session == c.node.Session {
+		c.receiveGraphAcks(id, acks)
 		c.signalSource(id, "received", true)
 		return nil
 	}
-	body, err := json.Marshal(partitionRPC{Namespace: c.root.Prefix, Partition: sourceID(id), Operation: "wake_source", Source: &id})
+	body, err := json.Marshal(partitionRPC{Namespace: c.root.Prefix, Partition: sourceID(id), Operation: "wake_source", Source: &id, Acks: acks})
 	if err != nil {
 		return err
 	}

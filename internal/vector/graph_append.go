@@ -53,7 +53,7 @@ func (g *graphReplica) appendDelta(ctx context.Context, s *Service, h GraphHead,
 			if e != nil {
 				return e
 			}
-			entry, err = g.journal.commitWithAuthority(ctx, h, offset, "delta", m, inputs, cluster, raw, token, func() error { return g.writer.authority(token) })
+			entry, err = g.journal.commitWithAuthority(ctx, h, offset, "delta", m, inputs, cluster, raw, token, g.writer)
 		} else if g.journal.c.referenceLogs {
 			entry, err = g.journal.commitPayload(ctx, h, offset, "delta", m, inputs, cluster, raw)
 		} else {
@@ -72,9 +72,7 @@ func (g *graphReplica) appendDelta(ctx context.Context, s *Service, h GraphHead,
 	commit(&e)
 	g.observeSourceEpochRejection("commit", e)
 	for _, q := range inputs {
-		// A hint, never an ACK: the source re-reads its durable watermarks.
-		// Unknown commit outcomes also deserve a prompt durable-state check.
-		g.input.cluster.signalSource(q.Source, "graph_commit", false)
+		cluster.signalGraphCommit(g.journal.id, q, e)
 	}
 	if g.fastAppend {
 		if e == nil {

@@ -44,6 +44,8 @@ type Repository struct {
 	Client        *txnkv.Client
 	Prefix        string
 	Dimension     int
+	pd            []string
+	raw           *rawDataStore
 	beginTxn      func() (transactionAPI, error)
 	scanLimit     int
 }
@@ -58,7 +60,7 @@ func NewRepository(pd []string, namespace string, dimension int) (*Repository, e
 	if err != nil {
 		return nil, err
 	}
-	r := &Repository{Client: c, Prefix: "vector-v0/" + hex.EncodeToString([]byte(namespace)) + "/", Dimension: dimension}
+	r := &Repository{Client: c, Prefix: "vector-v0/" + hex.EncodeToString([]byte(namespace)) + "/", Dimension: dimension, pd: append([]string(nil), pd...)}
 	if err = r.ensureSchema(ctx); err != nil {
 		c.Close()
 		return nil, err
@@ -74,13 +76,17 @@ func (r *Repository) Namespace() string {
 func (r *Repository) VectorDimension() int { return r.Dimension }
 func (r *Repository) begin() (transactionAPI, error) {
 	if r.beginTxn != nil {
-		return r.beginTxn()
+		tx, err := r.beginTxn()
+		if err != nil {
+			return nil, err
+		}
+		return r.wrapRawSnapshot(tx), nil
 	}
 	tx, err := r.Client.Begin()
 	if err != nil {
 		return nil, err
 	}
-	return tikvTransaction{tx}, nil
+	return r.wrapRawSnapshot(tikvTransaction{tx}), nil
 }
 
 // The suffix makes older writers fail their schema check on open. An in-place
@@ -170,6 +176,17 @@ func readRecord(ctx context.Context, tx transactionAPI, key []byte) (Record, err
 	return rec, err
 }
 func (r *Repository) Get(ctx context.Context, id string) (Record, error) {
+	if r.usesRawShardData() {
+		snapshot, err := r.raw.snapshot(ctx, r.Prefix)
+		if err != nil {
+			return Record{}, err
+		}
+		record, found := snapshot.record(id)
+		if !found {
+			return Record{}, ErrNotFound
+		}
+		return cloneRecord(record), nil
+	}
 	tx, e := r.begin()
 	if e != nil {
 		return Record{}, e
@@ -251,7 +268,7 @@ type appendCursor struct {
 // Semantic conflicts are detected before any Set, so a group can reject one
 // request without dropping unrelated valid requests. Storage errors abort it.
 func (r *Repository) mutateIn(ctx context.Context, tx transactionAPI, q preparedMutation, tail *appendCursor) (Record, bool, error) {
-	id, m, deleted, digest := q.id, q.mutation, q.deleted, q.digest
+	id, m, digest := q.id, q.mutation, q.digest
 	reqKey := r.key("request", m.RequestID)
 	b, e := tx.Get(ctx, reqKey)
 	if e == nil {
@@ -271,16 +288,9 @@ func (r *Repository) mutateIn(ctx context.Context, tx transactionAPI, q prepared
 	if e != nil && !errors.Is(e, ErrNotFound) {
 		return Record{}, false, e
 	}
-	if m.ExpectedRevision != nil && *m.ExpectedRevision != old.Revision {
-		return Record{}, false, ErrConflict
-	}
-	if old.Revision == ^uint64(0) {
-		return Record{}, false, errors.New("record revision exhausted")
-	}
-	rec := Record{ID: id, Revision: old.Revision + 1, Vector: m.Vector, Payload: m.Payload, Deleted: deleted}
-	if deleted {
-		rec.Vector = nil
-		rec.Payload = nil
+	rec, e := q.nextRecord(old.Revision)
+	if e != nil {
+		return Record{}, false, e
 	}
 	encoded, _ := json.Marshal(rec)
 	ack, _ := json.Marshal(receipt{Digest: digest, Record: rec})
@@ -304,15 +314,36 @@ func (r *Repository) mutateIn(ctx context.Context, tx transactionAPI, q prepared
 	tail.lsn = sequence
 	return rec, true, nil
 }
+
+func (q preparedMutation) nextRecord(revision uint64) (Record, error) {
+	m := q.mutation
+	if m.ExpectedRevision != nil && *m.ExpectedRevision != revision {
+		return Record{}, ErrConflict
+	}
+	if revision == ^uint64(0) {
+		return Record{}, errors.New("record revision exhausted")
+	}
+	record := Record{ID: q.id, Revision: revision + 1, Deleted: q.deleted}
+	if !q.deleted {
+		record.Vector, record.Payload = m.Vector, m.Payload
+	}
+	return record, nil
+}
 func (r *Repository) Scan(ctx context.Context, kind string) ([]Record, error) {
-	tx, e := r.begin()
+	var tx dataReader
+	var e error
+	if kind == "record" {
+		tx, e = r.beginDataRead(ctx)
+	} else {
+		tx, e = r.begin()
+	}
 	if e != nil {
 		return nil, e
 	}
 	defer tx.Rollback()
 	return r.scanTxn(ctx, tx, kind)
 }
-func (r *Repository) scanTxn(ctx context.Context, tx transactionAPI, kind string) ([]Record, error) {
+func (r *Repository) scanTxn(ctx context.Context, tx dataReader, kind string) ([]Record, error) {
 	var e error
 	prefix := r.Prefix + kind + "/"
 	it, e := tx.Iter([]byte(prefix), []byte(r.Prefix+kind+"0"))
@@ -432,19 +463,23 @@ type iteratorAPI interface {
 	Next() error
 	Close()
 }
-type transactionAPI interface {
-	StartTS() uint64
+type dataReader interface {
 	Get(context.Context, []byte) ([]byte, error)
+	Iter([]byte, []byte) (iteratorAPI, error)
+	FirstKey(context.Context, []byte, []byte) ([]byte, error)
+	LastKey(context.Context, []byte, []byte) ([]byte, error)
+	Rollback() error
+}
+
+type transactionAPI interface {
+	dataReader
+	StartTS() uint64
 	Set([]byte, []byte) error
 	Delete([]byte) error
 	Commit(context.Context) error
-	Rollback() error
-	Iter([]byte, []byte) (iteratorAPI, error)
 	// Last reads the last persisted pair in [start, end) at this snapshot.
 	// It does not scan the prefix or include this transaction's pending writes.
 	Last(context.Context, []byte, []byte) ([]byte, []byte, error)
-	FirstKey(context.Context, []byte, []byte) ([]byte, error)
-	LastKey(context.Context, []byte, []byte) ([]byte, error)
 }
 type tikvTransaction struct{ *transaction.KVTxn }
 

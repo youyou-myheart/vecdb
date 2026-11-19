@@ -35,8 +35,18 @@ func TestMasterElectionScheduleAndStaleLeader(t *testing.T) {
 	if e != nil || first.Node != a.ID || first.Epoch != 1 {
 		t.Fatal(first, e)
 	}
+	begin := root.beginTxn
+	root.beginTxn = func() (transactionAPI, error) { panic("InLeaderLease accessed KV") }
+	var before, after uint64
+	if !ma.InLeaderLease(&before) || !ma.InLeaderLease(&after) || before != first.Epoch || before != after || mb.InLeaderLease(nil) {
+		t.Fatal("bad local master lease", before, after)
+	}
+	root.beginTxn = begin
 	if e = mb.Tick(ctx, nodes); e != nil {
 		t.Fatal(e)
+	}
+	if mb.InLeaderLease(nil) {
+		t.Fatal("standby claimed local authority")
 	}
 	still, _ := c.Resolve(ctx, masterLeaseID)
 	if !sameOwner(first, still) {
@@ -79,6 +89,15 @@ func TestMasterElectionScheduleAndStaleLeader(t *testing.T) {
 	second, _ := c.Resolve(ctx, masterLeaseID)
 	if second.Node != b.ID || second.Epoch != 2 {
 		t.Fatal(second)
+	}
+	if !mb.InLeaderLease(&after) || after != second.Epoch || after == before {
+		t.Fatal("takeover reused the old epoch", before, after)
+	}
+	if e = c.Heartbeat(ctx, a); e != nil {
+		t.Fatal(e)
+	}
+	if e = ma.Tick(ctx, nodes); e != nil || ma.InLeaderLease(nil) {
+		t.Fatal("old master kept local authority after observing takeover", e)
 	}
 	if e = c.Schedule(ctx, first, layout, nil); !errors.Is(e, ErrFenced) {
 		t.Fatal("old master changed plans", e)

@@ -43,7 +43,7 @@ sequenceDiagram
 
 ## 位点与故障
 
-Leader 返回 `graphReplica.position`，与内存图由同一把锁保护。持久化位点 `GraphHead.Committed/Visible` 可能早于本地 apply，不能代替它。租约和身份用本地缓存及单调时钟检查；Follower 使用控制面缓存的 Publisher 地址和 session，不为每批捕获查询 TiKV。Gateway 仍使用现有计划/owner 路由，查询仍执行现有权威记录校验。
+Leader 返回 `graphReplica.position`，与内存图由同一把锁保护。持久化位点 `GraphHead.Committed/Visible` 可能早于本地 apply，不能代替它。租约和身份用本地缓存及单调时钟检查；Follower 使用控制面缓存的 Publisher 地址和 session，不为每批捕获查询 TiKV。Gateway 仍使用现有计划/owner 路由，查询使用已应用的内存图和记录，不再逐候选回查 TiKV；仍允许未在索引中应用的业务更新或删除。
 
 同一 namespace、Index 的图日志在换主后不清零。相同 sequence 必须匹配完整 GraphPosition；更大的 sequence 属于经校验历史的后续版本。等待期间晋升为 Leader、租约失效或服务退休，不能继续返回 Follower Read 成功。Gateway 可有限次重新路由到当前 Follower，重新捕获位点，整个调用共享原 deadline。
 
@@ -83,7 +83,7 @@ result, err := client.FollowerSearch(ctx, &pb.SearchRequest{
 | queue_ms | 入队到本批 RPC 发起，包含等待前一批 RPC |
 | leader_capture_ms | Leader 捕获 RPC 及返回处理 |
 | wait_apply_ms | 取得目标后等待本地 apply，直到获准查询 |
-| query_ms | 查询图及权威记录校验 |
+| query_ms | 查询已应用的内存图及记录 |
 
 并行分片时长不能相加当成整个调用时间。SDK 总时间还包含路由、网络、合并和序列化。捕获期间已经追平时，wait_apply_ms 可接近零。
 

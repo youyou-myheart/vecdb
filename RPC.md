@@ -29,19 +29,22 @@ Go/Python SDK 首次写某数据分片时从 Gateway 获取路由，随后复用
 | ResolveWriteRoute | 按 ID 查询数据分片、Worker gRPC 地址与写入任期 |
 | Put / Get / Delete | 写入、读取、删除记录 |
 | List | 分片顺序分页，默认隐藏墓碑 |
-| Search | 全局 Top-K、属性过滤、HNSW 或精确搜索 |
+| Search | 所选分片 Top-K，未指定分片时覆盖全部索引；支持属性过滤、HNSW 或精确搜索 |
 | FollowerSearch | Follower 合批获取 Leader applied LSN，等待本地应用后查询；返回各分片位点和耗时 |
 | Health | 进程状态和 namespace，不等同于分片全部 ready |
 | GetCluster / GetLayout | 主节点、节点列表、分片归属与布局 |
+| GetSearchRoutes | 轻量簇中心、分片计数和可服务副本地址；不包含图头或来源进度 |
 | Checkpoint / Rebuild / Prune | 快照、重建及安全日志清理 |
 
 请求 metadata 必须包含 `authorization: Bearer <API_TOKEN>`，SDK 自动附加。CLUSTER_TOKEN 不用于外部 RPC。协议是明确类型的 Protobuf 消息，epoch、revision、offset 使用 uint64，不通过浮点数转换。
 
 `Put.expected_revision` / `Delete.expected_revision` 是 optional：省略表示无版本条件，0 表示记录当前版本必须为 0，正值表示 CAS 更新/删除。SDK 的 insert 自动携带 0；update 要求正版本。每次逻辑写操作使用新的 request_id，重试保持 request_id 和所有请求参数不变。SDK 不主动重试写入；遇到超时，写入可能已提交，使用同一请求 ID 查询/重试，不能假定失败意味着没有写入。
 
-List 的 limit=0 使用默认 100，最大 1000。可能出现空 records 但仍有 next_cursor，必须继续读取直到游标为空。每页是独立事务视图，跨页不是时间点快照，详见 CLI.md 的列表语义。
+`DATA_BACKEND=raw` 的 namespace 在数据分片内对 `request_id` 判重。返回 `Durable=true` 时，最终版本和回执已经随该分片的日志持久化。`Get` 读取连续持久化前缀，索引投递从后台发布头继续推进。 [RawKV 写入协议](CLUSTER_ROUTING.md#rawkv-数据写入)
 
-Search 的 k 必须为 1..1000。min_visible 使用写入响应 token，同步索引并检查指定记录版本；不是跨记录事务快照。
+List 的 limit=0 使用默认 100，最大 1000。可能出现空 records 但仍有 next_cursor，必须继续读取直到游标为空。TxnKV 每页读取一次事务视图，RawKV 每页按访问顺序读取各分片的视图。客户端需要跨页导出一致数据时，应使用检查点和订阅日志。详见 CLI.md 的列表语义。
+
+Search 的 k 必须为 1..1000。`index_partitions` 可选择逻辑索引分片，空列表为全部分片；重复、未知分片及与 min_visible 同时使用均拒绝。结果来自副本已应用的索引，不逐候选回查 TiKV，允许旧版本与延迟删除。min_visible 使用写入响应 token，同步索引并检查指定记录版本；不是跨记录事务快照。
 
 FollowerSearch 的协议、队列上限、SDK 和监控见 [FOLLOWER_READ.md](FOLLOWER_READ.md)。最长 5 秒，客户端更短的 deadline 优先；不能与 min_visible 组合，不回退 Leader，不保证 Leader 已索引全部已持久化写入。
 
@@ -121,6 +124,27 @@ Client 内嵌生成的完整 VectorStoreClient，全部 RPC 方法可直接使�
 ```bash
 RPC_TARGET=127.0.0.1:18250 bash scripts/go.sh run ./examples/grpc-go
 ```
+
+## SDK 近簇路由
+
+Python/Go SDK 的普通 Search 默认按周期缓存的簇中心与记录数选片，数量不足或过滤后结果少于 K 时扩到相邻簇。首次请求通过 GetSearchRoutes 加载路由，其后默认每 5 秒后台刷新；超过 30 秒或 3 个刷新周期的缓存不用于裁剪。Close 会停止刷新任务。数据量取同一分片副本计数的最大值，不重复计算副本。
+
+```python
+with Client(endpoint, token, search_refresh_interval=5) as client:
+    result = client.search_by_id("A", k=10)  # Get A 的当前向量，再选择近簇
+    result = client.search(vector, k=10)    # 已知向量，不额外 Get
+    result = client.search(vector, k=10, all_partitions=True)
+```
+
+原生性能与语义验证：`.venv/bin/python scripts/verify_sdk_query_routing.py --steady-seconds 120 --samples 120`，保留近簇与全片的耗时、分片数和结果差异样本；不会将旧视图差异隐藏成全局召回保证。
+
+Go：`SearchByID(ctx, "A", &pb.SearchRequest{K: 10})`、`Search`、`SearchAll`；刷新周期由 `Options.SearchRefreshInterval` 配置。SDK `Exact=true` 和 min_visible 默认不裁剪分片。FollowerSearch 保留原有全片语义，也支持协议中显式的 index_partitions。
+
+近簇查询不能保证全局 Top-K 召回；全片查询也只反映各副本当时已应用的状态，不能替代 TiKV 当前记录读取。无需为了搜索而由 SDK 每次刷新路由。GetSearchRoutes 用同一个 TiKV 快照批量扫描节点、计划和 owner，不读取来源进度/图日志；老服务返回 UNIMPLEMENTED 时 SDK 才退回 GetCluster。Gateway 缓存可用副本地址，默认最多 2 秒（不超过租约 TTL/3），失败时尝试其他副本并合并刷新。缓存仅是地址提示，不授予读权限。
+
+在聚类图复制模式，Worker 只在确认 owner 续租成功后安装本地读租约；截止时间从存储 IO 前开始，沿用现有 leaseDeadline 安全余量。查询前后检查 namespace、epoch/session、退休标志和单调截止时间。失败/未知续租不延长有效期，释放前立即停止服务，结束校验时已超过截止时间的查询不能返回成功。非查询维护/写入仍使用原持久化 fencing。
+
+`partial=false` 表示被请求的分片全部成功，不表示近簇查询覆盖了全部逻辑分片。
 
 ## TLS
 
@@ -217,3 +241,29 @@ GetCluster 的 GraphHead 新增 `source_epochs`（字段 13）和 `checkpoint_so
 `ReplicaPlan.lease_draining`（protobuf 字段 7）表示 Master 正在等待旧 Publisher 已发放租约到期；此时 `publisher` 和 `serving` 仍保留旧主，停止给旧主续租。完成切换后字段为 false。HTTP `/v1/cluster`、gRPC GetCluster、Go/Python SDK 和 vectorctl 的集群状态均可读取，不改变业务读写 API。
 
 升级需要新的 v14 聚类 namespace，拒绝 v13 及更早写入者混跑；当前未实现旧 namespace 原地迁移。见 [GRAPH_JOURNAL.md](GRAPH_JOURNAL.md)。
+
+## 每请求元数据审计
+
+已逐一检查全部公开 RPC、对应 HTTP 入口和内部请求。地址与角色提示共用最多 2 秒的路由快照；缓存命中不代表拥有提交或删除权限。
+
+| 路径 | 已省去或合并 | 必须保留的读取/检查 |
+|---|---|---|
+| Health / GetLayout | 原本就是内存读取 | 无动态元数据读取 |
+| Get / SDK search_by_id 的 Get | 按 ID 定位数据分区，RawKV 优先读取租约内的 owner 内存视图 | owner 不可用时从 Raw WAL 恢复，TxnKV 读取记录键 |
+| List | 使用内存布局，RawKV 页面按分片固定日志视图 | 记录扫描及游标校验 |
+| Put / Delete | SDK/Gateway 缓存数据 owner，Worker 用本地租约接单，不逐批读取任期 guard | RawKV 每个非空批次一次 BatchPut，任期内从内存确认连续位点；TxnKV 每 100 个成功批次写一次 guard，并限定提交时间戳 |
+| ResolveWriteRoute | 仅冷启动/过期路由发现使用，SDK 缓存按分区复用 | 明确的重新发现必须读取当前 owner |
+| Search | 缓存选片/副本地址；普通查询使用确认续租的本地读租约 | 旧 hot 非图协议仍保留其 ReadThrough 数据头屏障 |
+| FollowerSearch | 不再逐请求读取计划与 owner | 每批重新捕获 Leader applied 位点、Follower 等待与身份校验 |
+| min_visible | HTTP/gRPC 不重复 Sync；路由层复用已读取记录的目标分片 | 图副本从已应用视图验证目标版本，删除 token 传给全部查询分片 |
+| GetSearchRoutes | 节点、计划、owner 在一次快照内批量扫描并缓存 | 冷启动、过期/失败刷新；不缓存授予权限的结论 |
+| Checkpoint / Rebuild / Prune / Sync | 缓存 Publisher 地址；数据 Prune 发给 source owner；Worker 从本地已确认的 lease 验证任期 | 实际提交内的 ReplicaFence、guard、保留水位 |
+| ReadChanges | 内存布局定位，无额外 owner 发现 | 同一 MVCC 快照内的 head/floor、日志内容与 reset 判定 |
+| ManageConsumer | 无额外地址解析 | acquire/ACK/release 的 epoch、租约、head/floor 必须与 GC 串行化 |
+| GetCluster / 全局 metrics | 不参与正常 SDK 查询；无需为选片生成全量状态 | 显式运维观测保持即时读取；只需本机指标可用 scope=local |
+| 内部 deliver | 每批不再 Plan + Resolve，复用 Publisher 地址 | 来源任期接纳、完整区间覆盖、图追加任期内提交 |
+| 内部 wake_source | 不再每次 Resolve 来源 owner | 成功提交的图回执携带来源任期与累计 LSN，普通唤醒只触发检查 |
+| applied_position | 原本只读取有效本地租约下的内存位点 | 每个 Follower 批次仍须重新捕获，不能跨请求缓存屏障 |
+| 后台重建检查/维护 | 无需重建时不查询计划；定时维护复用角色提示 | 控制循环续租/接管保持权威读取；GC/快照提交仍检查最新事务状态 |
+
+只读查询与幂等 Sync 保留主备切换期间的有界重试；checkpoint、rebuild、prune 和投递不因响应丢失自动重放。地址缓存中的旧身份必须在接收端被拒绝。订阅 head/floor、消费者 ACK 与删除安全边界不属于可随意使用旧值的路由信息。

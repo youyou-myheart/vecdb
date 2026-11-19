@@ -1,19 +1,18 @@
 package vector
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	tikverr "github.com/tikv/client-go/v2/error"
 )
 
-const mutationGroupRecords = 32
-const mutationGroupBytes = 2 << 20
+const (
+	mutationGroupRecords = 32
+	mutationGroupBytes   = 2 << 20
+)
 
 type mutationResult struct {
 	record Record
@@ -26,20 +25,12 @@ type mutationRequest struct {
 	result   chan mutationResult
 }
 
-// One short-lived drainer per local DataPartition. The first request starts
-// immediately; subsequent commits combine only already queued work. No timer
-// delays an ACK to fill a batch. Different DataPartitions drain independently.
-type appendLease struct {
-	owner   Ownership
-	guard   []byte
-	token   []byte
-	head    atomic.Uint64
-	expires atomic.Int64
-	// An ambiguous commit stops admission until the dispatcher recovers a new epoch.
-	uncertain atomic.Bool
-}
 type mutationGroup struct {
+	proofs    graphCommitProofs
 	lease     *appendLease
+	rawWriter *rawShardWriter
+	rawCtx    context.Context
+	rawStop   context.CancelFunc
 	ctx       context.Context
 	repo      *Repository
 	metrics   *pipelineMetrics
@@ -79,6 +70,10 @@ func (b *mutationGroup) mutate(ctx context.Context, id string, m Mutation, delet
 			}
 			return Record{}, context.Canceled
 		}
+		if b.lease != nil && !b.lease.InLeaderLease(nil) {
+			b.mu.Unlock()
+			return Record{}, ErrFenced
+		}
 		if err = ctx.Err(); err != nil {
 			b.mu.Unlock()
 			return Record{}, err
@@ -93,12 +88,25 @@ func (b *mutationGroup) mutate(ctx context.Context, id string, m Mutation, delet
 				q.mutation.ExpectedRevision = &n
 			}
 			r := &mutationRequest{preparedMutation: q, ctx: ctx, admitted: time.Now(), result: make(chan mutationResult, 1)}
-			b.queue = append(b.queue, r)
-			b.bytes += q.size
-			if !b.running {
+			if b.running {
+				b.queue = append(b.queue, r)
+				b.bytes += q.size
+				if b.rawWriter != nil && len(b.queue) == 1 {
+					b.signalLocked()
+				}
+			} else {
+				// The idle partition starts with this request. Requests
+				// arriving while it runs go into the next batch.
 				b.running = true
 				b.wg.Add(1)
-				go b.drain()
+				if b.rawWriter == nil {
+					go b.drain([]*mutationRequest{r})
+				} else {
+					if b.rawCtx == nil {
+						b.rawCtx, b.rawStop = context.WithCancel(b.ctx)
+					}
+					go b.drainRaw(b.rawCtx, []*mutationRequest{r})
+				}
 			}
 			b.mu.Unlock()
 			select {
@@ -125,24 +133,20 @@ func (b *mutationGroup) mutate(ctx context.Context, id string, m Mutation, delet
 func (b *mutationGroup) close() {
 	b.mu.Lock()
 	b.closed = true
+	if b.lease != nil {
+		b.lease.Retire()
+	}
+	if b.rawStop != nil {
+		b.rawStop()
+	}
 	b.signalLocked()
 	b.mu.Unlock()
 	b.wg.Wait()
 }
 
-func (b *mutationGroup) drain() {
+func (b *mutationGroup) drain(batch []*mutationRequest) {
 	defer b.wg.Done()
-	for {
-		b.mu.Lock()
-		batch := b.queue
-		b.queue, b.bytes = nil, 0
-		b.signalLocked()
-		if len(batch) == 0 {
-			b.running = false
-			b.mu.Unlock()
-			return
-		}
-		b.mu.Unlock()
+	for ; len(batch) != 0; batch = b.takeBatch() {
 		active := batch[:0]
 		for _, q := range batch {
 			if err := q.ctx.Err(); err != nil {
@@ -174,6 +178,18 @@ func (b *mutationGroup) drain() {
 	}
 }
 
+func (b *mutationGroup) takeBatch() []*mutationRequest {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	batch := b.queue
+	b.queue, b.bytes = nil, 0
+	if len(batch) == 0 {
+		b.running = false
+	}
+	b.signalLocked()
+	return batch
+}
+
 func (r *Repository) mutateGroup(ctx context.Context, batch []*mutationRequest) ([]mutationResult, error) {
 	return r.appendGroup(ctx, batch, nil)
 }
@@ -202,6 +218,10 @@ func (r *Repository) mutateGroupOnce(ctx context.Context, batch []*mutationReque
 			}
 		}
 	}()
+	var epoch uint64
+	if lease != nil && !lease.InLeaderLease(&epoch) {
+		return results, ErrFenced
+	}
 	tx, err := r.begin()
 	if err != nil {
 		return results, err
@@ -209,10 +229,9 @@ func (r *Repository) mutateGroupOnce(ctx context.Context, batch []*mutationReque
 	defer tx.Rollback()
 	var keys [][]byte
 	if lease != nil {
-		if lease.uncertain.Load() || txnMillis(tx) >= lease.expires.Load() {
-			return results, ErrFenced
+		if _, err = lease.grantForTransaction(tx, epoch); err != nil {
+			return results, err
 		}
-		keys = append(keys, lease.guard)
 	} else {
 		keys = append(keys, []byte(r.Prefix+"log-floor"))
 	}
@@ -227,9 +246,6 @@ func (r *Repository) mutateGroupOnce(ctx context.Context, batch []*mutationReque
 	changed := false
 	var tail appendCursor
 	if lease != nil {
-		if !bytes.Equal(values[string(lease.guard)], lease.token) {
-			return results, ErrFenced
-		}
 		tail = appendCursor{lsn: lease.head.Load(), known: true}
 	}
 	for n, q := range batch {
@@ -241,16 +257,8 @@ func (r *Repository) mutateGroupOnce(ctx context.Context, batch []*mutationReque
 		changed = changed || wrote
 	}
 	if changed {
-		if lease != nil {
-			if err = tx.Set(lease.guard, lease.token); err != nil {
-				return results, err
-			}
-		}
-		if err = tx.Commit(ctx); err != nil {
-			if lease != nil && !tikverr.IsErrWriteConflict(err) {
-				lease.uncertain.Store(true)
-			}
-			return results, fmt.Errorf("commit not confirmed; retry same request_id: %w", err)
+		if err = lease.commit(ctx, tx, epoch); err != nil {
+			return results, err
 		}
 		if lease != nil {
 			lease.head.Store(tail.lsn)

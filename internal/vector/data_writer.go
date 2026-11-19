@@ -5,20 +5,28 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strconv"
 	"time"
 )
 
-func (c *Coordinator) writeGuardKey(id IndexPartitionID) []byte {
-	return []byte(c.root.Prefix + "cluster/write-epochs/" + string(id))
-}
-func epochToken(epoch uint64) []byte { return strconv.AppendUint(nil, epoch, 10) }
-
-// Acquire has already fenced earlier append transactions. Only this worker may
-// allocate log positions from the snapshot taken after acquiring this epoch.
+// Recovery happens during acquisition, before the new owner accepts requests.
 func (c *ClusterService) recoverWriter(ctx context.Context, id DataPartitionID, o Ownership) (_ *mutationGroup, err error) {
 	defer c.observations.pipeline.track("data_writer_recover", string(o.Partition))(&err)
 	repo := c.data[id]
+	lease := &appendLease{owner: o, guard: c.coordinator.writeGuardKey(o.Partition), token: epochToken(o.Epoch),
+		boundCommitTS: c.coordinator.holdReleasedLeases}
+	group := newMutationGroup(c.runCtx, repo, &c.observations.pipeline, string(o.Partition))
+	group.lease = lease
+	group.onCommit = func() { c.signalSource(id, "write", true) }
+	if repo.raw != nil {
+		writer, err := repo.raw.recover(ctx, repo.Prefix, o)
+		if err != nil {
+			return nil, err
+		}
+		lease.head.Store(writer.history.end())
+		group.rawWriter = writer
+		return group, nil
+	}
+	// A TxnKV snapshot after acquisition observes earlier commits and locks.
 	tx, err := repo.begin()
 	if err != nil {
 		return nil, err
@@ -28,11 +36,7 @@ func (c *ClusterService) recoverWriter(ctx context.Context, id DataPartitionID, 
 	if err != nil {
 		return nil, err
 	}
-	lease := &appendLease{owner: o, guard: c.coordinator.writeGuardKey(o.Partition), token: epochToken(o.Epoch)}
 	lease.head.Store(head)
-	group := newMutationGroup(c.runCtx, repo, &c.observations.pipeline, string(o.Partition))
-	group.lease = lease
-	group.onCommit = func() { c.signalSource(id, "write", true) }
 	return group, nil
 }
 func (c *ClusterService) retireWriter(id DataPartitionID) {
@@ -42,6 +46,9 @@ func (c *ClusterService) retireWriter(id DataPartitionID) {
 	c.writerMu.Unlock()
 	if group != nil {
 		group.close()
+		if group.rawWriter != nil {
+			group.repo.raw.local.CompareAndDelete(group.repo.Prefix, group)
+		}
 	}
 }
 
@@ -63,13 +70,32 @@ func (c *ClusterService) MutateOwned(ctx context.Context, namespace string, d Da
 		return Record{}, ErrFenced
 	}
 	defer c.observations.pipeline.track("data_owner_mutate", string(sourceID(d)))(&err)
+	group, err := c.localDataWriter(d, epoch, session)
+	if err != nil {
+		return Record{}, err
+	}
+	record, err := group.mutate(ctx, id, m, deleted)
+	if err != nil {
+		return Record{}, err
+	}
+	var after uint64
+	if !group.lease.InLeaderLease(&after) || after != epoch {
+		// The write may have persisted. A retry on the new owner uses the
+		// same request ID and its receipt.
+		return Record{}, ErrFenced
+	}
+	return record, nil
+}
+
+func (c *ClusterService) localDataWriter(d DataPartitionID, epoch uint64, session string) (*mutationGroup, error) {
 	c.writerMu.RLock()
 	group := c.writers[d]
 	c.writerMu.RUnlock()
-	if group == nil || group.lease.owner.Epoch != epoch || group.lease.owner.Session != session {
-		return Record{}, ErrFenced
+	var current uint64
+	if group == nil || group.lease.owner.Session != session || !group.lease.InLeaderLease(&current) || current != epoch {
+		return nil, ErrFenced
 	}
-	return group.mutate(ctx, id, m, deleted)
+	return group, nil
 }
 func (c *ClusterService) WriteNamespace() string { return c.root.Prefix }
 func (c *ClusterService) routeMutation(ctx context.Context, d DataPartitionID, id string, m Mutation, deleted bool) (Record, error) {

@@ -70,7 +70,8 @@ class Measurements:
 
 class Storage:
     """Only owns processes and data directories created by this run."""
-    def __init__(self, directory, logs, base):
+    def __init__(self, directory, logs, base, *, pd_binary=None, tikv_binary=None,
+                 weed_binary=None, tikv_config=None):
         self.directory, self.logs, self.base = directory, logs, base
         self.children, self.current = [], {}
         self.directory.mkdir(parents=True)
@@ -80,13 +81,13 @@ class Storage:
         pd_config = directory/'pd.toml'
         pd_config.write_text('[replication]\nmax-replicas = 1\n')
         self.commands = {
-            'pd': [str(ROOT/'.tools/tiup-home/components/pd/v8.5.8/pd-server'), '--name=onebox-pd', '--data-dir='+str(pd),
+            'pd': [str(pd_binary or ROOT/'.tools/tiup-home/components/pd/v8.5.8/pd-server'), '--name=onebox-pd', '--data-dir='+str(pd),
                 '--config='+str(pd_config), f'--client-urls=http://127.0.0.1:{base}', f'--advertise-client-urls=http://127.0.0.1:{base}',
                 f'--peer-urls=http://127.0.0.1:{base+1}', f'--advertise-peer-urls=http://127.0.0.1:{base+1}'],
-            'tikv': [str(ROOT/'.tools/tiup-home/components/tikv/v8.5.8/tikv-server'), '--config='+str(ROOT/'tikv-local.toml'),
+            'tikv': [str(tikv_binary or ROOT/'.tools/tiup-home/components/tikv/v8.5.8/tikv-server'), '--config='+str(tikv_config or ROOT/'tikv-local.toml'),
                 f'--addr=127.0.0.1:{base+2}', f'--advertise-addr=127.0.0.1:{base+2}', f'--status-addr=127.0.0.1:{base+3}',
                 f'--pd=127.0.0.1:{base}', '--data-dir='+str(tikv)],
-            'seaweed': [str(ROOT/'.tools/weed'), 'server', '-dir='+str(weed), '-ip=127.0.0.1', '-ip.bind=127.0.0.1',
+            'seaweed': [str(weed_binary or ROOT/'.tools/weed'), 'server', '-dir='+str(weed), '-ip=127.0.0.1', '-ip.bind=127.0.0.1',
                 f'-master.port={base+10}', f'-volume.port={base+11}', f'-filer.port={base+12}', f'-s3.port={base+13}',
                 '-volume.max=8', '-master.volumeSizeLimitMB=128', '-master.telemetry=false', '-s3', '-s3.config='+str(ROOT/'s3.json')],
         }
@@ -516,10 +517,15 @@ class Onebox:
             p.send_signal(signal.SIGCONT); self.paused.discard(p.pid)
             self.stop_workload(); row.update(self.verify())
         with self.case('S3_pause_with_durable_writes') as row:
+            before=sum(d['head'] for d in self.state()['data_progress'].values())
             p=self.storage.current['seaweed']; p.send_signal(signal.SIGSTOP); self.paused.add(p.pid)
             self.start_workload(); self.hold(8)
             s=self.state(); row['peak_pending']=sum(d['head']-d['completed_lsn'] for d in s['data_progress'].values())
-            assert row['peak_pending']>0
+            row['durable_mutations_during_pause']=sum(d['head'] for d in s['data_progress'].values())-before
+            assert row['durable_mutations_during_pause']>0
+            assert subprocess.check_output(['ps','-o','stat=','-p',str(p.pid)],text=True).strip().startswith('T')
+            # Reference graph journals can keep applying from TiKV while S3 is
+            # paused; backlog is observed, not required to grow artificially.
             p.send_signal(signal.SIGCONT); self.paused.discard(p.pid)
             self.stop_workload(); row.update(self.verify())
         with self.case('TiKV_pause_and_uncertain_client_retries') as row:
@@ -532,12 +538,22 @@ class Onebox:
             self.start_workload(); self.kill([3,4,master,2]); self.hold(5)
             for slot in (master,3,4,2): self.launch(slot)
             self.stop_workload(); row.update(self.verify())
-        with self.case('all_workers_lost_raw_data_still_available') as row:
+        with self.case('all_workers_lost_writes_resume_after_owner_recovery') as row:
             self.checkpoint(); self.kill([3,4,5])
-            with ThreadPoolExecutor(max_workers=8) as pool: list(pool.map(lambda n:self.oracle.mutate(640+n%128),range(512)))
-            s=self.state(); row['peak_pending']=sum(d['head']-d['completed_lsn'] for d in s['data_progress'].values())
-            assert row['peak_pending']>=512
-            for slot in (3,4,5): self.launch(slot)
+            before=sum(d['head'] for d in self.state()['data_progress'].values())
+            # Data mutations require a live owner. Keep the requests pending,
+            # then restore owners before waiting on the executor's futures.
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                pending=[pool.submit(self.oracle.mutate,640+n%128) for n in range(512)]
+                try:
+                    self.hold(3)
+                    row['acks_without_workers']=sum(f.done() and f.exception() is None for f in pending)
+                    assert row['acks_without_workers']==0
+                finally:
+                    for slot in (3,4,5): self.launch(slot)
+                for future in pending: future.result()
+            row['resumed_mutations']=512
+            assert sum(d['head'] for d in self.state()['data_progress'].values())>=before+512
             row.update(self.verify())
         with self.case('continuous_failures_without_catchup_barriers') as row:
             self.start_workload(); row['rounds']=[]

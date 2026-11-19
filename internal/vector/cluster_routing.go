@@ -61,6 +61,10 @@ func (r clusterRouter) IndexForRecord(_ DataPartitionID, v Record) (IndexPartiti
 	return r.route.target(v.Vector), nil
 }
 func (r *Repository) ensureRoutedLayout(ctx context.Context, n int, route *ClusterRouting, scheduler, domain string, retention bool) (PartitionLayout, error) {
+	return r.ensureRoutedLayoutWithBackend(ctx, n, route, scheduler, domain, retention, false)
+}
+
+func (r *Repository) ensureRoutedLayoutWithBackend(ctx context.Context, n int, route *ClusterRouting, scheduler, domain string, retention, rawBackend bool) (PartitionLayout, error) {
 	raw, _ := json.Marshal(route)
 	var frozen ClusterRouting
 	if e := json.Unmarshal(raw, &frozen); e != nil {
@@ -84,7 +88,8 @@ func (r *Repository) ensureRoutedLayout(ctx context.Context, n int, route *Clust
 	defer tx.Rollback()
 	key := []byte(r.Prefix + "partition-layout")
 	raw, e = tx.Get(ctx, key)
-	if e == nil {
+	hasLayout := e == nil
+	if hasLayout {
 		var old PartitionLayout
 		if e = json.Unmarshal(raw, &old); e != nil {
 			return l, e
@@ -108,9 +113,15 @@ func (r *Repository) ensureRoutedLayout(ctx context.Context, n int, route *Clust
 	}
 	previous := fmt.Sprintf("v14-cluster-routing-lease-%s-%s-retention=%t", scheduler, domain, retention)
 	mode := previous + "-owner-append-v1"
+	if rawBackend {
+		mode += "-data-raw-v1"
+	}
 	key = []byte(r.Prefix + "cluster-mode")
 	raw, e = tx.Get(ctx, key)
 	if e == nil && string(raw) != mode {
+		if rawBackend {
+			return l, errors.New("DATA_BACKEND=raw requires a fresh namespace")
+		}
 		if string(raw) != previous {
 			return l, errors.New("incompatible cluster routing protocol")
 		}
@@ -124,6 +135,9 @@ func (r *Repository) ensureRoutedLayout(ctx context.Context, n int, route *Clust
 	}
 	if e != nil && !tikverr.IsErrNotFound(e) {
 		return l, e
+	}
+	if e != nil && rawBackend && hasLayout {
+		return l, errors.New("DATA_BACKEND=raw requires a fresh namespace")
 	}
 	if e = tx.Set(key, []byte(mode)); e != nil {
 		return l, e

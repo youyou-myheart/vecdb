@@ -54,7 +54,10 @@ func (c *ClusterService) FollowerSearch(ctx context.Context, q Search) (Follower
 	}
 	ctx, cancel := context.WithTimeout(ctx, followerReadTimeout)
 	defer cancel()
-	ids := c.router.QueryIndexes(q)
+	ids, routeErr := c.PartitionedService.queryIndexes(q)
+	if routeErr != nil {
+		return FollowerSearchResult{}, routeErr
+	}
 	replies := make([]partitionReply, len(ids))
 	errs := make([]error, len(ids))
 	var wg sync.WaitGroup
@@ -88,6 +91,7 @@ func (c *ClusterService) FollowerSearch(ctx context.Context, q Search) (Follower
 		result.Hits = append(result.Hits, r.Hits...)
 		result.FollowerReads = append(result.FollowerReads, *r.FollowerRead)
 	}
+	result.Hits = deduplicateHits(result.Hits)
 	sort.Slice(result.Hits, func(i, j int) bool {
 		if result.Hits[i].Distance == result.Hits[j].Distance {
 			return result.Hits[i].ID < result.Hits[j].ID
@@ -101,6 +105,9 @@ func (c *ClusterService) FollowerSearch(ctx context.Context, q Search) (Follower
 }
 
 func (p *remotePartition) followerCall(ctx context.Context, q Search) (partitionReply, error) {
+	if p.cluster.routeHintsEnabled() {
+		return p.cachedRoutedCall(ctx, "follower_search", q, nil)
+	}
 	last := error(ErrPartitionUnavailable)
 	for round := 0; round < 2; round++ {
 		plan, err := p.routingPlan(ctx, "follower_search")
@@ -138,7 +145,7 @@ func (g *graphReplica) followerAuthority() error {
 	w := g.writer
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.retired || !time.Now().Before(w.replicaDeadline) || w.publisher == "" || w.publisher == g.journal.owner.Partition || time.Now().Before(w.deadline) {
+	if !w.replicaLive() || w.publisher == "" || w.publisher == g.journal.owner.Partition || w.leaderLease.InLeaderLease(nil) {
 		return ErrFenced
 	}
 	return nil
@@ -154,8 +161,7 @@ func (g *graphReplica) leaderApplied() (GraphPosition, error) {
 	w := g.writer
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	now := time.Now()
-	if w.retired || !w.known || !now.Before(w.deadline) || !now.Before(w.replicaDeadline) {
+	if !w.known || !w.leaderLease.InLeaderLease(nil) || !w.replicaLive() {
 		return GraphPosition{}, ErrFenced
 	}
 	return g.position, nil
@@ -178,6 +184,12 @@ func (g *graphReplica) captureLeaderApplied(ctx context.Context) (GraphPosition,
 	}
 	if r.GraphPosition == nil {
 		return GraphPosition{}, ErrPartitionUnavailable
+	}
+	g.viewMu.RLock()
+	behind := g.position.Sequence < r.GraphPosition.Sequence
+	g.viewMu.RUnlock()
+	if behind {
+		g.input.notify()
 	}
 	return *r.GraphPosition, nil
 }

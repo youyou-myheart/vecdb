@@ -5,24 +5,28 @@ import (
 	"fmt"
 	"maps"
 	"sync"
-	"time"
+
+	"example.com/vector-storage/internal/lease"
 )
 
 // op serializes graph appends, including epoch barriers and maintenance. mu
 // protects short-lived snapshots only: ordinary admission never waits for a
 // graph build or commit. Service.syncMu always precedes op when both are needed.
 type indexWriter struct {
-	op              sync.Mutex
-	mu              sync.Mutex
-	lease           indexLease
-	deadline        time.Time
-	replicaDeadline time.Time
-	publisher       IndexPartitionID
-	publisherRoute  Assignment
-	head            GraphHead
-	known           bool
-	retired         bool
-	controls        []GraphPosition
+	op             sync.Mutex
+	mu             sync.Mutex
+	lease          indexLease
+	leaderLease    lease.Handle
+	replicaLease   *lease.Handle
+	publisher      IndexPartitionID
+	publisherRoute Assignment
+	head           GraphHead
+	known          bool
+	controls       []GraphPosition
+}
+
+func (w *indexWriter) replicaLive() bool {
+	return w.replicaLease != nil && w.replicaLease.InLeaderLease(nil)
 }
 
 func cloneGraphHead(h GraphHead) GraphHead {
@@ -33,19 +37,40 @@ func cloneGraphHead(h GraphHead) GraphHead {
 func (w *indexWriter) snapshot() (GraphHead, []byte, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.retired || !time.Now().Before(w.deadline) || !w.known {
+	if !w.replicaLive() || !w.leaderLease.InLeaderLease(nil) || !w.known {
 		return GraphHead{}, nil, ErrFenced
 	}
 	return cloneGraphHead(w.head), w.lease.token(), nil
 }
 func (w *indexWriter) authority(token []byte) error {
+	return w.appendAuthority(token, nil)
+}
+func (w *indexWriter) appendAuthority(token []byte, tx transactionAPI) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.retired || !time.Now().Before(w.deadline) || string(token) != string(w.lease.token()) {
+	grant, ok := w.leaderLease.Snapshot()
+	if !ok || !w.replicaLive() || string(token) != string(w.lease.token()) {
+		return ErrFenced
+	}
+	if tx != nil && txnMillis(tx) >= grant.Expires {
 		return ErrFenced
 	}
 	return nil
 }
+func (w *indexWriter) commitExpiry(token []byte) (int64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	leader, ok := w.leaderLease.Snapshot()
+	if !ok || w.replicaLease == nil || string(token) != string(w.lease.token()) {
+		return 0, ErrFenced
+	}
+	replica, ok := w.replicaLease.Snapshot()
+	if !ok {
+		return 0, ErrFenced
+	}
+	return min(leader.Expires, replica.Expires), nil
+}
+
 func (w *indexWriter) invalidate() {
 	w.mu.Lock()
 	w.known = false
@@ -54,24 +79,9 @@ func (w *indexWriter) invalidate() {
 }
 func (w *indexWriter) retire() {
 	w.mu.Lock()
-	w.retired = true
+	w.leaderLease.Retire()
 	w.known = false
 	w.mu.Unlock()
-}
-func (w *indexWriter) install(start time.Time, lease indexLease) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.retired {
-		return
-	}
-	if lease.Generation < w.lease.Generation || (lease.Generation == w.lease.Generation && lease.Expires < w.lease.Expires) {
-		return
-	}
-	if string(w.lease.token()) != string(lease.token()) {
-		w.known = false
-		w.controls = nil
-	}
-	w.lease, w.deadline = lease, leaseDeadline(start, lease.remaining)
 }
 func (w *indexWriter) accept(h GraphHead) {
 	w.mu.Lock()
@@ -85,66 +95,20 @@ func (w *indexWriter) advance(e GraphEntry) {
 	w.mu.Unlock()
 }
 
-// Called only by the control loop, after a confirmed replica renewal. A failed
-// grant never extends local authority. The monotonic deadline starts before IO.
-func (g *graphReplica) refreshLease(ctx context.Context, plan ReplicaPlan, replicaStart time.Time) (err error) {
-	w := g.writer
-	if w == nil {
-		return nil
-	}
-	w.mu.Lock()
-	w.publisher = plan.Publisher
-	w.publisherRoute = Assignment{}
-	for _, a := range plan.Serving {
-		if a.Partition == plan.Publisher {
-			w.publisherRoute = a
-			break
-		}
-	}
-	w.replicaDeadline = leaseDeadline(replicaStart, time.Duration(g.journal.c.ttl)*time.Millisecond)
-	w.mu.Unlock()
-	defer g.input.notify()
-	if plan.Publisher != g.journal.owner.Partition || plan.LeaseDraining {
-		return nil
-	}
-	defer g.track("index_lease_renew")(&err)
-	started := time.Now()
-	grant, err := g.journal.c.grantIndexLease(ctx, g.journal.id, g.journal.owner)
-	if err == nil {
-		// Ordinary renewals must not wait for construction/rebuild. A fresh guard
-		// is installed only between appends; if one is busy, leave the old local
-		// authority unchanged and retry on the next control tick. The durable guard
-		// already prevents any late old append, and failed installs do not extend it.
-		w.mu.Lock()
-		same := string(w.lease.token()) == string(grant.token())
-		if same && !w.retired && grant.Expires >= w.lease.Expires {
-			w.lease, w.deadline = grant, leaseDeadline(started, grant.remaining)
-		}
-		w.mu.Unlock()
-		if !same {
-			if !w.op.TryLock() {
-				return ErrConflict
-			}
-			w.install(started, grant)
-			w.op.Unlock()
-		}
-	}
-	return err
-}
-
-func (g *graphReplica) syncLeased(ctx context.Context, s *Service, rebuild bool) (err error) {
+func (g *graphReplica) syncLeased(ctx context.Context, s *Service, rebuild bool, expectedTerm uint64) (err error) {
 	w := g.writer
 	w.op.Lock()
 	defer w.op.Unlock()
 	w.mu.Lock()
-	live := !w.retired && time.Now().Before(w.replicaDeadline)
-	leader := !w.retired && time.Now().Before(w.deadline)
+	live := w.replicaLive()
+	leader := w.leaderLease.InLeaderLease(nil)
 	expectedLeader := w.publisher == g.journal.owner.Partition
 	known := w.known
+	generation := w.lease.Generation
 	token := w.lease.token()
 	w.mu.Unlock()
 	g.leader = leader
-	if !live || (expectedLeader && !leader) {
+	if !live || (expectedLeader && !leader) || (expectedTerm != 0 && (!expectedLeader || generation != expectedTerm)) {
 		return ErrFenced
 	}
 	if !leader {
@@ -167,7 +131,10 @@ func (g *graphReplica) syncLeased(ctx context.Context, s *Service, rebuild bool)
 		w.invalidate()
 		// Maintenance retains the fully fenced slow path. Its append is serialized
 		// with all cached appends and forces one recovery before reusing the cache.
-		return g.syncSlow(ctx, s, true)
+		if err := g.syncSlow(ctx, s, true, token); err != nil {
+			return err
+		}
+		return w.authority(token)
 	}
 	if !known {
 		measure := g.track("index_lease_recovery")
@@ -247,7 +214,7 @@ func validateAdmitted(h GraphHead, q Delivery) error {
 
 func (g *graphReplica) admitLeased(ctx context.Context, q Delivery) (GraphHead, error) {
 	w := g.writer
-	h, _, err := w.snapshot()
+	h, token, err := w.snapshot()
 	if err != nil {
 		return h, err
 	}
@@ -257,11 +224,14 @@ func (g *graphReplica) admitLeased(ctx context.Context, q Delivery) (GraphHead, 
 	}
 	if q.Owner.Epoch == h.SourceEpochs[key] {
 		// Validation IO does not hold op; the consumer can build/commit concurrently.
-		tx, err := g.repo.begin()
-		if err != nil {
-			return h, err
+		var tx transactionAPI
+		if !q.verified && q.Through > h.Sources[key] {
+			tx, err = g.repo.begin()
+			if err != nil {
+				return h, err
+			}
+			defer tx.Rollback()
 		}
-		defer tx.Rollback()
 		err = g.input.cluster.validateDeliveryBounds(ctx, tx, g.journal.id, q, h.Sources[key])
 		if err == nil && q.Through > h.Sources[key] {
 			err = g.input.cluster.validateDeliveryEvents(ctx, tx, g.journal.id, q)
@@ -269,15 +239,19 @@ func (g *graphReplica) admitLeased(ctx context.Context, q Delivery) (GraphHead, 
 		if err != nil {
 			return h, err
 		}
-		latest, _, err := w.snapshot()
+		latest, currentToken, err := w.snapshot()
 		if err == nil {
-			err = validateAdmitted(latest, q)
+			if string(currentToken) != string(token) {
+				err = ErrFenced
+			} else {
+				err = validateAdmitted(latest, q)
+			}
 		}
 		return latest, err
 	}
 	w.op.Lock()
 	defer w.op.Unlock()
-	h, token, err := w.snapshot()
+	h, token, err = w.snapshot()
 	if err != nil {
 		return h, err
 	}
@@ -289,7 +263,7 @@ func (g *graphReplica) admitLeased(ctx context.Context, q Delivery) (GraphHead, 
 		g.input.notify()
 		return h, ErrConflict
 	}
-	next, err := g.journal.admitSourceCached(ctx, g.input.cluster, q, h, token, func() error { return w.authority(token) })
+	next, err := g.journal.admitSourceCached(ctx, g.input.cluster, q, h, token, w)
 	if err != nil {
 		w.invalidate()
 		g.input.notify()

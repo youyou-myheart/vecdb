@@ -48,10 +48,10 @@ func (j graphJournal) admitSource(ctx context.Context, c *ClusterService, q Deli
 func (j graphJournal) admitSourceOnce(ctx context.Context, c *ClusterService, q Delivery) (GraphHead, error) {
 	return j.admitSourceTransaction(ctx, c, q, nil, nil, nil)
 }
-func (j graphJournal) admitSourceCached(ctx context.Context, c *ClusterService, q Delivery, h GraphHead, token []byte, check func() error) (GraphHead, error) {
-	return j.admitSourceTransaction(ctx, c, q, &h, token, check)
+func (j graphJournal) admitSourceCached(ctx context.Context, c *ClusterService, q Delivery, h GraphHead, token []byte, writer *indexWriter) (GraphHead, error) {
+	return j.admitSourceTransaction(ctx, c, q, &h, token, writer)
 }
-func (j graphJournal) admitSourceTransaction(ctx context.Context, c *ClusterService, q Delivery, cached *GraphHead, token []byte, check func() error) (GraphHead, error) {
+func (j graphJournal) admitSourceTransaction(ctx context.Context, c *ClusterService, q Delivery, cached *GraphHead, token []byte, writer *indexWriter) (GraphHead, error) {
 	tx, err := j.c.root.begin()
 	if err != nil {
 		return GraphHead{}, err
@@ -68,9 +68,9 @@ func (j graphJournal) admitSourceTransaction(ctx context.Context, c *ClusterServ
 		h, err = j.headIn(ctx, tx)
 	} else {
 		h = cloneGraphHead(*cached)
-		err = check()
+		err = writer.appendAuthority(token, tx)
 		if err == nil {
-			err = j.c.fenceIndexGuard(ctx, tx, j.id, token)
+			err = tx.Set(j.c.indexGuardKey(j.id), token)
 		}
 	}
 	if err != nil {
@@ -138,8 +138,8 @@ func (j graphJournal) admitSourceTransaction(ctx context.Context, c *ClusterServ
 	if err = putJSON(tx, keyBytes, e); err != nil {
 		return h, err
 	}
-	if check != nil {
-		if err = check(); err != nil {
+	if writer != nil {
+		if err = writer.authority(token); err != nil {
 			return h, err
 		}
 	}

@@ -13,6 +13,7 @@ import (
 )
 
 type partitionRPC struct {
+	Acks        []graphCommitAck `json:"graph_acks,omitempty"`
 	ID          string           `json:"id,omitempty"`
 	Mutation    *Mutation        `json:"mutation,omitempty"`
 	Deleted     bool             `json:"deleted,omitempty"`
@@ -62,6 +63,14 @@ func (c *ClusterService) InternalHandler() http.Handler {
 		if e := decoder.Decode(&extra); e != io.EOF {
 			w.WriteHeader(400)
 			return
+		}
+		if proof := r.Header.Get(deliveryProofHeader); proof != "" && req.Delivery != nil {
+			var err error
+			req.Delivery.proof, err = hex.DecodeString(proof)
+			if err != nil || len(req.Delivery.proof) != 32 {
+				w.WriteHeader(400)
+				return
+			}
 		}
 		budget := 30 * time.Second
 		if req.TimeoutMS > 0 && req.TimeoutMS < budget.Milliseconds() {
@@ -120,6 +129,24 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 	if req.Namespace != c.root.Prefix {
 		return reply, ErrFenced
 	}
+	if req.Operation == "get_owned" {
+		if req.Source == nil || *req.Source != c.router.DataForID(req.ID) || req.Partition != sourceID(*req.Source) {
+			return reply, ErrFenced
+		}
+		group, err := c.localDataWriter(*req.Source, req.Epoch, req.Session)
+		if err != nil {
+			return reply, err
+		}
+		record, err := group.readOwnedRecord(req.ID)
+		if errors.Is(err, ErrNotFound) {
+			return reply, nil
+		}
+		if err != nil {
+			return reply, err
+		}
+		reply.Record = &record
+		return reply, nil
+	}
 	if req.Operation == "mutate" {
 		if req.Source == nil || req.Partition != sourceID(*req.Source) || req.Mutation == nil {
 			return reply, ErrFenced
@@ -130,10 +157,29 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 		}
 		return reply, err
 	}
+	if req.Operation == "prune_data" {
+		if req.Source == nil || req.Partition != sourceID(*req.Source) {
+			return reply, ErrFenced
+		}
+		group, err := c.localDataWriter(*req.Source, req.Epoch, req.Session)
+		if err != nil {
+			return reply, err
+		}
+		reply.Floor, err = c.pruneData(ctx, *req.Source, group.lease.owner)
+		var after uint64
+		if err == nil && (!group.lease.InLeaderLease(&after) || req.Epoch != after) {
+			return partitionReply{}, ErrFenced
+		}
+		return reply, err
+	}
 	if req.Operation == "wake_source" {
 		if !c.EventDrivenIndexing() || c.worker == nil || req.Source == nil || *req.Source < 0 || int(*req.Source) >= c.layout.DataPartitions || req.Partition != sourceID(*req.Source) {
 			return reply, ErrFenced
 		}
+		if len(req.Acks) > len(c.layout.Bindings) {
+			return reply, ErrFenced
+		}
+		c.receiveGraphAcks(*req.Source, req.Acks)
 		c.signalSource(*req.Source, "received", true)
 		return reply, nil
 	}
@@ -158,13 +204,37 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 	if entry.owner.Epoch != req.Epoch {
 		return reply, ErrFenced
 	}
-	if req.Operation == "follower_search" {
-		return c.executeFollowerRead(ctx, entry, req.Query)
-	}
-	if !(c.coordinator.leaseReads && req.Operation == "deliver") {
+	localOwner := c.localOwnerLeases || req.Operation == "search" && c.localReadLeases()
+	if localOwner {
+		if e := entry.checkReadLease(req); e != nil {
+			return reply, e
+		}
+	} else if req.Operation != "follower_search" && !(c.coordinator.leaseReads && req.Operation == "deliver") {
 		if e := c.coordinator.Check(ctx, entry.owner); e != nil {
 			return reply, e
 		}
+	}
+	if req.Operation == "follower_search" {
+		reply, err := c.executeFollowerRead(ctx, entry, req.Query)
+		if err == nil && localOwner {
+			err = entry.checkReadLease(req)
+		}
+		if err != nil {
+			return partitionReply{}, err
+		}
+		return reply, nil
+	}
+	if req.Operation == "search" && req.Query.MinVisible != nil && c.graphReplication && c.EventDrivenIndexing() {
+		reply, err := c.searchVisibleReplica(ctx, entry, req.Query)
+		if err != nil {
+			return partitionReply{}, err
+		}
+		if localOwner {
+			err = entry.checkReadLease(req)
+		} else {
+			err = c.coordinator.Check(ctx, entry.owner)
+		}
+		return reply, err
 	}
 	entry.mu.RLock()
 	defer entry.mu.RUnlock()
@@ -178,7 +248,14 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 		if req.Delivery == nil || s.graphReplica == nil || s.graphReplica.input == nil {
 			return reply, ErrFenced
 		}
-		e = s.graphReplica.enqueue(ctx, *req.Delivery)
+		q := *req.Delivery
+		if len(q.proof) != 0 {
+			if !c.verifyDelivery(s.graphReplica.journal.id, q) {
+				return reply, ErrFenced
+			}
+			q.verified = true
+		}
+		e = s.graphReplica.enqueue(ctx, q)
 	case "search":
 		started := time.Now()
 		defer func() { entry.queryNanos.Add(time.Since(started).Nanoseconds()) }()
@@ -222,7 +299,13 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 			return partitionReply{}, ErrFenced
 		}
 		_, _, e = s.graphReplica.writer.snapshot()
-	} else {
+		if e != nil {
+			return partitionReply{}, e
+		}
+	}
+	if localOwner {
+		e = entry.checkReadLease(req)
+	} else if !(c.coordinator.leaseReads && req.Operation == "deliver") {
 		e = c.coordinator.Check(ctx, entry.owner)
 	}
 	if e != nil {

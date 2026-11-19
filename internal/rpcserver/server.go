@@ -45,7 +45,7 @@ func New(b Backend, token, namespace string, gateway bool, options ...grpc.Serve
 			return nil, status.Error(codes.Unauthenticated, "invalid API_TOKEN")
 		}
 		switch info.FullMethod {
-		case pb.VectorStore_Health_FullMethodName, pb.VectorStore_GetCluster_FullMethodName, pb.VectorStore_GetLayout_FullMethodName:
+		case pb.VectorStore_Health_FullMethodName, pb.VectorStore_GetCluster_FullMethodName, pb.VectorStore_GetSearchRoutes_FullMethodName, pb.VectorStore_GetLayout_FullMethodName:
 		case pb.VectorStore_Put_FullMethodName:
 			if !gateway && (!worker || req.(*pb.PutRequest).GetRoute() == nil) {
 				return nil, status.Error(codes.PermissionDenied, "direct data route required")
@@ -76,6 +76,8 @@ func rpcError(err error) error {
 		return status.Error(codes.Canceled, err.Error())
 	case errors.Is(err, context.DeadlineExceeded):
 		return status.Error(codes.DeadlineExceeded, err.Error())
+	case errors.Is(err, vector.ErrInvalidSearchPartitions):
+		return status.Error(codes.InvalidArgument, err.Error())
 	case errors.Is(err, vector.ErrNotFound):
 		return status.Error(codes.NotFound, err.Error())
 	case errors.Is(err, vector.ErrConflict):
@@ -191,13 +193,19 @@ func (s *Server) Search(ctx context.Context, r *pb.SearchRequest) (*pb.SearchRes
 		return nil, status.Error(codes.InvalidArgument, "k must be 1..1000; ef_search must be 0..4096")
 	}
 	q := vector.Search{Vector: r.Vector, K: int(r.K), Filter: r.Filter, Exact: r.Exact, EFSearch: int(r.EfSearch)}
+	for _, id := range r.IndexPartitions {
+		q.IndexPartitions = append(q.IndexPartitions, vector.IndexPartitionID(id))
+	}
 	if r.MinVisible != nil {
 		if !validID(r.MinVisible.Id) || r.MinVisible.Revision == 0 {
 			return nil, status.Error(codes.InvalidArgument, "invalid visibility token")
 		}
 		q.MinVisible = &vector.Token{ID: r.MinVisible.Id, Revision: r.MinVisible.Revision}
-		if e := s.backend.Sync(ctx); e != nil {
-			return nil, rpcError(e)
+		handler, owns := s.backend.(interface{ HandlesMinVisible() bool })
+		if !owns || !handler.HandlesMinVisible() {
+			if e := s.backend.Sync(ctx); e != nil {
+				return nil, rpcError(e)
+			}
 		}
 	}
 	hits, e := s.backend.SearchContext(ctx, q)
@@ -216,6 +224,9 @@ func (s *Server) Health(context.Context, *pb.Empty) (*pb.HealthResponse, error) 
 
 func (s *Server) FollowerSearch(ctx context.Context, r *pb.SearchRequest) (*pb.SearchResponse, error) {
 	q := vector.Search{Vector: r.Vector, K: int(r.K), Filter: r.Filter, Exact: r.Exact, EFSearch: int(r.EfSearch)}
+	for _, id := range r.IndexPartitions {
+		q.IndexPartitions = append(q.IndexPartitions, vector.IndexPartitionID(id))
+	}
 	if r.MinVisible != nil {
 		return nil, status.Error(codes.InvalidArgument, "follower read cannot be combined with min_visible")
 	}
@@ -276,6 +287,25 @@ func (s *Server) GetCluster(ctx context.Context, _ *pb.Empty) (*pb.ClusterStatus
 	routing := state.Routing
 	state.Routing = nil
 	err := convert(state, out)
+	out.Routing = rpcRouting(routing)
+	return out, err
+}
+
+func (s *Server) GetSearchRoutes(ctx context.Context, _ *pb.Empty) (*pb.ClusterStatus, error) {
+	provider, ok := s.backend.(interface {
+		SearchRouting(context.Context) (vector.ClusterStatus, error)
+	})
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "search routing unavailable")
+	}
+	state, err := provider.SearchRouting(ctx)
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	routing := state.Routing
+	state.Routing = nil
+	out := &pb.ClusterStatus{}
+	err = convert(state, out)
 	out.Routing = rpcRouting(routing)
 	return out, err
 }

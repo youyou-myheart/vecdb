@@ -15,35 +15,66 @@ const DefaultGraphCheckpointAge = 3 * time.Minute
 // The first uncovered entry supplies the clock across restarts and failover.
 // A quiet graph has no deadline and never creates repeated empty checkpoints.
 func (j graphJournal) checkpointDue(ctx context.Context, bytes uint64, age time.Duration) (bool, error) {
+	_, delay, err := j.nextCheckpoint(ctx, bytes, age)
+	return delay == 0 && err == nil, err
+}
+
+// A negative delay means the checkpoint covers the entire journal.
+func (j graphJournal) nextCheckpoint(ctx context.Context, bytes uint64, age time.Duration) (GraphHead, time.Duration, error) {
 	tx, err := j.c.root.begin()
 	if err != nil {
-		return false, err
+		return GraphHead{}, 0, err
 	}
 	defer tx.Rollback()
 	h, err := j.headIn(ctx, tx)
 	if err != nil {
-		return false, err
+		return h, 0, err
 	}
 	if h.Committed.Sequence == h.CheckpointPosition.Sequence {
-		return false, nil
+		return h, -1, nil
 	}
 	if h.LogBytes < h.CheckpointBytes {
-		return false, errors.New("checkpoint byte watermark exceeds graph tail")
+		return h, 0, errors.New("checkpoint byte watermark exceeds graph tail")
 	}
 	if h.LogBytes-h.CheckpointBytes >= bytes {
-		return true, nil
+		return h, 0, nil
 	}
 	var first GraphEntry
 	if err = readJSON(ctx, tx, j.key(fmt.Sprintf("entries/%020d", h.CheckpointPosition.Sequence+1)), &first); err != nil {
-		return false, err
+		return h, 0, err
 	}
 	if first.CreatedMS <= 0 {
-		return false, errors.New("graph entry missing durable timestamp")
+		return h, 0, errors.New("graph entry missing durable timestamp")
 	}
-	return txnMillis(tx)-first.CreatedMS >= age.Milliseconds(), nil
+	return h, max(time.Duration(0), age-time.Duration(txnMillis(tx)-first.CreatedMS)*time.Millisecond), nil
+}
+
+type graphMaintenanceSchedule struct {
+	generation uint64
+	checkpoint GraphPosition
+	bytes      uint64
+	deadline   time.Time
+	gcAt       time.Time
+}
+
+func (m *graphMaintenanceSchedule) canWait(w *indexWriter, threshold uint64) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	grant, live := w.leaderLease.Snapshot()
+	if !live || !w.replicaLive() {
+		return true
+	}
+	if !w.known || grant.Epoch != m.generation || !time.Now().Before(m.gcAt) {
+		return false
+	}
+	if w.head.Committed == m.checkpoint {
+		return true
+	}
+	return !m.deadline.IsZero() && time.Now().Before(m.deadline) && w.head.LogBytes >= m.bytes && w.head.LogBytes-m.bytes < threshold
 }
 
 func (c *ClusterService) runGraphMaintenance(ctx context.Context, entry *localPartition) {
+	var schedule graphMaintenanceSchedule
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -60,26 +91,47 @@ func (c *ClusterService) runGraphMaintenance(ctx context.Context, entry *localPa
 				return
 			}
 			g := s.graphReplica
-			plan, err := c.coordinator.Plan(ctx, g.journal.id)
+			// A role hint only: checkpoint/GC still enforce ReplicaFence in
+			// their changing transaction, including the current publisher.
+			var plan ReplicaPlan
+			var err error
+			if g.writer != nil {
+				if schedule.canWait(g.writer, c.checkpointBytes) {
+					return
+				}
+				plan.Publisher = entry.owner.Partition
+			} else if c.routeHintsEnabled() {
+				var state *ClusterStatus
+				state, err = c.cachedSearchRoutes(ctx, false)
+				if err == nil {
+					plan = state.ReplicaPlans[g.journal.id]
+				}
+			} else {
+				plan, err = c.coordinator.Plan(ctx, g.journal.id)
+			}
 			if err != nil || plan.Publisher != entry.owner.Partition {
 				return
 			}
 			work, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			defer cancel()
-			err = c.maintainGraph(work, s)
+			err = c.maintainGraph(work, s, &schedule)
 			if err != nil && ctx.Err() == nil && !errors.Is(err, ErrFenced) && !errors.Is(err, ErrConflict) {
 				log.Printf("graph maintenance %s: %v", g.journal.id, err)
 			}
 		}()
 	}
 }
-func (c *ClusterService) maintainGraph(ctx context.Context, s *Service) (err error) {
+func (c *ClusterService) maintainGraph(ctx context.Context, s *Service, m *graphMaintenanceSchedule) (err error) {
 	g := s.graphReplica
-	due, err := g.journal.checkpointDue(ctx, c.checkpointBytes, c.checkpointAge)
+	var generation uint64
+	if g.writer != nil && !g.writer.leaderLease.InLeaderLease(&generation) {
+		return ErrFenced
+	}
+	h, delay, err := g.journal.nextCheckpoint(ctx, c.checkpointBytes, c.checkpointAge)
 	if err != nil {
 		return err
 	}
-	if due {
+	if delay == 0 {
 		measure := c.observations.pipeline.track("graph_checkpoint", string(g.journal.id))
 		_, err = g.checkpoint(ctx, s)
 		measure(&err)
@@ -87,8 +139,19 @@ func (c *ClusterService) maintainGraph(ctx context.Context, s *Service) (err err
 			return err
 		}
 	}
+	m.generation, m.checkpoint, m.bytes = generation, h.CheckpointPosition, h.CheckpointBytes
+	m.deadline = time.Time{}
+	if delay > 0 {
+		m.deadline = time.Now().Add(delay)
+	}
+	if delay != 0 && time.Now().Before(m.gcAt) {
+		return nil
+	}
 	measure := c.observations.pipeline.track("graph_gc", string(g.journal.id))
 	_, err = s.Prune(ctx)
+	if err == nil {
+		m.gcAt = time.Now().Add(10 * time.Second)
+	}
 	measure(&err)
 	return err
 }
@@ -143,14 +206,14 @@ func (c *ClusterService) retainGraphReferences(ctx context.Context, tx transacti
 	return completedPrefix(batch.Events, floor, c.eventTargets, commits), nil
 }
 
-// A local writer is a candidate for maintenance, never proof of ownership.
-// Copy the small set so no writer lock spans a KV lookup, upload or GC.
+// Start maintenance for live local writers. Publishing and pruning still
+// fence their mutations at commit, without holding writerMu during I/O.
 func (c *ClusterService) localDataOwners() map[DataPartitionID]Ownership {
 	c.writerMu.RLock()
 	defer c.writerMu.RUnlock()
 	owners := make(map[DataPartitionID]Ownership, len(c.writers))
 	for id, group := range c.writers {
-		if !group.lease.uncertain.Load() {
+		if group.lease.InLeaderLease(nil) {
 			owners[id] = group.lease.owner
 		}
 	}
@@ -167,9 +230,6 @@ func (c *ClusterService) dataMaintenanceLoop(ctx context.Context) {
 		case <-ticker.C:
 		}
 		for d, owner := range c.localDataOwners() {
-			if err := c.coordinator.Check(ctx, owner); err != nil {
-				continue
-			}
 			work, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			measure := c.observations.pipeline.track("data_checkpoint_gc", string(sourceID(d)))
 			err := c.maintainData(work, d, owner)

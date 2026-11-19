@@ -6,7 +6,18 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"example.com/vector-storage/internal/lease"
 )
+
+func testIndexWriterWithReplicaLease(g *graphReplica) *indexWriter {
+	w := &indexWriter{replicaLease: &lease.Handle{}}
+	w.replicaLease.Confirm(time.Now(), lease.Grant{
+		Epoch: g.journal.owner.Epoch, Expires: g.journal.owner.Expires,
+		Remaining: time.Duration(g.journal.c.ttl) * time.Millisecond,
+	})
+	return w
+}
 
 func leasedFixture(t *testing.T) (*graphFixture, *ClusterService, Ownership) {
 	t.Helper()
@@ -15,12 +26,12 @@ func leasedFixture(t *testing.T) (*graphFixture, *ClusterService, Ownership) {
 	f.c.leaseReads = true
 	for _, s := range f.services {
 		g := s.graphReplica
-		g.writer = &indexWriter{}
+		g.writer = testIndexWriterWithReplicaLease(g)
 		p, e := f.c.Plan(f.ctx, g.journal.id)
 		if e != nil {
 			t.Fatal(e)
 		}
-		if e = g.refreshLease(f.ctx, p, time.Now()); e != nil {
+		if e = g.refreshLease(f.ctx, p); e != nil {
 			t.Fatal(e)
 		}
 		if e = s.Sync(f.ctx); e != nil {
@@ -31,7 +42,7 @@ func leasedFixture(t *testing.T) (*graphFixture, *ClusterService, Ownership) {
 }
 
 // Count actual transaction operations, not just calls to the public Head API.
-// KV reads for immutable source data and the storage write guard remain allowed.
+// KV reads for immutable source data remain allowed.
 type noControlReadsTx struct {
 	transactionAPI
 	t *testing.T
@@ -39,7 +50,7 @@ type noControlReadsTx struct {
 
 func (x noControlReadsTx) Get(ctx context.Context, key []byte) ([]byte, error) {
 	k := string(key)
-	if strings.Contains(k, "cluster/owners/") || strings.Contains(k, "cluster/replica-plans/") || strings.HasSuffix(k, "/head") || strings.Contains(k, "cluster/fences/") {
+	if strings.Contains(k, "cluster/owners/") || strings.Contains(k, "cluster/replica-plans/") || strings.HasSuffix(k, "/head") || strings.Contains(k, "cluster/fences/") || strings.Contains(k, "cluster/index-guards/") {
 		x.t.Fatalf("hot path control read: %s", k)
 	}
 	return x.transactionAPI.Get(ctx, key)
@@ -133,13 +144,11 @@ func TestIndexLeaseUnknownAppendRecoversDurableState(t *testing.T) {
 	}
 }
 
-func TestIndexLeaseExpiryFailsClosedAndDelayedGrant(t *testing.T) {
+func TestIndexLeaseRetirementFailsClosedAndDelayedGrant(t *testing.T) {
 	f, _, o := leasedFixture(t)
 	g := f.services[0].graphReplica
 	w := g.writer
-	w.mu.Lock()
-	w.deadline = time.Now().Add(-time.Millisecond)
-	w.mu.Unlock()
+	w.leaderLease.Retire()
 	f.write(t, "v", false)
 	if e := g.enqueue(f.ctx, deliveryFor(t, f, o, 0)); !errors.Is(e, ErrFenced) {
 		t.Fatal(e)
@@ -149,8 +158,9 @@ func TestIndexLeaseExpiryFailsClosedAndDelayedGrant(t *testing.T) {
 	}
 	lease := w.lease
 	lease.remaining = 100 * time.Millisecond
-	w.install(time.Now().Add(-time.Second), lease)
-	if e := w.authority(lease.token()); !errors.Is(e, ErrFenced) {
+	unconfirmed := &indexWriter{}
+	unconfirmed.install(time.Now().Add(-time.Second), lease)
+	if e := unconfirmed.authority(lease.token()); !errors.Is(e, ErrFenced) {
 		t.Fatal("late reply extended lease", e)
 	}
 	w.retire()
@@ -302,7 +312,7 @@ func TestIndexLeaseRenewalDoesNotWaitForConstruction(t *testing.T) {
 	defer w.op.Unlock()
 	// The caller deliberately owns the construction lock. A regular renewal
 	// must update the deadline without needing that lock (and cannot deadlock).
-	if e = g.refreshLease(f.ctx, plan, time.Now()); e != nil {
+	if e = g.refreshLease(f.ctx, plan); e != nil {
 		t.Fatal(e)
 	}
 	if _, _, e = w.snapshot(); e != nil {

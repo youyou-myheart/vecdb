@@ -30,6 +30,7 @@ const (
 	VectorStore_FollowerSearch_FullMethodName    = "/vectorstore.v1.VectorStore/FollowerSearch"
 	VectorStore_Health_FullMethodName            = "/vectorstore.v1.VectorStore/Health"
 	VectorStore_GetCluster_FullMethodName        = "/vectorstore.v1.VectorStore/GetCluster"
+	VectorStore_GetSearchRoutes_FullMethodName   = "/vectorstore.v1.VectorStore/GetSearchRoutes"
 	VectorStore_GetLayout_FullMethodName         = "/vectorstore.v1.VectorStore/GetLayout"
 	VectorStore_Checkpoint_FullMethodName        = "/vectorstore.v1.VectorStore/Checkpoint"
 	VectorStore_Rebuild_FullMethodName           = "/vectorstore.v1.VectorStore/Rebuild"
@@ -52,6 +53,8 @@ type VectorStoreClient interface {
 	FollowerSearch(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*SearchResponse, error)
 	Health(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*HealthResponse, error)
 	GetCluster(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*ClusterStatus, error)
+	// Lightweight centers/counts/replica hints, omitting graph and data progress.
+	GetSearchRoutes(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*ClusterStatus, error)
 	GetLayout(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*Layout, error)
 	Checkpoint(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*Manifest, error)
 	Rebuild(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*Manifest, error)
@@ -165,6 +168,15 @@ func (c *vectorStoreClient) GetCluster(ctx context.Context, in *Empty, opts ...g
 	return out, nil
 }
 
+func (c *vectorStoreClient) GetSearchRoutes(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*ClusterStatus, error) {
+	out := new(ClusterStatus)
+	err := c.cc.Invoke(ctx, VectorStore_GetSearchRoutes_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *vectorStoreClient) GetLayout(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*Layout, error) {
 	out := new(Layout)
 	err := c.cc.Invoke(ctx, VectorStore_GetLayout_FullMethodName, in, out, opts...)
@@ -217,6 +229,8 @@ type VectorStoreServer interface {
 	FollowerSearch(context.Context, *SearchRequest) (*SearchResponse, error)
 	Health(context.Context, *Empty) (*HealthResponse, error)
 	GetCluster(context.Context, *Empty) (*ClusterStatus, error)
+	// Lightweight centers/counts/replica hints, omitting graph and data progress.
+	GetSearchRoutes(context.Context, *Empty) (*ClusterStatus, error)
 	GetLayout(context.Context, *Empty) (*Layout, error)
 	Checkpoint(context.Context, *Empty) (*Manifest, error)
 	Rebuild(context.Context, *Empty) (*Manifest, error)
@@ -260,6 +274,9 @@ func (UnimplementedVectorStoreServer) Health(context.Context, *Empty) (*HealthRe
 }
 func (UnimplementedVectorStoreServer) GetCluster(context.Context, *Empty) (*ClusterStatus, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetCluster not implemented")
+}
+func (UnimplementedVectorStoreServer) GetSearchRoutes(context.Context, *Empty) (*ClusterStatus, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetSearchRoutes not implemented")
 }
 func (UnimplementedVectorStoreServer) GetLayout(context.Context, *Empty) (*Layout, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetLayout not implemented")
@@ -484,6 +501,24 @@ func _VectorStore_GetCluster_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VectorStore_GetSearchRoutes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VectorStoreServer).GetSearchRoutes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VectorStore_GetSearchRoutes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VectorStoreServer).GetSearchRoutes(ctx, req.(*Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _VectorStore_GetLayout_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(Empty)
 	if err := dec(in); err != nil {
@@ -606,6 +641,10 @@ var VectorStore_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetCluster",
 			Handler:    _VectorStore_GetCluster_Handler,
+		},
+		{
+			MethodName: "GetSearchRoutes",
+			Handler:    _VectorStore_GetSearchRoutes_Handler,
 		},
 		{
 			MethodName: "GetLayout",

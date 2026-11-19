@@ -63,7 +63,7 @@ curl -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:18202/v1/cluster
 | `vecdb_index_admissions_total` / `duplicates_total` / `rejections_total` | 本进程接受批次、重复批次、拒绝批次；拒绝包括背压和 fencing，需要结合错误状态判断 |
 | `vecdb_index_queue_batches` / `queue_bytes` | 当前本地 Index 输入队列大小；每来源最多一批，总编码预算 4 MiB，不包括正在构图的批次 |
 | `vecdb_scrub_scanned_records_total` / `removed_records_total` | 后台错簇清理扫描的记录数、已提交删除的本地旧记录数 |
-| `vecdb_search_stale_candidates_total` / `exact_fallbacks_total` | 查询候选权威校验剔除数，以及超过候选预算转为精确验证的次数；升高时检查跨簇移动积压与清理进度 |
+| `vecdb_search_stale_candidates_total` / `exact_fallbacks_total` | 保留供历史监控兼容；当前查询只读已应用的内存索引，不再回查 TiKV，因此不会递增这两个候选权威校验计数 |
 
 表中省略重复前缀的列沿用同一前缀，例如 `vecdb_data_completed_lsn`、`vecdb_index_duplicates_total`。
 
@@ -113,3 +113,5 @@ Graph committed 与 visible 在新协议中相等，均表示持久化可回放�
 
 
 在 Worker 指标中，`vecdb_pipeline_batch_items{stage="source_heads"}` 记录每个来源窗口实际读取的 Index 数量。用同一时间段的 `_sum` 增量除以 `_count` 增量，可以区分单簇窗口与多目标窗口的平均读取量。`vecdb_pipeline_stage_seconds_count{stage="graph_progress_report"}` 统计尝试提交图副本状态的次数，已确认且连续无变化的心跳跳过该事务。各阶段对应的键和计数见 [TiKV 元数据访问清单](CLUSTER_ROUTING.md#tikv-元数据访问清单)。
+
+轻量路由快照刷新使用阶段 `search_route_snapshot`，按缓存未命中的实际扫描次数计数。租约读普通查询的缓存命中不会产生 `route_plan`/`route_owner` 读取样本；这些阶段仍用于非租约查询与维护。`replica_rpc_search` 继续包含实际分片调用耗时。

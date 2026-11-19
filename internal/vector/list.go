@@ -70,7 +70,7 @@ func listRecords(ctx context.Context, repos []*Repository, opts ListOptions) (Re
 			return page, ErrInvalidList
 		}
 	}
-	tx, e := repos[0].begin()
+	tx, e := repos[0].beginDataRead(ctx)
 	if e != nil {
 		return page, e
 	}

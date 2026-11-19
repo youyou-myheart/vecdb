@@ -6,6 +6,48 @@ import (
 	"testing"
 )
 
+func TestReleasedLeaseBlocksTakeoverUntilOriginalExpiry(t *testing.T) {
+	ctx := context.Background()
+	r, db := newFakeRepo()
+	db.nowMillis = 1000
+	c := &Coordinator{root: r, ttl: 6000, holdReleasedLeases: true}
+	old := ClusterNode{ID: "a", Session: "first", Roles: []string{RoleWorker}, URL: "http://a"}
+	next := ClusterNode{ID: "b", Session: "second", Roles: []string{RoleWorker}, URL: "http://b"}
+	id := sourceID(0)
+	if err := c.Heartbeat(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	testAssignment(t, c, old, id)
+	owner, err := c.Acquire(ctx, id, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err = c.Update(ctx, owner, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.nowMillis++
+	released, err := c.Update(ctx, owner, false, true)
+	if err != nil || !released.Released || released.Ready || released.Expires != owner.Expires {
+		t.Fatal(released, err)
+	}
+	if _, err = c.Update(ctx, owner, true, false); !errors.Is(err, ErrFenced) {
+		t.Fatal("released owner renewed", err)
+	}
+	if err = c.Heartbeat(ctx, next); err != nil {
+		t.Fatal(err)
+	}
+	testAssignment(t, c, next, id)
+	db.nowMillis = owner.Expires - 1
+	if _, err = c.Acquire(ctx, id, next); !errors.Is(err, ErrConflict) {
+		t.Fatal("successor acquired before expiry", err)
+	}
+	db.nowMillis++
+	if acquired, err := c.Acquire(ctx, id, next); err != nil || acquired.Epoch != owner.Epoch+1 {
+		t.Fatal(acquired, err)
+	}
+}
+
 func TestOwnershipLifecycleAndFencing(t *testing.T) {
 	ctx := context.Background()
 	root, db := newFakeRepo()

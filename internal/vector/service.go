@@ -19,19 +19,34 @@ type ObjectAPI interface {
 	Load(context.Context, Manifest) ([]Record, error)
 }
 type Service struct {
-	graphReplica *graphReplica
-	Repo         RepositoryAPI
-	Objects      ObjectAPI
-	Index        *HNSWIndex
-	syncMu       sync.Mutex
-	cursor       uint64
+	recall        recallMonitor
+	publisherTerm func() (uint64, bool)
+	policy        IndexPolicy
+	graphReplica  *graphReplica
+	Repo          RepositoryAPI
+	Objects       ObjectAPI
+	Index         *HNSWIndex
+	syncMu        sync.Mutex
+	cursor        uint64
 }
 
 func NewService(ctx context.Context, r RepositoryAPI, o ObjectAPI) (*Service, error) {
 	return newServiceWithProgress(ctx, r, o, nil)
 }
 
+// NewServiceWithIndexPolicy applies a process-local search policy to a standalone index.
+func NewServiceWithIndexPolicy(ctx context.Context, r RepositoryAPI, o ObjectAPI, policy IndexPolicy) (*Service, error) {
+	if err := policy.Validate(); err != nil {
+		return nil, err
+	}
+	return openIndexService(ctx, r, o, policy.clone(), nil)
+}
+
 func newServiceWithProgress(ctx context.Context, r RepositoryAPI, o ObjectAPI, onBaseline func(uint64)) (*Service, error) {
+	return openIndexService(ctx, r, o, IndexPolicy{}, onBaseline)
+}
+
+func openIndexService(ctx context.Context, r RepositoryAPI, o ObjectAPI, policy IndexPolicy, onBaseline func(uint64)) (*Service, error) {
 	if e := o.Ensure(ctx); e != nil {
 		return nil, e
 	}
@@ -106,6 +121,7 @@ func newServiceWithProgress(ctx context.Context, r RepositoryAPI, o ObjectAPI, o
 		}
 		s.cursor = head
 	}
+	s.setIndexPolicy(policy)
 	if onBaseline != nil {
 		onBaseline(s.cursor)
 	}
@@ -208,31 +224,33 @@ func (s *Service) Rebuild(ctx context.Context) error {
 	return s.Index.Rebuild(ctx)
 }
 func (s *Service) MaybeRebuild(ctx context.Context) error {
-	if g := s.graphReplica; g != nil && g.input != nil {
-		s.syncMu.Lock()
-		e := g.scrub(ctx, s)
-		s.syncMu.Unlock()
-		if e != nil {
-			return e
-		}
+	if !s.recall.maintenance.TryLock() {
+		return nil
 	}
-	if s.graphReplica != nil {
-		p, e := s.graphReplica.journal.c.Plan(ctx, s.graphReplica.journal.id)
-		if e != nil {
-			return e
-		}
-		if p.Publisher != s.graphReplica.journal.owner.Partition {
+	defer s.recall.maintenance.Unlock()
+	term, publisher := s.recallTerm()
+	if g := s.graphReplica; g != nil {
+		if !publisher {
 			return nil
+		}
+		if g.input != nil {
+			s.syncMu.Lock()
+			err := g.scrub(ctx, s)
+			s.syncMu.Unlock()
+			if err != nil {
+				return err
+			}
 		}
 		if s.Index.NeedsRebuild() {
 			return s.Rebuild(ctx)
 		}
-		return nil
-	}
-	if s.Index.NeedsRebuild() {
+	} else if s.Index.NeedsRebuild() {
 		return s.Index.Rebuild(ctx)
 	}
-	return nil
+	if !publisher {
+		return nil
+	}
+	return s.checkRecall(ctx, term)
 }
 
 func (s *Service) syncIncremental(ctx context.Context, repo IncrementalRepository) error {

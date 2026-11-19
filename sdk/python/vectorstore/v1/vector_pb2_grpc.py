@@ -89,6 +89,11 @@ class VectorStoreStub(object):
                 request_serializer=vectorstore_dot_v1_dot_vector__pb2.Empty.SerializeToString,
                 response_deserializer=vectorstore_dot_v1_dot_vector__pb2.ClusterStatus.FromString,
                 _registered_method=True)
+        self.GetSearchRoutes = channel.unary_unary(
+                '/vectorstore.v1.VectorStore/GetSearchRoutes',
+                request_serializer=vectorstore_dot_v1_dot_vector__pb2.Empty.SerializeToString,
+                response_deserializer=vectorstore_dot_v1_dot_vector__pb2.ClusterStatus.FromString,
+                _registered_method=True)
         self.GetLayout = channel.unary_unary(
                 '/vectorstore.v1.VectorStore/GetLayout',
                 request_serializer=vectorstore_dot_v1_dot_vector__pb2.Empty.SerializeToString,
@@ -181,6 +186,13 @@ class VectorStoreServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetSearchRoutes(self, request, context):
+        """Lightweight centers/counts/replica hints, omitting graph and data progress.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def GetLayout(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -260,6 +272,11 @@ def add_VectorStoreServicer_to_server(servicer, server):
             ),
             'GetCluster': grpc.unary_unary_rpc_method_handler(
                     servicer.GetCluster,
+                    request_deserializer=vectorstore_dot_v1_dot_vector__pb2.Empty.FromString,
+                    response_serializer=vectorstore_dot_v1_dot_vector__pb2.ClusterStatus.SerializeToString,
+            ),
+            'GetSearchRoutes': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetSearchRoutes,
                     request_deserializer=vectorstore_dot_v1_dot_vector__pb2.Empty.FromString,
                     response_serializer=vectorstore_dot_v1_dot_vector__pb2.ClusterStatus.SerializeToString,
             ),
@@ -579,6 +596,33 @@ class VectorStore(object):
             request,
             target,
             '/vectorstore.v1.VectorStore/GetCluster',
+            vectorstore_dot_v1_dot_vector__pb2.Empty.SerializeToString,
+            vectorstore_dot_v1_dot_vector__pb2.ClusterStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetSearchRoutes(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vectorstore.v1.VectorStore/GetSearchRoutes',
             vectorstore_dot_v1_dot_vector__pb2.Empty.SerializeToString,
             vectorstore_dot_v1_dot_vector__pb2.ClusterStatus.FromString,
             options,

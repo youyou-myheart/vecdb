@@ -30,6 +30,27 @@ bash scripts/acceptance-onebox-freshness.sh --freshness-rounds 20 --load-seconds
 
 每次使用新 namespace、新 `.state/onebox-e2e/<run_id>/` 数据目录和 `reports/onebox-e2e/<run_id>/` 日志目录。故障恢复始终复用同次运行的存储目录和 namespace，不通过换空集群掩盖恢复问题。
 
+## 整体性能报告
+
+在仓库根目录运行以下命令，会从当前源码构建服务端和 Go 写入客户端，先后启动两套独立的真实存储和服务进程。每组使用 64 维向量、4 个数据分片、4 个索引分片和双索引副本。采集覆盖 SDK 查询、点读、持久化写、持续写入时的搜索、索引可见性、召回和 Worker 接管。每个阶段写入原始 JSON，两组结束后生成中文 `report.md`。
+
+```bash
+.venv/bin/python scripts/overall_performance.py run
+```
+
+默认输出目录为 `reports/overall/<UTC时间>/`。第一组提高 TiKV 的 Region 分裂阈值，以便重复比较同一工作负载。第二组使用本仓库 One-box 的默认 Region 参数。可用 `--profile controlled` 或 `--profile default` 单独运行。存储介质会影响写入数据，跨版本对比应保持一致。用 `--scratch` 指定临时存储目录，`--base-port` 指定本机端口起点，`--server` 和 `--driver` 可指定已有二进制。采集使用前述 Go/C++、Python 与原生存储依赖，可用 `--pd`、`--tikv`、`--weed` 指定存储程序路径。
+
+保存过两版原始 JSON 后，只用 Python 标准库即可重新生成对照报告。下面的目录名代表各自的实测输出目录。
+
+```bash
+python3 scripts/overall_performance.py report \
+  --current current/current-controlled.json --current current/current-default.json \
+  --baseline previous/current-controlled.json --baseline previous/current-default.json \
+  --output current/report.md
+```
+
+`run` 同样接受 `--baseline`。两种入口都支持重复传入 `--ann` 附加召回专项，只归入服务端二进制 SHA-256 相同的测量。旧版默认 Region 基线缺少 `region_control` 时，使用 `--default-baseline` 显式声明该工况。遇到阶段失败时，`run` 保存已有测量并返回非零状态，可从 JSON 核对错误、实际发送量和每个窗口的副本追平情况。
+
 ## Case 顺序
 
 | Case | 注入与断言 |
@@ -38,10 +59,10 @@ bash scripts/acceptance-onebox-freshness.sh --freshness-rounds 20 --load-seconds
 | 常稳 | 4 个写线程、2 个读线程；默认持续 600 秒；每 ID 串行 CAS，跨 ID 并行；更新、跨簇移动、删除重插和幂等重试；常稳期间不允许请求重试错误 |
 | Gateway/Master 单故障 | 杀掉一个 Gateway，客户端切换另一入口；杀掉当前 Master，记录备用主 epoch 增长耗时；持续读写后恢复 |
 | 旧 Worker 恢复 | SIGSTOP 持有来源分片的 Worker，等待租约过期与新 epoch，然后 SIGCONT；旧进程不能使位点倒退 |
-| S3 暂停 | 暂停 SeaweedFS 8 秒，数据继续持久化、索引积压必须增长；恢复后全部副本追平 |
+| S3 暂停 | 暂停 SeaweedFS 8 秒，确认进程暂停且数据继续持久化，记录索引积压（引用日志路径可能为 0）；恢复后全部副本追平 |
 | TiKV 暂停 | 暂停 TiKV 8 秒，使客户端出现真实超时/服务错误；使用同一 request ID 重试不确定写入；恢复后无重复版本或丢失 |
 | 叠加故障 | 同时强杀 2 Worker、当前 Master 和一个 Gateway；另一个 Gateway 仍接收业务写入；恢复后逐条校验 |
-| 全 Worker 丢失 | 强杀全部 Worker，再持久化 512 次更新；确认至少 512 条来源积压，然后恢复所有 Worker |
+| 全 Worker 丢失 | 强杀全部 Worker，提交 512 次更新；确认无 owner 时没有成功 ACK，再恢复 Worker，等待全部请求重试成功并核验数据。当前 owner-routed 写入不能在所有数据 owner 停止时直接 ACK |
 | 连续故障 | 默认 6 轮 Worker/Master 强杀与重启；各轮之间不等分片追平，业务线程持续运行；最后统一收敛检查 |
 | 整套冷恢复 | 快照/GC 后再写 256 次尾部更新，SIGKILL 全部 7 个向量进程和 3 个存储进程；从原持久化目录启动并验证 |
 | 恢复后常稳 | 默认再持续 60 秒读写，最后对全部记录和两份查询入口进行完整校验 |

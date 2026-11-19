@@ -39,19 +39,22 @@ type nodeVersion struct {
 	Revision uint64 `json:"revision"`
 }
 type HNSWIndex struct {
-	poison       error
-	rebuildMu    sync.Mutex
-	rebuildDelta map[string]Record
-	mu           sync.RWMutex
-	graph        *ann.Graph
-	records      map[string]Record
-	nodes        map[uint64]nodeVersion
-	postings     payloadIndex
-	dimension    int
-	config       IndexConfig
-	next         uint64
-	epoch        uint64
-	live         int
+	// Local query strategy; config is also persisted in graph snapshots and deltas.
+	exactThreshold       int
+	poison               error
+	rebuildMu            sync.Mutex
+	rebuildDelta         map[string]Record
+	mu                   sync.RWMutex
+	graph                *ann.Graph
+	records              map[string]Record
+	nodes                map[uint64]nodeVersion
+	postings             payloadIndex
+	dimension            int
+	config               IndexConfig
+	next                 uint64
+	epoch                uint64
+	lastReplacementEpoch uint64 // Protected by mu; data updates only advance epoch.
+	live                 int
 }
 
 func NewHNSWIndex(d int, c IndexConfig) (*HNSWIndex, error) {
@@ -65,7 +68,7 @@ func NewHNSWIndex(d int, c IndexConfig) (*HNSWIndex, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &HNSWIndex{graph: graph, records: map[string]Record{}, nodes: map[uint64]nodeVersion{}, postings: payloadIndex{}, dimension: d, config: c}, nil
+	return &HNSWIndex{graph: graph, records: map[string]Record{}, nodes: map[uint64]nodeVersion{}, postings: payloadIndex{}, dimension: d, config: c, exactThreshold: c.ExactThreshold}, nil
 }
 func (i *HNSWIndex) Apply(batch []Record) error {
 	if err := validateBatch(batch, i.dimension); err != nil {
@@ -146,15 +149,19 @@ func (i *HNSWIndex) Search(q Search) ([]Hit, error) {
 	return hits, err
 }
 func (i *HNSWIndex) SearchWithStats(q Search) ([]Hit, QueryStats, error) {
-	stats := QueryStats{}
 	if err := validateQuery(q, i.dimension); err != nil {
-		return nil, stats, err
+		return nil, QueryStats{}, err
 	}
 	if q.EFSearch < 0 || q.EFSearch > 4096 {
-		return nil, stats, errors.New("ef_search must be 0..4096")
+		return nil, QueryStats{}, errors.New("ef_search must be 0..4096")
 	}
 	i.mu.RLock()
 	defer i.mu.RUnlock()
+	return i.searchWithStatsLocked(q, true)
+}
+
+func (i *HNSWIndex) searchWithStatsLocked(q Search, returnExactHits bool) ([]Hit, QueryStats, error) {
+	stats := QueryStats{}
 	if i.poison != nil {
 		return nil, stats, i.poison
 	}
@@ -167,6 +174,9 @@ func (i *HNSWIndex) SearchWithStats(q Search) ([]Hit, QueryStats, error) {
 		matching = len(allowed)
 	}
 	exact := func() []Hit {
+		if !returnExactHits {
+			return nil
+		}
 		best := make(topK, 0, q.K)
 		score := func(r Record) {
 			if r.Deleted {
@@ -186,7 +196,7 @@ func (i *HNSWIndex) SearchWithStats(q Search) ([]Hit, QueryStats, error) {
 		}
 		return materialize(best, i.records)
 	}
-	if q.Exact || matching <= i.config.ExactThreshold || matching <= q.K {
+	if q.Exact || matching <= i.exactThreshold || matching <= q.K {
 		stats.Plan = "exact"
 		return exact(), stats, nil
 	}
@@ -252,11 +262,21 @@ func (i *HNSWIndex) Stats() IndexStats {
 
 // Build offline, chase coalesced updates, and briefly fence writes for the final tail.
 func (i *HNSWIndex) Rebuild(ctx context.Context) error {
+	return i.rebuild(ctx, nil, nil)
+}
+
+// Reject quality observations superseded by a graph replacement. New data
+// remains eligible and its installation epoch is returned under the index lock.
+func (i *HNSWIndex) rebuild(ctx context.Context, epoch *uint64, canInstall func() bool) error {
 	if !i.rebuildMu.TryLock() {
 		return ErrConflict
 	}
 	defer i.rebuildMu.Unlock()
 	i.mu.Lock()
+	if epoch != nil && i.lastReplacementEpoch > *epoch {
+		i.mu.Unlock()
+		return ErrConflict
+	}
 	records := snapshotRecords(i.records)
 	// IDs can be ordered by topic/time. A deterministic shuffle avoids building
 	// long runs from one cluster and degrading cross-cluster graph connectivity.
@@ -311,7 +331,14 @@ func (i *HNSWIndex) Rebuild(ctx context.Context) error {
 			i.mu.Unlock()
 			return err
 		}
+		if canInstall != nil && !canInstall() {
+			i.mu.Unlock()
+			return ErrFenced
+		}
 		i.replaceGraphLocked(fresh)
+		if epoch != nil {
+			*epoch = i.epoch
+		}
 		published = true
 		i.mu.Unlock()
 		return nil
@@ -335,5 +362,6 @@ func (i *HNSWIndex) replaceGraphLocked(fresh *HNSWIndex) {
 	i.next = fresh.next
 	i.live = fresh.live
 	i.epoch++
+	i.lastReplacementEpoch = i.epoch
 	oldGraph.Close()
 }

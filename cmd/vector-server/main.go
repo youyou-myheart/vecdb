@@ -44,6 +44,18 @@ func main() {
 	if e != nil || dim < 1 || dim > 4096 {
 		log.Fatal("invalid DIMENSION")
 	}
+	indexPolicy, err := indexPolicyFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+	clusterMode := env("CLUSTER_MODE", "0") == "1"
+	dataBackend := env("DATA_BACKEND", "txn")
+	if dataBackend != "txn" && dataBackend != "raw" {
+		log.Fatal("DATA_BACKEND must be txn or raw")
+	}
+	if dataBackend == "raw" && (!clusterMode || os.Getenv("CLUSTER_ROUTING_FILE") == "") {
+		log.Fatal("DATA_BACKEND=raw requires CLUSTER_MODE=1 and CLUSTER_ROUTING_FILE")
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	repo, e := vector.NewRepository(strings.Split(env("PD_ENDPOINTS", "127.0.0.1:12379"), ","), env("NAMESPACE", "demo/default"), dim)
@@ -62,7 +74,7 @@ func main() {
 	var service runningService
 	var cluster *vector.ClusterService
 	grpcAddr := os.Getenv("GRPC_LISTEN_ADDR")
-	routedWorker := env("CLUSTER_MODE", "0") == "1" && os.Getenv("CLUSTER_ROUTING_FILE") != "" && slices.ContainsFunc(strings.Split(env("ROLES", "master,gateway,worker"), ","), func(role string) bool { return strings.TrimSpace(role) == vector.RoleWorker })
+	routedWorker := clusterMode && os.Getenv("CLUSTER_ROUTING_FILE") != "" && slices.ContainsFunc(strings.Split(env("ROLES", "master,gateway,worker"), ","), func(role string) bool { return strings.TrimSpace(role) == vector.RoleWorker })
 	if routedWorker && grpcAddr == "" {
 		host, _, err := net.SplitHostPort(env("LISTEN_ADDR", "127.0.0.1:18090"))
 		if err != nil {
@@ -86,7 +98,7 @@ func main() {
 			writeEndpoint = env("GRPC_ADVERTISE_ADDR", net.JoinHostPort(u.Hostname(), strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)))
 		}
 	}
-	if env("CLUSTER_MODE", "0") == "1" {
+	if clusterMode {
 		ttl, err := time.ParseDuration(env("LEASE_TTL", "9s"))
 		if err != nil {
 			log.Fatal(err)
@@ -126,13 +138,13 @@ func main() {
 				log.Fatal(err)
 			}
 		}
-		cluster, e = vector.OpenClusterService(ctx, repo, objects, partitions, vector.ClusterConfig{WriteEndpoint: writeEndpoint, GraphCheckpointBytes: checkpointBytes, GraphCheckpointAge: checkpointAge, Routing: routing, ConsumerRetention: os.Getenv("CONSUMER_RETENTION") == "1", IndexReplication: env("INDEX_REPLICATION", "independent"), HostID: os.Getenv("HOST_ID"), Zone: os.Getenv("ZONE"), FailureDomain: env("REPLICA_FAILURE_DOMAIN", "node"), MemoryBudgetBytes: memoryBudget, Scheduler: env("SCHEDULER", "hash"), Capacity: capacity, BalanceCooldown: cooldown, Replicas: replicas, NodeID: os.Getenv("NODE_ID"), AdvertiseURL: os.Getenv("ADVERTISE_URL"), Token: os.Getenv("CLUSTER_TOKEN"), LeaseTTL: ttl, Roles: env("ROLES", "master,gateway,worker")})
+		cluster, e = vector.OpenClusterService(ctx, repo, objects, partitions, vector.ClusterConfig{IndexPolicy: indexPolicy, WriteEndpoint: writeEndpoint, GraphCheckpointBytes: checkpointBytes, GraphCheckpointAge: checkpointAge, Routing: routing, DataBackend: dataBackend, ConsumerRetention: os.Getenv("CONSUMER_RETENTION") == "1", IndexReplication: env("INDEX_REPLICATION", "independent"), HostID: os.Getenv("HOST_ID"), Zone: os.Getenv("ZONE"), FailureDomain: env("REPLICA_FAILURE_DOMAIN", "node"), MemoryBudgetBytes: memoryBudget, Scheduler: env("SCHEDULER", "hash"), Capacity: capacity, BalanceCooldown: cooldown, Replicas: replicas, NodeID: os.Getenv("NODE_ID"), AdvertiseURL: os.Getenv("ADVERTISE_URL"), Token: os.Getenv("CLUSTER_TOKEN"), LeaseTTL: ttl, Roles: env("ROLES", "master,gateway,worker")})
 		if e == nil {
 			service = cluster
 			defer cluster.Close()
 		}
 	} else {
-		service, e = vector.OpenPartitionedService(ctx, repo, objects, partitions)
+		service, e = vector.OpenPartitionedServiceWithIndexPolicy(ctx, repo, objects, partitions, indexPolicy)
 	}
 	if e != nil {
 		log.Fatal(e)

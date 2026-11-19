@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"example.com/vector-storage/internal/lease"
 	tikverr "github.com/tikv/client-go/v2/error"
 )
 
@@ -36,7 +37,8 @@ func (c *Coordinator) grantIndexLease(ctx context.Context, id IndexPartitionID, 
 		return indexLease{}, err
 	}
 	defer tx.Rollback()
-	if err = c.Fence(owner)(ctx, tx); err != nil {
+	current, err := c.fenceOwner(ctx, tx, owner)
+	if err != nil {
 		return indexLease{}, err
 	}
 	plan, err := c.planIn(ctx, tx, id)
@@ -69,10 +71,6 @@ func (c *Coordinator) grantIndexLease(ctx context.Context, id IndexPartitionID, 
 		if err = tx.Set(c.indexGuardKey(id), lease.token()); err != nil {
 			return lease, err
 		}
-	}
-	current, err := c.readOwner(ctx, tx, owner.Partition)
-	if err != nil {
-		return lease, err
 	}
 	lease.Expires = min(current.Expires, now+c.ttl)
 	lease.remaining = time.Duration(max(int64(0), lease.Expires-now)) * time.Millisecond
@@ -146,9 +144,77 @@ func (c *Coordinator) fenceIndexGuard(ctx context.Context, tx transactionAPI, id
 	return tx.Set(c.indexGuardKey(id), b)
 }
 
-func leaseMargin(ttl time.Duration) time.Duration { return max(50*time.Millisecond, ttl/10) }
-func leaseDeadline(started time.Time, remaining time.Duration) time.Time {
-	return started.Add(max(time.Duration(0), remaining-leaseMargin(remaining)))
+func (w *indexWriter) install(start time.Time, grant indexLease) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.installLocked(start, grant)
+}
+
+func (w *indexWriter) installLocked(start time.Time, grant indexLease) {
+	if !w.leaderLease.Confirm(start, lease.Grant{Epoch: grant.Generation, Expires: grant.Expires, Remaining: grant.remaining}) {
+		return
+	}
+	if w.lease.Generation != grant.Generation {
+		w.known = false
+		w.controls = nil
+	}
+	w.lease = grant
+}
+
+// The replica control tick campaigns for a publisher lease when the durable
+// plan designates this replica. The plan transaction still enforces handoff.
+func (g *graphReplica) refreshLease(ctx context.Context, plan ReplicaPlan) (err error) {
+	w := g.writer
+	if w == nil {
+		return nil
+	}
+	owner := g.journal.owner
+	w.mu.Lock()
+	oldPublisher, oldRoute := w.publisher, w.publisherRoute
+	w.publisher = plan.Publisher
+	w.publisherRoute = Assignment{}
+	for _, a := range plan.Serving {
+		if a.Partition == plan.Publisher {
+			w.publisherRoute = a
+			break
+		}
+	}
+	changed := oldPublisher != w.publisher || oldRoute != w.publisherRoute
+	w.mu.Unlock()
+	if changed {
+		g.input.notify()
+	}
+	if !w.replicaLive() || plan.Publisher != owner.Partition || plan.LeaseDraining {
+		return nil
+	}
+	if grant, live := w.leaderLease.Snapshot(); live && time.Until(grant.Deadline) > time.Duration(g.journal.c.ttl)*time.Millisecond/2 {
+		return nil
+	}
+	defer g.track("index_lease_renew")(&err)
+	grant, started, err := lease.Refresh(ctx, func(ctx context.Context) (indexLease, error) {
+		return g.journal.c.grantIndexLease(ctx, g.journal.id, owner)
+	})
+	if err != nil {
+		return err
+	}
+	w.mu.Lock()
+	same := w.lease.Generation == grant.Generation
+	if same {
+		w.installLocked(started, grant)
+	}
+	w.mu.Unlock()
+	if same {
+		return nil
+	}
+	// Install a new epoch only between appends. An active append stays
+	// fenced by the durable guard, and a failed install cannot extend it.
+	if !w.op.TryLock() {
+		return ErrConflict
+	}
+	defer w.op.Unlock()
+	w.install(started, grant)
+	g.input.notify()
+	return nil
 }
 
 // Recovery must establish a serialization point even when the owner/term did
@@ -178,6 +244,14 @@ func (j graphJournal) claimLeased(ctx context.Context, token []byte) (GraphHead,
 		h.Term++
 		h.Leader = j.owner
 		if err = putJSON(tx, j.key("head"), h); err != nil {
+			return h, err
+		}
+	}
+	if _, bounded := j.nativeAppend(tx); bounded && h.Committed.Sequence != ^uint64(0) {
+		// Conflict with any unconfirmed append from this same generation.
+		// The next slot is absent at this recovery snapshot; its tombstone
+		// fences an older prewrite even when the publisher lease did not change.
+		if err = tx.Delete(j.key(fmt.Sprintf("entries/%020d", h.Committed.Sequence+1))); err != nil {
 			return h, err
 		}
 	}
