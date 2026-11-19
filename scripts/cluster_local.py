@@ -19,7 +19,8 @@ ROOT = Path(__file__).resolve().parent.parent
 
 class LocalCluster:
     def __init__(self, namespace, partitions=32, dimension=16, base_port=18200,
-                 directory=None, environment=None, grpc_port=None, replicas=1, scheduler="hash"):
+                 directory=None, environment=None, grpc_port=None, replicas=1, scheduler="hash",
+                 server_binary=None):
         if not namespace or not 1 <= partitions <= 64 or not 1 <= dimension <= 4096:
             raise ValueError('namespace required; partitions 1..64; dimension 1..4096')
         if not 1024 <= base_port <= 65500:
@@ -30,6 +31,7 @@ class LocalCluster:
             raise ValueError("replicas must be 1 or 2")
         if scheduler not in ("hash", "load") or (scheduler == "load" and replicas != 2):
             raise ValueError("load scheduler requires replicas=2")
+        self.server_binary = Path(server_binary).resolve() if server_binary else ROOT / ".tools/vector-server"
         self.scheduler = scheduler
         self.replicas = replicas
         self.urls = {}
@@ -69,7 +71,7 @@ class LocalCluster:
         self.directory.mkdir(parents=True, exist_ok=True)
         log = (self.directory / (node + '.log')).open('a')
         try:
-            proc = subprocess.Popen([str(ROOT / '.tools/vector-server')], cwd=ROOT,
+            proc = subprocess.Popen([str(self.server_binary)], cwd=ROOT,
                 env=dict(self.env, GRPC_LISTEN_ADDR=(f'127.0.0.1:{grpc_port or self.grpc_port}' if role == 'gateway' and (grpc_port or self.grpc_port) else ''), NODE_ID=node, ROLES=role,
                          LISTEN_ADDR=f'127.0.0.1:{port}', ADVERTISE_URL=url),
                 stdout=log, stderr=log)

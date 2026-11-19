@@ -70,7 +70,8 @@ class Measurements:
 
 class Storage:
     """Only owns processes and data directories created by this run."""
-    def __init__(self, directory, logs, base):
+    def __init__(self, directory, logs, base, *, pd_binary=None, tikv_binary=None,
+                 weed_binary=None, tikv_config=None):
         self.directory, self.logs, self.base = directory, logs, base
         self.children, self.current = [], {}
         self.directory.mkdir(parents=True)
@@ -80,13 +81,13 @@ class Storage:
         pd_config = directory/'pd.toml'
         pd_config.write_text('[replication]\nmax-replicas = 1\n')
         self.commands = {
-            'pd': [str(ROOT/'.tools/tiup-home/components/pd/v8.5.8/pd-server'), '--name=onebox-pd', '--data-dir='+str(pd),
+            'pd': [str(pd_binary or ROOT/'.tools/tiup-home/components/pd/v8.5.8/pd-server'), '--name=onebox-pd', '--data-dir='+str(pd),
                 '--config='+str(pd_config), f'--client-urls=http://127.0.0.1:{base}', f'--advertise-client-urls=http://127.0.0.1:{base}',
                 f'--peer-urls=http://127.0.0.1:{base+1}', f'--advertise-peer-urls=http://127.0.0.1:{base+1}'],
-            'tikv': [str(ROOT/'.tools/tiup-home/components/tikv/v8.5.8/tikv-server'), '--config='+str(ROOT/'tikv-local.toml'),
+            'tikv': [str(tikv_binary or ROOT/'.tools/tiup-home/components/tikv/v8.5.8/tikv-server'), '--config='+str(tikv_config or ROOT/'tikv-local.toml'),
                 f'--addr=127.0.0.1:{base+2}', f'--advertise-addr=127.0.0.1:{base+2}', f'--status-addr=127.0.0.1:{base+3}',
                 f'--pd=127.0.0.1:{base}', '--data-dir='+str(tikv)],
-            'seaweed': [str(ROOT/'.tools/weed'), 'server', '-dir='+str(weed), '-ip=127.0.0.1', '-ip.bind=127.0.0.1',
+            'seaweed': [str(weed_binary or ROOT/'.tools/weed'), 'server', '-dir='+str(weed), '-ip=127.0.0.1', '-ip.bind=127.0.0.1',
                 f'-master.port={base+10}', f'-volume.port={base+11}', f'-filer.port={base+12}', f'-s3.port={base+13}',
                 '-volume.max=8', '-master.volumeSizeLimitMB=128', '-master.telemetry=false', '-s3', '-s3.config='+str(ROOT/'s3.json')],
         }
