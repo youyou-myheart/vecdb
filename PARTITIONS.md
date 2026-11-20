@@ -32,13 +32,14 @@ flowchart LR
 |---|---|
 | `P/schema` | 维度、距离函数、分区 schema 标记 |
 | `P/partition-layout` | version、epoch、hash 算法、分区数、data→index 绑定 |
-| `P/request/<request_id>` | namespace 级幂等凭证 |
+| `P/request/<request_id>` | 一一映射布局的 namespace 级幂等凭证 |
+| `P/data/0000/wal/<批序号>`、`P/data/0000/request/<request_id>` | 聚类 TxnKV 布局的不可变批日志和分片内幂等凭证 |
 | `P/data/0000/record/...` | 数据分区 0 的完整记录和墓碑 |
 | `P/data/0000/log/...`、`log-floor` | 数据分区 0 的有序日志及保留范围 |
 | `P/index/index-0000/manifest` | 索引分区 0 的图快照清单 |
 | SeaweedFS 的 `P/index/index-0000/snapshots/...` | 索引分区 0 的不可变快照对象 |
 
-记录、来源日志和 namespace 级凭证在一个 TiKV 事务内提交。聚类布局由各分片的写入 owner 从内存末尾分配 LSN，接管时按日志尾键或回收水位恢复。请求 ID 仍在整个 namespace 内唯一，不能通过换一个 hash 分区绕过幂等冲突检查。
+一一映射布局在同一事务提交记录、来源日志和 namespace 级凭证。聚类布局由各 DataPartition 的 Leader 在内存分配事件 LSN，单键追加一个批次；请求 ID 在所属数据分片内去重。接管者从批日志尾、事件尾和回收位点恢复。详见 [聚类布局的分片日志接口](CLUSTER_ROUTING.md#分片日志接口)。
 
 索引服务通过绑定的来源读取日志，图快照和 manifest 使用独立索引路径。发布快照仍校验来源 head/floor；清理通过该绑定读取持久化快照位点。当前一对一关系保证每个索引仍只需要一个来源 offset。
 

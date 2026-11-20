@@ -43,6 +43,8 @@ type mutationGroup struct {
 	closed    bool
 	changed   chan struct{}
 	wg        sync.WaitGroup
+
+	dispatchWake chan<- struct{} // immutable after publishing this owner
 }
 
 func newMutationGroup(ctx context.Context, r *Repository, p *pipelineMetrics, partition string) *mutationGroup {
@@ -134,7 +136,7 @@ func (b *mutationGroup) close() {
 	b.mu.Lock()
 	b.closed = true
 	if b.lease != nil {
-		b.lease.Retire()
+		b.lease.StepDown()
 	}
 	if b.rawStop != nil {
 		b.rawStop()
@@ -194,6 +196,9 @@ func (r *Repository) mutateGroup(ctx context.Context, batch []*mutationRequest) 
 	return r.appendGroup(ctx, batch, nil)
 }
 func (r *Repository) appendGroup(ctx context.Context, batch []*mutationRequest, lease *appendLease) ([]mutationResult, error) {
+	if r.packed != nil && lease != nil {
+		return r.proposeDataBatch(ctx, batch, lease)
+	}
 	for attempt := 0; ; attempt++ {
 		results, err := r.mutateGroupOnce(ctx, batch, lease)
 		if !tikverr.IsErrWriteConflict(errors.Unwrap(err)) || attempt >= 15 {

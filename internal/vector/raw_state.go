@@ -6,25 +6,9 @@ import (
 	"sync"
 )
 
-type rawEntry struct {
-	RequestID string `json:"request_id"`
-	Digest    string `json:"digest"`
-	Record    Record `json:"record"`
-}
-
-// A single atomic KV value contains the complete accepted decision for its
-// batch. Replaying a contiguous prefix needs no volatile writer state.
-type rawAcceptedBatch struct {
-	Number  uint64     `json:"number"`
-	First   uint64     `json:"first"`
-	Entries []rawEntry `json:"entries"`
-}
-
-func (b rawAcceptedBatch) last() uint64 { return b.First + uint64(len(b.Entries)) - 1 }
-
 type rawShardHistory struct {
 	mu       sync.RWMutex
-	entries  []rawEntry
+	entries  []mutationLogEntry
 	records  map[string][]uint64
 	receipts map[string]uint64
 }
@@ -39,7 +23,7 @@ func (h *rawShardHistory) end() uint64 {
 	return uint64(len(h.entries))
 }
 
-func (h *rawShardHistory) extend(batches []rawAcceptedBatch) error {
+func (h *rawShardHistory) extend(batches []mutationLogBatch) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	// Validate the entire extension before changing any pinned history.
@@ -89,9 +73,9 @@ type rawShardSnapshot struct {
 	floor   uint64
 }
 
-func (s *rawShardSnapshot) entry(seq uint64) (rawEntry, bool) {
+func (s *rawShardSnapshot) entry(seq uint64) (mutationLogEntry, bool) {
 	if seq <= s.floor || seq > s.end {
-		return rawEntry{}, false
+		return mutationLogEntry{}, false
 	}
 	s.history.mu.RLock()
 	defer s.history.mu.RUnlock()

@@ -161,7 +161,8 @@ func (g *graphReplica) leaderApplied() (GraphPosition, error) {
 	w := g.writer
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if !w.known || !w.leaderLease.InLeaderLease(nil) || !w.replicaLive() {
+	grant, ok := w.leaderLease.Snapshot()
+	if !w.known || !ok || grant.Epoch != w.lease.Generation || !w.replicaLive() {
 		return GraphPosition{}, ErrFenced
 	}
 	return g.position, nil

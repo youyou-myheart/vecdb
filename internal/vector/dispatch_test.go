@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func routedFixture(t *testing.T) (*graphFixture, *ClusterService, Ownership) {
@@ -42,9 +43,25 @@ func routedFixture(t *testing.T) (*graphFixture, *ClusterService, Ownership) {
 	}
 	return f, c, owner
 }
+
+func TestPruneAfterDataOwnerHandoff(t *testing.T) {
+	f, c, owner := routedFixture(t)
+	c.indexes = map[IndexPartitionID]PartitionIndex{c.layout.Bindings[0].Index: f.services[0]}
+	c.node.ID, c.node.Session = owner.Node, owner.Session
+	l := &appendLease{owner: owner}
+	confirmAppendGrant(t, l, owner.Epoch, owner.Expires, time.Second)
+	c.writers = map[DataPartitionID]*mutationGroup{0: {lease: l}}
+	// The Gateway cached its routes when the handoff was still in progress.
+	c.searchRoutes.state = &ClusterStatus{}
+	c.searchRoutes.deadline = time.Now().Add(time.Minute)
+	if _, err := c.PruneState(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func deliveryFor(t *testing.T, f *graphFixture, o Ownership, after uint64) Delivery {
 	t.Helper()
-	b, e := f.r.ReadEvents(f.ctx, after, 0, dispatchBatchSize)
+	b, e := f.r.ReadEvents(f.ctx, after, 0, LogBatchSize)
 	if e != nil || len(b.Events) == 0 {
 		t.Fatal(b, e)
 	}
@@ -457,5 +474,119 @@ func TestRestartListsRetainedRangeAtCompletedCursor(t *testing.T) {
 	f.write(t, "next", false)
 	if err = c.loadDispatchWindow(f.ctx, 0, s); err != nil || len(s.window) != 1 || s.window[0].Sequence != 7 {
 		t.Fatal(s, err)
+	}
+}
+
+func TestDispatchProjectionReusesWindowAcrossPartialACKs(t *testing.T) {
+	_, c, _ := routedFixture(t)
+	c.layout.Routing = &ClusterRouting{Version: 1, Centers: [][]float64{{0, 0}, {10, 0}}}
+	c.layout.Bindings = []PartitionBinding{{Index: "index-0000"}, {Index: "index-0001"}}
+	c.router = clusterRouter{IdentityPartitionRouter{c.layout}, c.layout.Routing}
+	rows := make([]LogEvent, dispatchBatchSize+1)
+	for n := range rows {
+		rows[n] = LogEvent{Sequence: uint64(n + 1), Record: Record{Vector: []float64{float64(n%2) * 10, 0}}}
+	}
+	rows[2].Record = Record{Deleted: true}
+	var p dispatchProjection
+	p.update(c, rows[:dispatchBatchSize])
+	first := &p.routed[0]
+	p.update(c, rows[:dispatchBatchSize])
+	if first != &p.routed[0] || len(p.destinations(rows[2])) != 2 {
+		t.Fatal("recomputed the same window or lost a broadcast")
+	}
+	p.update(c, rows[2:dispatchBatchSize])
+	for _, id := range p.targets {
+		if p.byIndex[id][0].Sequence != 3 {
+			t.Fatal("partial ACK discarded a broadcast or retained an acknowledged prefix")
+		}
+	}
+	p.update(c, rows[dispatchBatchSize:])
+	if len(p.targets) != 1 || len(p.routed) != 1 || len(p.byIndex["index-0000"]) != 1 {
+		t.Fatal("new window retained events from its predecessor")
+	}
+}
+
+func TestCommittedWriteWakesItsDispatcherDuringControlWork(t *testing.T) {
+	_, c, _ := routedFixture(t)
+	c.dispatchSignals, c.outboundSignals = newSourceSignals(), newSourceSignals()
+	wake := make(chan struct{}, 1)
+	c.writers = map[DataPartitionID]*mutationGroup{0: {dispatchWake: wake}}
+	c.signalSource(0, "write", true)
+	c.signalSource(0, "graph_commit", true)
+	if len(wake) != 1 || len(c.dispatchSignals.take()) != 0 {
+		t.Fatal("source wake waited for the control loop")
+	}
+}
+
+func TestTxnDispatchLookaheadAndWireBounds(t *testing.T) {
+	f, c, owner := routedFixture(t)
+	c.token = "test-source-token"
+	s := &dataDispatcher{owner: owner, writer: &mutationGroup{lease: &appendLease{owner: owner}}}
+	for n := uint64(1); n <= dispatchLookahead+1; n++ {
+		e := LogEvent{Sequence: n, Record: Record{ID: fmt.Sprint(n), Revision: 1, Vector: []float64{1, 2}}}
+		seed(f.db, f.r.logKey(n), e)
+	}
+	s.writer.lease.head.Store(dispatchLookahead + 1)
+	if err := c.loadDispatchWindow(f.ctx, 0, s); err != nil || len(s.window) != dispatchLookahead {
+		t.Fatal("unexpected source lookahead", len(s.window), err)
+	}
+	id := c.layout.Bindings[0].Index
+	q := Delivery{Source: 0, Owner: owner, RouteVersion: c.layout.Epoch, Through: dispatchLookahead, Events: s.window[dispatchLookahead-1:]}
+	if err := c.validateDeliveryBounds(f.ctx, nil, id, q, 0); err == nil {
+		t.Fatal("unsigned sparse interval exceeded its verification window")
+	}
+	q.verified = true
+	if err := c.validateDeliveryBounds(f.ctx, nil, id, q, 0); err != nil {
+		t.Fatal(err)
+	}
+	q.Events = s.window
+	if err := c.validateDeliveryBounds(f.ctx, nil, id, q, 0); err == nil {
+		t.Fatal("accepted too many records in an authenticated delivery")
+	}
+	q.Through++
+	q.Events = []LogEvent{{Sequence: q.Through, Record: s.window[0].Record}}
+	if err := c.validateDeliveryBounds(f.ctx, nil, id, q, 0); err == nil {
+		t.Fatal("accepted a span larger than the source lookahead")
+	}
+}
+
+func TestRoutedPruneDoesNotWaitForGraphConstruction(t *testing.T) {
+	f, _, _ := routedFixture(t)
+	enableReferences(f)
+	s := f.services[0]
+	s.syncMu.Lock()
+	done := make(chan error, 1)
+	go func() { _, err := s.Prune(f.ctx); done <- err }()
+	select {
+	case err := <-done:
+		s.syncMu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		s.syncMu.Unlock()
+		<-done
+		t.Fatal("routed GC waited for graph construction")
+	}
+}
+
+func TestRoutedLogNamespacesSeparateReceiptsAndGraphConsumers(t *testing.T) {
+	_, c, _ := routedFixture(t)
+	r := *c.data[0]
+	r.collectionPrefix = "tenant-a/"
+	r.Prefix = r.collectionPrefix + "data/0000/"
+	r.packed = &packedStore{namespace: r.collectionPrefix, count: 1}
+	c.root = &Repository{Prefix: r.collectionPrefix, packed: r.packed}
+	c.data[0] = &r
+	index := c.layout.Bindings[0].Index
+	consumer, err := c.changeSource(ChangeRequest{Partition: index, Stream: "graph"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(consumer.consumerKey("graph")), string(c.indexRepository(index).consumerKey("graph")); got != want || got != "tenant-a/index/"+string(index)+"/consumers/graph" {
+		t.Fatal("consumer registration and GC diverged", got, want)
+	}
+	if got := string(r.key("request", "x")); got != "tenant-a/data/0000/request/78" {
+		t.Fatal("unscoped receipt", got)
 	}
 }

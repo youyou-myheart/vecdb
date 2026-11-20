@@ -144,16 +144,7 @@ func (c *Coordinator) fenceIndexGuard(ctx context.Context, tx transactionAPI, id
 	return tx.Set(c.indexGuardKey(id), b)
 }
 
-func (w *indexWriter) install(start time.Time, grant indexLease) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.installLocked(start, grant)
-}
-
-func (w *indexWriter) installLocked(start time.Time, grant indexLease) {
-	if !w.leaderLease.Confirm(start, lease.Grant{Epoch: grant.Generation, Expires: grant.Expires, Remaining: grant.remaining}) {
-		return
-	}
+func (w *indexWriter) adoptGrantLocked(grant indexLease) {
 	if w.lease.Generation != grant.Generation {
 		w.known = false
 		w.controls = nil
@@ -179,6 +170,7 @@ func (g *graphReplica) refreshLease(ctx context.Context, plan ReplicaPlan) (err 
 			break
 		}
 	}
+	generation := w.lease.Generation
 	changed := oldPublisher != w.publisher || oldRoute != w.publisherRoute
 	w.mu.Unlock()
 	if changed {
@@ -187,33 +179,35 @@ func (g *graphReplica) refreshLease(ctx context.Context, plan ReplicaPlan) (err 
 	if !w.replicaLive() || plan.Publisher != owner.Partition || plan.LeaseDraining {
 		return nil
 	}
-	if grant, live := w.leaderLease.Snapshot(); live && time.Until(grant.Deadline) > time.Duration(g.journal.c.ttl)*time.Millisecond/2 {
+	if grant, live := w.leaderLease.Snapshot(); live && grant.Epoch == generation && time.Until(grant.Deadline) > time.Duration(g.journal.c.ttl)*time.Millisecond/2 {
 		return nil
 	}
 	defer g.track("index_lease_renew")(&err)
-	grant, started, err := lease.Refresh(ctx, func(ctx context.Context) (indexLease, error) {
-		return g.journal.c.grantIndexLease(ctx, g.journal.id, owner)
+	var grant indexLease
+	group := g.journal.log(&w.leaderLease, nil)
+	err = group.Campaign(ctx, func(ctx context.Context) (lease.Grant, time.Time, error) {
+		var start time.Time
+		var err error
+		grant, start, err = lease.Refresh(ctx, func(ctx context.Context) (indexLease, error) {
+			return g.journal.c.grantIndexLease(ctx, g.journal.id, owner)
+		})
+		return lease.Grant{Epoch: grant.Generation, Expires: grant.Expires, Remaining: grant.remaining}, start, err
 	})
 	if err != nil {
-		return err
+		return logStorageError(err)
 	}
 	w.mu.Lock()
-	same := w.lease.Generation == grant.Generation
-	if same {
-		w.installLocked(started, grant)
+	defer w.mu.Unlock()
+	if w.lease.Generation != grant.Generation {
+		// Old-token operations reject the newly confirmed generation until
+		// the old append exits and recovery can install its base.
+		if !w.op.TryLock() {
+			return ErrConflict
+		}
+		defer w.op.Unlock()
+		defer g.input.notify()
 	}
-	w.mu.Unlock()
-	if same {
-		return nil
-	}
-	// Install a new epoch only between appends. An active append stays
-	// fenced by the durable guard, and a failed install cannot extend it.
-	if !w.op.TryLock() {
-		return ErrConflict
-	}
-	defer w.op.Unlock()
-	w.install(started, grant)
-	g.input.notify()
+	w.adoptGrantLocked(grant)
 	return nil
 }
 
@@ -251,7 +245,7 @@ func (j graphJournal) claimLeased(ctx context.Context, token []byte) (GraphHead,
 		// Conflict with any unconfirmed append from this same generation.
 		// The next slot is absent at this recovery snapshot; its tombstone
 		// fences an older prewrite even when the publisher lease did not change.
-		if err = tx.Delete(j.key(fmt.Sprintf("entries/%020d", h.Committed.Sequence+1))); err != nil {
+		if err = tx.Delete(j.stream().Key(h.Committed.Sequence + 1)); err != nil {
 			return h, err
 		}
 	}

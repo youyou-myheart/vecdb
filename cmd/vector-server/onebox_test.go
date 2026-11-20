@@ -496,9 +496,14 @@ func oneProcessPipeline(t *testing.T, graph, retention bool, clustered ...bool) 
 		return true
 	})
 	start("worker-2", "worker")
-	wait("replacement replica ready", func() bool {
+	wait("replacement replica and data owners ready", func() bool {
 		verify(g1)
 		s := status(g1)
+		// The next checkpoint/prune needs every data owner. A replacement
+		// index replica can already serve searches during a data handoff.
+		if !s.Ready || !s.FullyReplicated {
+			return false
+		}
 		for _, owners := range s.ReplicaOwners {
 			for _, o := range owners.Owners {
 				if o.Node == "worker-2" {

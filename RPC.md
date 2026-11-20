@@ -249,9 +249,9 @@ GetCluster 的 GraphHead 新增 `source_epochs`（字段 13）和 `checkpoint_so
 | 路径 | 已省去或合并 | 必须保留的读取/检查 |
 |---|---|---|
 | Health / GetLayout | 原本就是内存读取 | 无动态元数据读取 |
-| Get / SDK search_by_id 的 Get | 按 ID 定位数据分区，RawKV 优先读取租约内的 owner 内存视图 | owner 不可用时从 Raw WAL 恢复，TxnKV 读取记录键 |
+| Get / SDK search_by_id 的 Get | 按 ID 定位数据分区，RawKV 优先读取租约内的 owner 内存视图 | owner 不可用时从 Raw WAL 恢复。聚类 TxnKV 读记录视图，遇到尚在投影的批次时从同一快照的 WAL 补齐 |
 | List | 使用内存布局，RawKV 页面按分片固定日志视图 | 记录扫描及游标校验 |
-| Put / Delete | SDK/Gateway 缓存数据 owner，Worker 用本地租约接单，不逐批读取任期 guard | RawKV 每个非空批次一次 BatchPut，任期内从内存确认连续位点；TxnKV 每 100 个成功批次写一次 guard，并限定提交时间戳 |
+| Put / Delete | SDK/Gateway 缓存数据 owner，Worker 用本地租约接单，不逐批读取任期 guard | RawKV 每个非空批次一次 BatchPut，任期内从内存确认连续位点；默认 TxnKV 每批向不可覆盖的 WAL 键做一次 1PC Insert，提交前后读取内存任期 |
 | ResolveWriteRoute | 仅冷启动/过期路由发现使用，SDK 缓存按分区复用 | 明确的重新发现必须读取当前 owner |
 | Search | 缓存选片/副本地址；普通查询使用确认续租的本地读租约 | 旧 hot 非图协议仍保留其 ReadThrough 数据头屏障 |
 | FollowerSearch | 不再逐请求读取计划与 owner | 每批重新捕获 Leader applied 位点、Follower 等待与身份校验 |

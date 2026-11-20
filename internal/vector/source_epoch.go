@@ -34,7 +34,7 @@ func checkSourceEpoch(h GraphHead, q Delivery) error {
 // Admission may advance an epoch even for an already committed batch. Only an
 // issued, currently live owner can introduce a higher epoch. Once accepted,
 // ordinary deliveries depend on this Index's epoch, not the source lease.
-// The Index fence serializes barriers, appends, pruning and publisher changes.
+// A leased writer orders epoch barriers and deltas in the same journal.
 func (j graphJournal) admitSource(ctx context.Context, c *ClusterService, q Delivery) (head GraphHead, err error) {
 	defer c.observations.pipeline.track("source_epoch_admission", string(j.id))(&err)
 	err = retryIndexCommit(ctx, func() error {
@@ -60,6 +60,8 @@ func (j graphJournal) admitSourceTransaction(ctx context.Context, c *ClusterServ
 	if native, ok := tx.(interface{ SetEnable1PC(bool) }); ok {
 		native.SetEnable1PC(true)
 	}
+	native, oneSlot := j.nativeAppend(tx)
+	oneSlot = oneSlot && cached != nil && writer != nil
 	var h GraphHead
 	if cached == nil {
 		if err = j.c.ReplicaFence(j.id, j.owner)(ctx, tx); err != nil {
@@ -68,8 +70,8 @@ func (j graphJournal) admitSourceTransaction(ctx context.Context, c *ClusterServ
 		h, err = j.headIn(ctx, tx)
 	} else {
 		h = cloneGraphHead(*cached)
-		err = writer.appendAuthority(token, tx)
-		if err == nil {
+		err = writer.authority(token)
+		if err == nil && !oneSlot {
 			err = tx.Set(j.c.indexGuardKey(j.id), token)
 		}
 	}
@@ -101,6 +103,9 @@ func (j graphJournal) admitSourceTransaction(ctx context.Context, c *ClusterServ
 		return h, ErrFenced
 	}
 	if !sameOwner(h.Leader, j.owner) {
+		if oneSlot {
+			return h, ErrFenced
+		}
 		if h.Term == ^uint64(0) {
 			return h, errors.New("graph term exhausted")
 		}
@@ -129,22 +134,32 @@ func (j graphJournal) admitSourceTransaction(ctx context.Context, c *ClusterServ
 		Position: GraphPosition{Sequence: h.Committed.Sequence + 1, DataOffset: h.Committed.DataOffset},
 		Sources:  maps.Clone(h.Sources), SourceEpochs: epochs, LogBytes: h.LogBytes + uint64(len(encoded)), CreatedMS: txnMillis(tx)}
 	e.Position.Hash = entryHash(e)
-	keyBytes := j.key(fmt.Sprintf("entries/%020d", e.Position.Sequence))
-	if _, err = tx.Get(ctx, keyBytes); err == nil {
-		return h, ErrConflict
-	} else if !tikverr.IsErrNotFound(err) {
-		return h, err
-	}
-	if err = putJSON(tx, keyBytes, e); err != nil {
-		return h, err
-	}
-	if writer != nil {
-		if err = writer.authority(token); err != nil {
+	keyBytes := j.stream().Key(e.Position.Sequence)
+	if oneSlot {
+		raw, err := json.Marshal(e)
+		if err != nil {
 			return h, err
 		}
-	}
-	if err = tx.Commit(ctx); err != nil {
-		return h, err
+		if err = j.proposeSlot(ctx, writer, token, native, e.Position.Sequence, raw); err != nil {
+			return h, err
+		}
+	} else {
+		if _, err = tx.Get(ctx, keyBytes); err == nil {
+			return h, ErrConflict
+		} else if !tikverr.IsErrNotFound(err) {
+			return h, err
+		}
+		if err = putJSON(tx, keyBytes, e); err != nil {
+			return h, err
+		}
+		if writer != nil {
+			if err = writer.authority(token); err != nil {
+				return h, err
+			}
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return h, err
+		}
 	}
 	h.Committed, h.Visible, h.SourceEpochs, h.LogBytes = e.Position, e.Position, epochs, e.LogBytes
 	c.observations.pipeline.init()

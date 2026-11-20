@@ -36,18 +36,19 @@ type receipt struct {
 	Record Record `json:"record"`
 }
 type Repository struct {
-	DataSnapshots bool
-	Retain        func(context.Context, transactionAPI, uint64) (uint64, error)
-	Fence         func(context.Context, transactionAPI) error
-	ReceiptPrefix string
-	IndexPrefix   string
-	Client        *txnkv.Client
-	Prefix        string
-	Dimension     int
-	pd            []string
-	raw           *rawDataStore
-	beginTxn      func() (transactionAPI, error)
-	scanLimit     int
+	DataSnapshots    bool
+	Retain           func(context.Context, transactionAPI, uint64) (uint64, error)
+	Fence            func(context.Context, transactionAPI) error
+	collectionPrefix string
+	IndexPrefix      string
+	Client           *txnkv.Client
+	Prefix           string
+	Dimension        int
+	pd               []string
+	packed           *packedStore
+	raw              *rawDataStore
+	beginTxn         func() (transactionAPI, error)
+	scanLimit        int
 }
 
 func NewRepository(pd []string, namespace string, dimension int) (*Repository, error) {
@@ -85,6 +86,9 @@ func (r *Repository) begin() (transactionAPI, error) {
 	tx, err := r.Client.Begin()
 	if err != nil {
 		return nil, err
+	}
+	if r.packed != nil {
+		return &packedSnapshot{tikvTransaction: tikvTransaction{tx}, store: r.packed}, nil
 	}
 	return r.wrapRawSnapshot(tikvTransaction{tx}), nil
 }
@@ -158,8 +162,8 @@ func (r *Repository) ensureSchema(ctx context.Context) error {
 
 func (r *Repository) key(kind, id string) []byte {
 	prefix := r.Prefix
-	if kind == "request" && r.ReceiptPrefix != "" {
-		prefix = r.ReceiptPrefix
+	if kind == "request" && r.packed == nil && r.collectionPrefix != "" {
+		prefix = r.collectionPrefix
 	}
 	return []byte(prefix + kind + "/" + hex.EncodeToString([]byte(id)))
 }

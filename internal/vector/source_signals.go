@@ -45,10 +45,28 @@ type graphCommitAck struct {
 	Through uint64           `json:"through"`
 }
 type graphCommitProof struct {
-	through uint64
-	offered uint64
-	checked time.Time
+	through         uint64
+	offered         uint64
+	checked         time.Time
+	admittedThrough uint64
+	admittedAt      time.Time
 }
+
+// Admission suppresses redundant sends while the leader is building. Only a
+// durable ACK advances through. Lost volatile queues are retried after a tick.
+func (p *graphCommitProofs) recentlyAdmitted(id IndexPartitionID, through uint64) bool {
+	old := p.read(id)
+	return old.admittedThrough == through && time.Since(old.admittedAt) < dispatchControlInterval
+}
+
+func (p *graphCommitProofs) admitted(id IndexPartitionID, through uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	old := p.byIndex[id] // noteDelivery creates the map before the RPC
+	old.admittedThrough, old.admittedAt = through, time.Now()
+	p.byIndex[id] = old
+}
+
 type graphCommitProofs struct {
 	mu      sync.RWMutex
 	byIndex map[IndexPartitionID]graphCommitProof
@@ -173,6 +191,18 @@ func (c *ClusterService) signalSource(id DataPartitionID, reason string, local b
 	p.init()
 	p.dispatchWake.WithLabelValues(string(sourceID(id)), reason).Inc()
 	if local {
+		c.writerMu.RLock()
+		group := c.writers[id]
+		c.writerMu.RUnlock()
+		if group != nil && group.dispatchWake != nil {
+			// The dispatcher checks its own incarnation before doing any work.
+			// Wake it directly even while unrelated leases are being renewed.
+			select {
+			case group.dispatchWake <- struct{}{}:
+			default:
+			}
+			return
+		}
 		c.dispatchSignals.add(id)
 	} else {
 		c.outboundSignals.add(id)

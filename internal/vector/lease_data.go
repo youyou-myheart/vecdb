@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"example.com/vector-storage/internal/lease"
+	"example.com/vector-storage/internal/shardlog"
 	tikverr "github.com/tikv/client-go/v2/error"
 )
 
@@ -13,7 +14,7 @@ const guardWriteEvery = 100
 
 // appendLease ties one data writer and its log cursor to a confirmed owner.
 type appendLease struct {
-	lease.Handle
+	shardlog.Node
 	owner         Ownership
 	guard         []byte
 	token         []byte
@@ -21,6 +22,7 @@ type appendLease struct {
 	head          atomic.Uint64
 	indexed       atomic.Uint64 // contiguous source prefix confirmed by every target
 	// Only the partition's drainer counts confirmed, nonempty commits.
+	batch             uint64 // committed single-key WAL batch number; serialized by the drainer
 	batchesSinceGuard int
 	// An ambiguous commit stops admission until the dispatcher recovers a new epoch.
 	uncertain atomic.Bool
@@ -63,7 +65,7 @@ func (l *appendLease) commit(ctx context.Context, tx transactionAPI, epoch uint6
 	}
 	if err := commit(ctx); err != nil {
 		if l != nil && !tikverr.IsErrWriteConflict(err) {
-			l.Retire()
+			l.StepDown()
 			l.uncertain.Store(true)
 		}
 		return fmt.Errorf("commit not confirmed; retry same request_id: %w", err)

@@ -3,6 +3,7 @@
 // Format is pinned to the same little-endian 64-bit ABI as graph snapshots.
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -42,7 +43,8 @@ inline void apply(Graph&g,const Patch&p,bool reverse){
  const Meta&from=reverse?p.after:p.before;const Meta&to=reverse?p.before:p.after;
  validateMeta(g,from);validateMeta(g,to);
  if(!equal(meta(g),from))throw std::runtime_error("graph patch base mismatch");
- std::map<uint32_t,const Image*> targets;
+ std::unordered_map<uint32_t,const Image*> targets;
+ targets.reserve(p.changes.size());
  for(auto&c:p.changes){const Image&src=reverse?c.after:c.before;const Image&dst=reverse?c.before:c.after;
   if(!targets.emplace(c.id,&dst).second||c.id>=std::max(from.count,to.count)||!equal(image(g,c.id),src))throw std::runtime_error("graph patch node mismatch");
   if(c.id>=to.count){if(dst.level!=-1||!dst.base.empty()||!dst.upper.empty())throw std::runtime_error("graph patch removed node");continue;}
@@ -74,5 +76,18 @@ inline void apply(Graph&g,const Patch&p,bool reverse){
  g.maxlevel_=to.level;g.enterpoint_node_=to.entry;
  std::istringstream in(to.random);in>>g.level_generator_>>std::ws>>g.update_probability_generator_;
 }
-inline Patch finish(Graph&g,Capture&c){Patch p;p.before=c.before;p.after=meta(g);for(uint32_t id=c.before.count;id<g.cur_element_count;id++)c.old.emplace(id,Image{});for(auto&entry:c.old)p.changes.push_back({entry.first,entry.second,image(g,entry.first)});return p;}
+inline Patch finish(Graph& g, Capture& capture) {
+ Patch p;
+ p.before = capture.before;
+ p.after = meta(g);
+ p.changes.reserve(capture.old.size() + p.after.count - p.before.count);
+ for (auto& entry : capture.old) {
+  auto after = image(g, entry.first);
+  if (!equal(entry.second, after))
+   p.changes.push_back({entry.first, std::move(entry.second), std::move(after)});
+ }
+ for (uint32_t id = p.before.count; id < p.after.count; ++id)
+  p.changes.push_back({id, Image{}, image(g, id)});
+ return p;
+}
 }

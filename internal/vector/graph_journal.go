@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"time"
 
 	tikverr "github.com/tikv/client-go/v2/error"
+	tikvutil "github.com/tikv/client-go/v2/util"
 )
 
 // A durable entry is replayable immediately. Local applied positions may lag
@@ -39,7 +41,7 @@ type GraphHead struct {
 type GraphEntry struct {
 	SourceEpochs map[string]uint64 `json:"source_epochs,omitempty"`
 	Payload      *GraphPayload     `json:"payload,omitempty"`
-	PayloadData  []byte            `json:"payload_data,omitempty"` // Subscription transport only; excluded from the journal hash.
+	PayloadData  []byte            `json:"payload_data,omitempty"` // Inline delta bytes; entryHash authenticates them through Payload.SHA256.
 	LogBytes     uint64            `json:"log_bytes,omitempty"`
 	CreatedMS    int64             `json:"created_ms,omitempty"`
 	// Cumulative source watermarks make the latest entry a self-contained ACK.
@@ -84,20 +86,20 @@ func (j graphJournal) headIn(ctx context.Context, tx transactionAPI) (GraphHead,
 		return h, errors.New("invalid durable graph anchor (legacy publication protocol is not supported)")
 	}
 	key, raw, err := tx.Last(ctx, j.key("entries/"), j.key("entries0"))
-	if tikverr.IsErrNotFound(err) {
+	if err != nil && !tikverr.IsErrNotFound(err) {
+		return h, err
+	}
+	if len(key) == 0 {
 		if h.Committed != h.Floor {
 			return h, errors.New("missing graph tail above retention floor")
 		}
 		return h, nil
 	}
-	if err != nil {
-		return h, err
-	}
 	var tail GraphEntry
-	if err = json.Unmarshal(raw, &tail); err != nil {
+	if err := decodeGraphEntry(raw, &tail, false); err != nil {
 		return h, err
 	}
-	if string(key) != string(j.key(fmt.Sprintf("entries/%020d", tail.Position.Sequence))) ||
+	if string(key) != string(j.stream().Key(tail.Position.Sequence)) ||
 		tail.Position.Sequence == 0 || tail.Previous.Sequence != tail.Position.Sequence-1 ||
 		tail.Position.Hash != entryHash(tail) || tail.Term > h.Term ||
 		tail.Position.Sequence < h.Committed.Sequence || tail.Position.DataOffset < h.Committed.DataOffset ||
@@ -136,7 +138,7 @@ func (j graphJournal) Entry(ctx context.Context, seq uint64) (GraphEntry, error)
 }
 func (j graphJournal) entryIn(ctx context.Context, tx transactionAPI, seq uint64) (GraphEntry, error) {
 	var entry GraphEntry
-	e := readJSON(ctx, tx, j.key(fmt.Sprintf("entries/%020d", seq)), &entry)
+	e := readGraphEntry(ctx, tx, j.stream().Key(seq), &entry, true)
 	if e == nil && (entry.Position.Sequence != seq || entry.Position.Hash != entryHash(entry)) {
 		e = errors.New("graph journal hash mismatch")
 	}
@@ -201,15 +203,13 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 		return entry, e
 	}
 	defer tx.Rollback()
-	// Prefer TiKV's atomic single-region commit for these short metadata
-	// transactions, avoiding 2PC prewrite locks on conflicts in this fast path.
-	// The client falls back to 2PC for mutations spanning regions; fencing and
-	// uncertain-outcome recovery remain unchanged.
+	// Generic metadata writes prefer 1PC. The leased append below enforces
+	// single-slot 1PC for deltas and a bounded transaction for object resets.
 	if native, ok := tx.(interface{ SetEnable1PC(bool) }); ok {
 		native.SetEnable1PC(true)
 	}
-	native, bounded := j.nativeAppend(tx)
-	bounded = bounded && writer != nil
+	native, nativeSlot := j.nativeAppend(tx)
+	nativeSlot = nativeSlot && writer != nil
 	var h GraphHead
 	leasedReset := writer != nil && kind == "reset"
 	if writer == nil || leasedReset {
@@ -224,14 +224,14 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 		h = cloneGraphHead(base)
 	}
 	if writer != nil {
-		if e = writer.appendAuthority(token, tx); e != nil {
+		if e = writer.authority(token); e != nil {
 			return entry, e
 		}
 		if leasedReset {
 			// The grant can roll over in storage during the object upload.
 			// Its replacement may not yet be installed by the local writer.
 			e = j.c.fenceIndexGuard(ctx, tx, j.id, token)
-		} else if !bounded {
+		} else if !nativeSlot {
 			// A takeover cannot change the guard until the durable lease
 			// expires. Touch it to serialize an already-started commit with takeover.
 			e = tx.Set(j.c.indexGuardKey(j.id), token)
@@ -284,49 +284,96 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 		entry.LogBytes = h.LogBytes + added
 	}
 	if len(payload) > 0 {
-		entry.Payload, e = j.writePayload(tx, entry.Position.Sequence, payload)
-		if e != nil {
-			return entry, e
+		if len(payload) > maxGraphPayload {
+			return entry, errors.New("invalid graph payload size")
 		}
+		entry.Payload = &GraphPayload{Size: len(payload), SHA256: fmt.Sprintf("%x", sha256.Sum256(payload))}
+		entry.PayloadData = payload
 	}
 	entry.Position.Hash = entryHash(entry)
-	key := j.key(fmt.Sprintf("entries/%020d", entry.Position.Sequence))
-	if bounded {
-		encoded, err := json.Marshal(entry)
-		if err != nil {
-			return entry, err
-		}
-		if err = native.insert(key, encoded); err != nil {
-			return entry, err
-		}
-		expires, err := writer.commitExpiry(token)
-		if err != nil {
-			return entry, err
-		}
-		err = native.commitBeforeLeaseExpiry(ctx, expires)
-		var exists *tikverr.ErrKeyExist
-		if errors.As(err, &exists) {
-			err = ErrConflict
-		}
+	key := j.stream().Key(entry.Position.Sequence)
+	encodeStart := time.Now()
+	encoded, err := encodeGraphEntry(entry)
+	if cluster != nil {
+		cluster.observations.pipeline.observe("graph_entry_encode", string(j.id), time.Since(encodeStart), err)
+	}
+	if err != nil {
 		return entry, err
 	}
-	if _, e = tx.Get(ctx, key); e == nil {
-		return entry, ErrConflict
-	} else if !tikverr.IsErrNotFound(e) {
-		return entry, e
-	}
-	// Concurrent appenders choose the same immutable key: TiKV's write conflict
-	// check rejects one. Index fencing, source epoch checks and object adoption remain atomic
-	// with this append, even though no head or publication key is written.
-	if e = putJSON(tx, key, entry); e != nil {
-		return entry, e
-	}
-	if writer != nil {
-		if e = writer.authority(token); e != nil {
-			return entry, e
+	// A reset adopts an uploaded object and changes metadata. Its grant still
+	// bounds that transaction, including on the compatibility storage path.
+	var resetExpiry int64
+	if leasedReset {
+		resetExpiry, err = writer.commitExpiry(token)
+		if err != nil {
+			return entry, err
+		}
+		if txnMillis(tx) >= resetExpiry {
+			return entry, ErrFenced
 		}
 	}
-	return entry, tx.Commit(ctx)
+	var commit func(context.Context) error
+	if nativeSlot {
+		if leasedReset {
+			if err = native.insert(key, encoded); err != nil {
+				return entry, err
+			}
+			commit = func(ctx context.Context) error { return native.commitBeforeLeaseExpiry(ctx, resetExpiry) }
+		} else {
+			commit = func(ctx context.Context) error {
+				return j.proposeSlot(ctx, writer, token, native, entry.Position.Sequence, encoded)
+			}
+		}
+	} else {
+		if _, e = tx.Get(ctx, key); e == nil {
+			return entry, ErrConflict
+		} else if !tikverr.IsErrNotFound(e) {
+			return entry, e
+		}
+		// Competing appenders choose the same immutable key. Its write conflict
+		// check is atomic with fencing, source epochs and object adoption.
+		if e = tx.Set(key, encoded); e != nil {
+			return entry, e
+		}
+		if writer != nil {
+			if e = writer.authority(token); e != nil {
+				return entry, e
+			}
+		}
+		commit = tx.Commit
+	}
+	var details *tikvutil.CommitDetails
+	if nativeSlot && cluster != nil {
+		ctx = context.WithValue(ctx, tikvutil.CommitDetailCtxKey, &details)
+	}
+	started := time.Now()
+	err = commit(ctx)
+	if cluster != nil {
+		p := &cluster.observations.pipeline
+		p.observe("graph_tikv_commit", string(j.id), time.Since(started), err)
+		if details != nil {
+			p.observe("graph_tikv_prewrite", string(j.id), details.PrewriteTime, err)
+			p.observe("graph_tikv_latest_ts", string(j.id), details.GetLatestTsTime, err)
+			if !leasedReset && err == nil {
+				p.observe("graph_tikv_one_phase", string(j.id), details.PrewriteTime, nil)
+			}
+			p.observe("graph_tikv_commit_ts", string(j.id), details.GetCommitTsTime, err)
+			p.observe("graph_tikv_commit_primary", string(j.id), details.CommitTime, err)
+			details.Mu.Lock()
+			backoff := time.Duration(details.Mu.CommitBackoffTime)
+			details.Mu.Unlock()
+			p.observe("graph_tikv_backoff", string(j.id), backoff, err)
+		}
+		if err == nil && len(payload) > 0 {
+			p.graphEntryBytes.WithLabelValues(string(j.id), "delta").Add(float64(len(payload)))
+			p.graphEntryBytes.WithLabelValues(string(j.id), "stored").Add(float64(len(encoded)))
+		}
+	}
+	var exists *tikverr.ErrKeyExist
+	if nativeSlot && errors.As(err, &exists) {
+		err = ErrConflict
+	}
+	return entry, err
 }
 
 // Coverage describes the captured graph, not the possibly newer durable tail.
@@ -357,7 +404,7 @@ func (j graphJournal) saveCheckpoint(ctx context.Context, pos GraphPosition, m M
 		}
 		if pos.Sequence > h.Floor.Sequence {
 			var entry GraphEntry
-			if e = readJSON(ctx, tx, j.key(fmt.Sprintf("entries/%020d", pos.Sequence)), &entry); e != nil {
+			if e = readGraphEntry(ctx, tx, j.stream().Key(pos.Sequence), &entry, false); e != nil {
 				return e
 			}
 			if entry.Position != pos || entryHash(entry) != pos.Hash || entry.LogBytes != coverage.LogBytes || !maps.Equal(entry.Sources, coverage.Sources) || !maps.Equal(entry.SourceEpochs, coverage.SourceEpochs) {

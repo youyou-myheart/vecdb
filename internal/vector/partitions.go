@@ -162,7 +162,7 @@ func OpenPartitionedServiceWithIndexPolicy(ctx context.Context, root *Repository
 	p := &PartitionedService{layout: layout, router: IdentityPartitionRouter{layout}, data: map[DataPartitionID]*Repository{}, indexes: map[IndexPartitionID]PartitionIndex{}, dimension: root.Dimension}
 	for _, b := range layout.Bindings {
 		data := *root
-		data.ReceiptPrefix = root.Prefix
+		data.collectionPrefix = root.Prefix
 		if count > 1 {
 			data.Prefix = fmt.Sprintf("%sdata/%04d/", root.Prefix, b.Data)
 			if err = data.ensureSchema(ctx); err != nil {

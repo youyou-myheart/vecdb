@@ -8,8 +8,10 @@ Requires CGO and a C++14 compiler. Native searches share a read lock; mutation/s
 
 Snapshot format is pinned to 64-bit little-endian hnswlib 0.8.0. The vector module validates structure and bounds before calling `Import`; raw untrusted native bytes must not be passed directly to it. Snapshot portability across library versions/architectures is not guaranteed; rebuild from authoritative records when migrating.
 
+On AArch64, squared L2 uses NEON for four or more coordinates and handles any remaining coordinates with a scalar loop. The HNSW construction and search parameters are shared with the other architectures.
+
 Graph journal support adds mutation hooks for newly inserted labels and captures
-reversible images of touched nodes, entry point, levels, capacity and RNG state.
+reversible images of new or changed nodes, entry point, levels, capacity and RNG state.
 `FinishPatch` rolls construction back; `ApplyPatch` installs images directly.
 The owning Go index excludes queries throughout capture/rollback. Existing-label
 native updates are rejected during capture. Snapshot metadata separately preserves

@@ -7,6 +7,12 @@ from pipeline_probe import parse_metrics, interval, drain_summary, collect
 
 
 class PipelineProbeTest(unittest.TestCase):
+    def test_graph_entry_bytes_preserve_stored_and_original_sizes(self):
+        text = '\n'.join([
+            'vecdb_graph_entry_bytes_total{index_partition="i",representation="delta"} 1500',
+            'vecdb_graph_entry_bytes_total{index_partition="i",representation="stored"} 500'])
+        self.assertEqual(parse_metrics(text)['graph_entry_bytes'], {'i': {'delta': 1500, 'stored': 500}})
+
     def test_local_leases_are_observed_without_changing_progress_probe(self):
         text = '\n'.join([
             'vecdb_index_local_lease_valid{index_partition="i",replica="r"} 1',

@@ -181,7 +181,7 @@ func TestRawFallbackRechecksPartialPageAcrossRegions(t *testing.T) {
 	if _, err := reader.snapshot(ctx, repo.Prefix); err != nil {
 		t.Fatal(err)
 	}
-	var data []rawAcceptedBatch
+	var data []mutationLogBatch
 	for _, id := range []string{"a", "b"} {
 		_, batch, err := writer.prepare([]*mutationRequest{rawTestRequest(t, repo, id, id)})
 		if err != nil {
@@ -194,7 +194,7 @@ func TestRawFallbackRechecksPartialPageAcrossRegions(t *testing.T) {
 	// the last contiguous WAL slot.
 	probe.afterBatch = func(keys, values [][]byte) {
 		probe.afterBatch = nil
-		for _, batch := range []rawAcceptedBatch{data[1], data[0]} {
+		for _, batch := range []mutationLogBatch{data[1], data[0]} {
 			if err := writer.write(ctx, batch); err != nil {
 				t.Fatal(err)
 			}

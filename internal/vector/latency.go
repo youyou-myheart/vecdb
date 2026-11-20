@@ -19,6 +19,7 @@ type pipelineMetrics struct {
 	batch                 *prometheus.HistogramVec
 	workBatch             *prometheus.HistogramVec
 	graphLoads            *prometheus.GaugeVec
+	graphEntryBytes       *prometheus.CounterVec
 	consumerWake          *prometheus.CounterVec
 	sourceEpochAdvances   *prometheus.CounterVec
 	sourceEpochRejections *prometheus.CounterVec
@@ -40,7 +41,7 @@ func (p *pipelineMetrics) init() {
 		p.batch = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "vecdb_index_batch_records",
 			Help:    "Input records per routed graph commit attempt, before revision coalescing.",
-			Buckets: []float64{1, 2, 4, 8, 16, 32, 64, 128},
+			Buckets: []float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512},
 		}, []string{"partition", "outcome"})
 		p.workBatch = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "vecdb_pipeline_batch_items",
@@ -51,6 +52,11 @@ func (p *pipelineMetrics) init() {
 			Name: "vecdb_graph_object_loads_inflight",
 			Help: "Concurrent graph-object loads on this process, across local replicas of an index.",
 		}, []string{"index_partition"})
+		p.graphEntryBytes = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vecdb_graph_entry_bytes_total",
+			Help: "Confirmed inline entries: original delta bytes and actual TiKV value bytes including framing.",
+		}, []string{"index_partition", "representation"})
+		p.registry.MustRegister(p.graphEntryBytes)
 		p.consumerWake = prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "vecdb_index_consumer_cycles_total",
 			Help: "Local index consumer cycles by trigger; continue and follower_continue drain without waiting, follower_poll follows an empty read, retry is failed IO backoff.",

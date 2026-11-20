@@ -297,7 +297,13 @@ func (s *Service) syncIncremental(ctx context.Context, repo IncrementalRepositor
 	}
 }
 func (s *Service) Prune(ctx context.Context) (uint64, error) {
-	if s.graphReplica != nil {
+	g := s.graphReplica
+	if g != nil && g.input != nil && g.journal.c.referenceLogs {
+		// Routed retention changes only fenced, checkpoint-certified TiKV state.
+		// Serialize collectors with one another without blocking HNSW ingestion.
+		g.pruneMu.Lock()
+		defer g.pruneMu.Unlock()
+	} else if g != nil {
 		s.syncMu.Lock()
 		defer s.syncMu.Unlock()
 	}
@@ -307,7 +313,6 @@ func (s *Service) Prune(ctx context.Context) (uint64, error) {
 	}
 	var floor uint64
 	var e error
-	g := s.graphReplica
 	if g != nil && (g.retention || g.journal.c.referenceLogs) {
 		e = retryIndexCommit(ctx, func() error { _, err := g.journal.Prune(ctx, g.repo, LogBatchSize); return err }, func() {})
 		if e != nil {

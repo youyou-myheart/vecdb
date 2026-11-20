@@ -14,7 +14,7 @@ func TestRoutedBatchBoundsAndFairness(t *testing.T) {
 			if large {
 				size = dispatchBytes / 2
 			}
-			in.queue[id] = &queuedDelivery{Delivery: Delivery{Source: id, Events: make([]LogEvent, 32)}, bytes: size}
+			in.queue[id] = &queuedDelivery{Delivery: Delivery{Source: id, Events: make([]LogEvent, indexBatchRecords/4)}, bytes: size}
 			in.bytes += size
 		}
 		first := in.takeBatch()

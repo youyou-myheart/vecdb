@@ -5,6 +5,8 @@ reserve-space = "512MiB"
 [storage.block-cache]
 capacity = "256MiB"
 [raftstore]
+# Allow incompressible 32 MiB graph deltas plus storage and Raft framing.
+raft-entry-max-size = "64MiB"
 capacity = "4GiB"
 # TiKV checks the combined database file budget against RLIMIT_NOFILE.
 # Bound it for the small local/CI dataset; compose.ci.yaml grants 16384 FDs.

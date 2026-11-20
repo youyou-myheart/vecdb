@@ -9,7 +9,7 @@ flowchart TD
     W[业务写入] --> D[TiKV：记录、数据日志、幂等凭证]
     D --> ACK[返回业务写入成功]
     D --> A[索引 Leader A：构图、预校验并回退]
-    A --> L[TiKV：原子追加图条目和图载荷]
+    A --> L["TiKV：单键写图增量和来源位点"]
     L --> AA[A 按序 apply]
     L --> B[B 读取图载荷和引用的数据日志]
     B --> BB[B 按序 apply，不计算邻居]
@@ -17,20 +17,24 @@ flowchart TD
     AA -. 30 MB 或 3 分钟 .-> C[SeaweedFS：完整检查点]
 ```
 
-数据分片按 ID hash 划分；索引按固定簇划分，两者独立。业务写入只等数据事务。A 生成和预校验可逆补丁后，去掉其中的向量字节和属性，留下精确的图结构变化与数据引用。旧节点向量从本地不可变 label 读取，新节点向量从引用的数据日志读取。更新会创建新 label，旧 label 不因记录更新而改变。Follower 不重新选择邻居，同一图位置的邻接表、记录版本、墓碑、节点映射和 RNG 状态应完全相同。
+数据分片按 ID hash 划分；索引按固定簇划分，两者独立。业务写入等待数据分片的批日志与记录、回执投影完成。A 生成和预校验可逆补丁后，去掉其中的向量字节和属性，留下精确的图结构变化与数据引用。旧节点向量从本地不可变 label 读取，新节点向量从引用的数据日志读取。更新会创建新 label，旧 label 不因记录更新而改变。Follower 不重新选择邻居，同一图位置的邻接表、记录版本、墓碑、节点映射和 RNG 状态应完全相同。
 
 ## 图日志实际保存什么
 
 | 位置 | 内容 |
 |---|---|
 | TiKV data/log/LSN | 该历史版本的完整记录：向量、属性、revision、墓碑 |
-| TiKV graph/entries/sequence | previous、position、term、kind、累计 sources/source_epochs、载荷大小/校验和/分块数、累计 log_bytes、created_ms |
-| TiKV graph/payload/sequence/chunk | 邻接表修改、节点映射、构图元数据/RNG、旧记录 hash，以及 `(source, LSN, ID, revision, hash)` 引用 |
+| TiKV graph/entries/sequence | previous、position、term、kind、累计 sources/source_epochs、累计 log_bytes、created_ms，以及内联的图增量正文、大小和 SHA-256 |
+| 旧版 TiKV graph/payload/sequence/chunk | 升级前的外置图增量，按原描述读取，在对应条目 GC 时回收 |
 | SeaweedFS checkpoint | 完整的可恢复状态，见下一节 |
 
 原生补丁的 before/after 节点镜像也已去掉向量，不只是删除 JSON 的 records 字段。逻辑删除和后台旧位置清理用小型内联墓碑，无需捏造数据日志引用。
 
-载荷按 256 KiB 分块，单批上限 32 MiB。图条目、所有分块、来源水位和 fencing 在**同一个 TiKV 事务**内提交。失败不会留下半条可见日志；提交结果未知时重新读尾部，不能盲目重新构图。头部反向读取只需小条目，不读取载荷。事务仍负责隔离旧 Index Leader、低于本 Index 已接受 epoch 的来源请求和竞争追加，并非额外的“发布事务”。
+每个新图增量只写一个 `entries/<sequence>` 键。TiKV 值依次包含四字节标记 `VGE1`、小端 uint32 的 JSON 头长度、JSON 头，以及 Snappy block 压缩的增量正文。头里的 `payload.chunks=0` 表示正文内联，`size` 和 SHA-256 均针对解压后的原文。检查点使用的 `log_bytes` 继续按原文累计。读取图尾仍会从 TiKV 取回整条压缩记录，但读取来源位点只解析头部。Follower 回放和订阅读取才解压正文，并核对原始长度与摘要。HTTP、gRPC 订阅返回原有 `payload_data`。控制条目沿用 JSON；历史 JSON 内联和历史多键分块都可回放、订阅和清理。原始正文上限为 32 MiB，本地和 CI 的 Raft entry 限额为 64 MiB。升级须先停旧版本，再启动新版全部角色。
+
+Follower 按固定目标位点分批回放，在同一个 TiKV 快照中检查回收边界和日志哈希链，按原始载荷大小限制每批解压量。已完成检查点所覆盖的图日志在独立的回收锁下删除，采集订阅水位、校验检查点以及 TiKV 事务中的 fencing 仍然生效。
+
+每个 Worker 的数据回收任务先在一个 TiKV 快照里批读各 Index 的 `floor_sources`。某个来源已有图引用被回收时，再批读对应来源的连续完成位点和数据日志回收位点。只有仍有可能推进的 DataPartition 才启动分片级检查。真正删除日志的事务会重新验证检查点、订阅和每条事件的目标分片。Worker 级筛选耗时记录在 `data_gc_preflight`，分片级检查和回收耗时记录在 `data_checkpoint_gc`。
 
 `head` 只在领取任期、检查点发布、清理时更新；最新位置、sources 和 source_epochs 从尾条目派生。`Committed == Visible`，Visible 是兼容别名，不代表每个副本已应用。B 可以先于 A 应用最后一条持久化日志。
 
@@ -53,14 +57,15 @@ sequenceDiagram
     A-->>D: 入队成功（业务写入早已返回）
     A->>A: 合批构图、预校验
     A->>A: 在本地追加锁内重查 epoch 和完成 LSN
-    A->>K: 校验 Index guard，追加图载荷和来源完成 LSN
+    A->>K: 单键 1PC 追加图增量与来源完成 LSN
+    K-->>A: 持久化成功，该条目可回放
     B->>K: 按序读取控制条目、图变更
     B->>B: 控制条目仅推进图位置；图变更更新 HNSW
 ```
 
 - 小于已接受 epoch：拒绝，并返回当前 epoch 和 `commit_lsn`。等于时沿用 LSN 去重、连续覆盖和精确数据日志校验。
 - 更大 epoch：必须匹配 Coordinator 当前有效 owner；只读授权不写共享来源 fence。随后在该 Index 的图日志中提交控制条目。即使请求已经完全去重，也要先持久化 epoch 升级。
-- 控制条目与正常图提交在本地共用追加锁，在存储端共用 Index guard 和不可变图 sequence，形成持久化顺序。新屏障提交后，队列中的旧 epoch 被拒绝，不会构建旧补丁；跨任期迟到的事务由 guard 拒绝。仅收到 RPC、进入内存队列不构成屏障。
+- 控制条目与正常图提交共用本地追加锁，按同一串不可变图序号落盘。新屏障提交后，队列中的旧 epoch 会被拒绝。TiKV 在提交时检查旧 Leader 的租约时间上界，恢复操作还会隔离同一任期内悬而未决的追加。
 - Index 尚未看到新 epoch 时，允许已验证的旧 epoch 处理不可变数据日志。不同 Index 可在不同时刻接受新 epoch，不要求全局同步屏障。数据 `completed_lsn` 和数据 GC 仍由来源租约 fencing 保护。
 - `source_epoch` 没有图载荷和对象，保持 `data_offset`、sources、HNSW 不变，只增加图 sequence/hash。订阅者需要识别并推进游标。Follower、接管 Leader 和检查点恢复均保留该屏障；新 Leader 从持久化图头读取接受状态。
 
@@ -78,14 +83,15 @@ flowchart LR
     Q[入队唤醒] --> L[检查本地 lease]
     M --> L
     L --> B[取批次并构图]
-    B --> T[TiKV guard + 图日志事务]
+    B --> T["TiKV 单键 1PC 写 entries/LSN"]
     T --> A[更新缓存并直接 apply]
     A --> Q
 ```
 
 - Publisher lease 与副本存活租约分开保存，期限不超过当前副本租约。控制循环按 TTL 的三分之一巡检。当本地租约剩余有效时间降至半个 TTL 时申请续租。Worker 在请求前记录单调时钟，扣除 `max(50 ms, 剩余期限的 10%)` 安全余量；响应延迟和失败都不能延长租约。
 - Master 在已发放 lease 到期前固定 Publisher。主动迁移先发布 `lease_draining=true`、停止续租、保留旧 Publisher，等待到期后切换。显式 release 或节点失联也不能提前撤销已发放 lease。
-- 持有 Publisher 和副本租约的原生 TiKV 写入器通过 Insert 追加图条目。提交时间戳必须早于两份租约的到期时间。获取新任期、来源 epoch 屏障和恢复仍由持久化协议隔离。
+- 普通图增量和已取得租约的来源 epoch 屏障使用 TiKV 单阶段提交（1PC）。每个 Index Leader 顺序对 `entries/<LSN>` 执行一次 MVCC Insert，已存在的序号无法覆盖。增量与累计来源位点在同一个值中。后台续租、到期回调和主动退位更新内存状态。`Propose` 在写入前后读取本地任期。TiKV 在一次写 RPC 中选择提交时间戳并持久化，普通日志不会把应用租约写入 `MaxCommitTs`。成功持久化的条目即可回放。调用期间失去任期时返回结果未确认，由恢复流程判定这批数据是否已落盘。客户端在写入前仍向 PD 获取时间戳。
+- TiKV 若退回普通预写，客户端阻止第二阶段提交，回滚预写锁，该次追加没有 ACK。若响应丢失，Leader 先恢复持久化图尾，再决定是否重放。引用对象的 reset、检查点和接管继续使用各自的元数据事务。
 - 图增量、来源 epoch 控制条目、重建和清理的追加在本地串行化；相同来源 epoch 的普通入队校验不持有追加锁，不等构图或提交。已提交控制条目直接推进本地图位置，不重新构图。
 - 初次成为 Publisher、新 lease generation、未知提交或维护追加后，先在 guard 事务中 Claim/读取持久化图头，再追平并安装缓存。恢复事务写 guard，并在原生路径对下一条尚未使用的图序号写删除标记。标记使同任期未决的旧追加与恢复发生写冲突。失败时缓存不可用，消费循环重试恢复。
 - Follower 从后台缓存获得角色与本地租约，但仍读取持久化图日志，有进展时连续追赶，空闲轮询从 100 ms 逐步退避至 1 秒。Follower 查询捕获到更新的目标位点时会唤醒消费线程。查询 RPC 继续校验副本 owner；本次优化针对接收与构图热路径。
@@ -108,7 +114,7 @@ flowchart LR
 
 ## 清理顺序与恢复
 
-1. 图清理最多处理 256 条：不能超过图检查点或活跃 graph 消费者 ACK；同一事务删除条目和载荷分块、推进 floor 与 `floor_sources`。
+1. 图清理最多处理 256 条：不能超过图检查点或活跃 graph 消费者 ACK；同一事务删除条目、清理旧格式的外置块，并推进 floor 与 `floor_sources`。
 2. 数据清理按实际路由逐条计算连续安全前缀。所有目标索引的 `floor_sources[source]` 都覆盖该事件，才证明引用它的图日志已退休；不能直接取所有索引水位的 min/max。
 3. 再受数据检查点、completed_lsn 和活跃 data 消费者 ACK 限制，最多删除 256 条。数据清理仍校验来源租约；图追加不再锁共享来源 fence。安全性依赖下述单调引用约束。
 

@@ -2,10 +2,12 @@ package vector
 
 import (
 	"context"
+
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"example.com/vector-storage/internal/shardlog"
 	"fmt"
 	"sync"
 
@@ -101,7 +103,7 @@ func (s rawShardStore) epochPrefix(epoch uint64) string {
 }
 
 func (s rawShardStore) batchKey(epoch, number uint64) []byte {
-	return []byte(fmt.Sprintf("%s%020d", s.epochPrefix(epoch), number))
+	return shardlog.Stream(s.epochPrefix(epoch)).Key(number)
 }
 
 func (s rawShardStore) sealKey(digest string) []byte { return []byte(s.prefix + "seals/" + digest) }
@@ -140,27 +142,16 @@ func (s rawShardStore) put(ctx context.Context, key, val []byte) error {
 func (s rawShardStore) readEpoch(ctx context.Context, h *rawShardHistory, epoch, after, through uint64) (uint64, error) {
 	const pageSize = 4
 	for after < through && ctx.Err() == nil {
-		n := int(min(uint64(pageSize), through-after))
-		keys := make([][]byte, n)
-		for i := range keys {
-			keys[i] = s.batchKey(epoch, after+uint64(i)+1)
-		}
-		values, err := s.client.BatchGet(ctx, keys)
+		values, err := shardlog.Stream(s.epochPrefix(epoch)).Tail(ctx, s.client.BatchGet, after, through, pageSize, false)
 		if err != nil {
 			return after, err
 		}
-		if len(values) != n {
-			return after, errors.New("invalid raw batch response")
-		}
-		if values[0] == nil {
+		if len(values) == 0 {
 			break
 		}
-		page := make([]rawAcceptedBatch, 0, n)
+		page := make([]mutationLogBatch, 0, len(values))
 		for i, value := range values {
-			if value == nil {
-				break
-			}
-			var batch rawAcceptedBatch
+			var batch mutationLogBatch
 			if err = json.Unmarshal(value, &batch); err != nil {
 				return after, err
 			}

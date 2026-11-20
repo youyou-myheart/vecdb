@@ -66,7 +66,7 @@ func TestDispatcherIdleAndCachedWindowMetadataIO(t *testing.T) {
 	f, c, o := routedFixture(t)
 	lease := &appendLease{}
 	confirmAppendGrant(t, lease, o.Epoch, o.Expires, time.Minute)
-	s := &dataDispatcher{owner: o, writer: &mutationGroup{lease: lease}}
+	s := &dataDispatcher{owner: o, writer: &mutationGroup{lease: lease}, wake: make(chan struct{}, 1)}
 	c.dispatchers = map[DataPartitionID]*dataDispatcher{0: s}
 	if err := c.loadDispatchWindow(f.ctx, 0, s); err != nil {
 		t.Fatal(err)
@@ -74,7 +74,13 @@ func TestDispatcherIdleAndCachedWindowMetadataIO(t *testing.T) {
 	begin := f.r.beginTxn
 	calls := 0
 	f.r.beginTxn = func() (transactionAPI, error) { calls++; return begin() }
-	if c.dispatchSelected(f.ctx, []DataPartitionID{0}, false) || calls != 0 {
+	c.wakeDispatcher(0)
+	select {
+	case <-s.wake:
+	default:
+		t.Fatal("live dispatcher did not wake")
+	}
+	if calls != 0 {
 		t.Fatal("idle wake opened TiKV transaction", calls)
 	}
 	f.write(t, "fresh", false)
@@ -86,8 +92,9 @@ func TestDispatcherIdleAndCachedWindowMetadataIO(t *testing.T) {
 	if err := c.loadDispatchWindow(f.ctx, 0, s); err != nil || calls != 0 {
 		t.Fatal("cached window reread", err, calls)
 	}
-	lease.Retire()
-	if c.dispatchSelected(f.ctx, []DataPartitionID{0}, false) || calls != 0 {
+	lease.StepDown()
+	c.wakeDispatcher(0)
+	if calls != 0 || len(s.wake) != 0 {
 		t.Fatal("retired wake renewed authority", calls)
 	}
 }
@@ -191,13 +198,38 @@ func TestTiKVGraphSubscriptionSnapshotAcrossGC(t *testing.T) {
 	}
 }
 
+func TestDataMaintenancePreflightSharesSnapshotAcrossSources(t *testing.T) {
+	f, c, owner := routedFixture(t)
+	c.data[1] = &Repository{Prefix: f.r.Prefix + "second/"}
+	c.data[2] = &Repository{Prefix: f.r.Prefix + "third/"}
+	j := f.services[0].graphReplica.journal
+	pos := GraphPosition{Sequence: 1}
+	seed(f.db, j.key("head"), GraphHead{Committed: pos, Visible: pos, Floor: pos, CheckpointPosition: pos,
+		FloorSources: map[string]uint64{"0": 2, "1": 2, "2": 2}})
+	seed(f.db, completedKey(c.data[0]), uint64(2))
+	seed(f.db, []byte(c.data[0].Prefix+"log-floor"), uint64(2))
+	seed(f.db, completedKey(c.data[1]), uint64(2))
+	seed(f.db, completedKey(c.data[2]), "malformed")
+	begin := f.r.beginTxn
+	begins := 0
+	f.r.beginTxn = func() (transactionAPI, error) {
+		begins++
+		return begin()
+	}
+	selected, err := c.dataMaintenanceCandidates(f.ctx, map[DataPartitionID]Ownership{0: owner, 1: owner, 2: owner})
+	want := map[DataPartitionID]Ownership{1: owner, 2: owner}
+	if err != nil || begins != 1 || !reflect.DeepEqual(selected, want) {
+		t.Fatal("covered source, eligible source and malformed source", selected, begins, err)
+	}
+}
+
 func TestDataMaintenanceSelectsOwnedHealthyWriters(t *testing.T) {
 	c := &ClusterService{writers: make(map[DataPartitionID]*mutationGroup)}
 	for _, id := range []DataPartitionID{1, 3} {
 		lease := &appendLease{owner: Ownership{Partition: sourceID(id), Epoch: 7}}
 		confirmAppendGrant(t, lease, lease.owner.Epoch, 1<<60, time.Minute)
 		if id == 3 {
-			lease.Retire()
+			lease.StepDown()
 			lease.uncertain.Store(true)
 		}
 		c.writers[id] = &mutationGroup{lease: lease}

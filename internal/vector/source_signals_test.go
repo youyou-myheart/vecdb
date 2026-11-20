@@ -170,7 +170,7 @@ func TestGraphCommitNotifiesLocalSourceWithoutOutboundRouting(t *testing.T) {
 		t.Fatal("out-of-bounds or uncertain commit certified a position or missed the local wake")
 	}
 
-	group.lease.Retire()
+	group.lease.StepDown()
 	next := owner
 	next.Epoch++
 	successor := &mutationGroup{lease: &appendLease{owner: next}}

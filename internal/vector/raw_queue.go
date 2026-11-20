@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"example.com/vector-storage/internal/shardlog"
 )
 
 const rawWritesInFlight = 16
@@ -11,7 +13,7 @@ const rawWritesInFlight = 16
 type rawPendingWrite struct {
 	requests []*mutationRequest
 	results  []mutationResult
-	batch    rawAcceptedBatch
+	batch    mutationLogBatch
 	done     chan struct{}
 	err      error
 }
@@ -135,7 +137,10 @@ func (b *mutationGroup) writeRawBatch(ctx context.Context, work *rawPendingWrite
 	callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	measure := b.metrics.track("data_group_commit", b.partition)
-	work.err = b.rawWriter.write(callCtx, work.batch)
+	group := shardlog.Open(&b.lease.Node, func(ctx context.Context, p mutationLogBatch) error {
+		return b.rawWriter.write(ctx, p)
+	}, dataLogReader{repo: b.repo})
+	work.err = logStorageError(group.Propose(callCtx, b.lease.owner.Epoch, work.batch))
 	measure(&work.err)
 	b.metrics.observeBatch("data_commit", b.partition, len(work.requests), work.err)
 }
@@ -167,7 +172,7 @@ func (b *mutationGroup) confirmRawWrite(ctx context.Context, epoch uint64, work 
 func (b *mutationGroup) failRawWrites(err error, batch []*mutationRequest, pending []*rawPendingWrite) {
 	b.mu.Lock()
 	if b.lease != nil {
-		b.lease.Retire()
+		b.lease.StepDown()
 		b.lease.uncertain.Store(true)
 	}
 	b.rawStop()

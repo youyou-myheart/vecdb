@@ -145,7 +145,7 @@ func (i *HNSWIndex) applyDeltaLocked(d GraphDelta, reverse bool) error {
 	if i.next != expected {
 		return errors.New("graph delta base mismatch")
 	}
-	seen := map[string]bool{}
+	revisions := make(map[string]uint64, len(d.Records))
 	liveNodes := map[string]int{}
 	for n, meta := range d.Nodes {
 		if n <= d.BeforeNext || n > d.AfterNext {
@@ -155,10 +155,10 @@ func (i *HNSWIndex) applyDeltaLocked(d GraphDelta, reverse bool) error {
 	}
 	for _, ch := range d.Records {
 		r := ch.After
-		if seen[r.ID] || r.Revision <= ch.Before.Revision || (ch.Before.Revision != 0 && ch.Before.ID != r.ID) {
+		if revisions[r.ID] != 0 || r.Revision <= ch.Before.Revision || (ch.Before.Revision != 0 && ch.Before.ID != r.ID) {
 			return errors.New("invalid delta revision")
 		}
-		seen[r.ID] = true
+		revisions[r.ID] = r.Revision
 		if err := validateBatch([]Record{r}, i.dimension); err != nil {
 			return err
 		}
@@ -178,17 +178,11 @@ func (i *HNSWIndex) applyDeltaLocked(d GraphDelta, reverse bool) error {
 		}
 	}
 	for n, meta := range d.Nodes {
-		if !seen[meta.ID] {
+		revision, ok := revisions[meta.ID]
+		if !ok {
 			return errors.New("graph delta orphan node")
 		}
-		found := false
-		for _, ch := range d.Records {
-			if ch.After.ID == meta.ID && ch.After.Revision == meta.Revision && !ch.After.Deleted {
-				found = true
-				break
-			}
-		}
-		if !found || (reverse && i.nodes[n] != meta) {
+		if revision != meta.Revision || (reverse && i.nodes[n] != meta) {
 			return errors.New("graph delta node version mismatch")
 		}
 	}

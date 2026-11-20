@@ -1,5 +1,8 @@
 #pragma once
 #include "hnswlib.h"
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(NO_MANUAL_VECTORIZATION)
+#include <arm_neon.h>
+#endif
 
 namespace hnswlib {
 
@@ -205,6 +208,28 @@ L2SqrSIMD4ExtResiduals(const void *pVect1v, const void *pVect2v, const void *qty
 }
 #endif
 
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(NO_MANUAL_VECTORIZATION)
+static float L2SqrNEON(const void *left, const void *right, const void *qty_ptr) {
+    const auto *a = static_cast<const float *>(left);
+    const auto *b = static_cast<const float *>(right);
+    size_t remaining = *static_cast<const size_t *>(qty_ptr);
+    float32x4_t sum = vdupq_n_f32(0);
+    while (remaining >= 4) {
+        const auto diff = vsubq_f32(vld1q_f32(a), vld1q_f32(b));
+        sum = vaddq_f32(sum, vmulq_f32(diff, diff));
+        a += 4;
+        b += 4;
+        remaining -= 4;
+    }
+    float result = vaddvq_f32(sum);
+    while (remaining--) {
+        const float diff = *a++ - *b++;
+        result += diff * diff;
+    }
+    return result;
+}
+#endif
+
 class L2Space : public SpaceInterface<float> {
     DISTFUNC<float> fstdistfunc_;
     size_t data_size_;
@@ -232,6 +257,9 @@ class L2Space : public SpaceInterface<float> {
             fstdistfunc_ = L2SqrSIMD16ExtResiduals;
         else if (dim > 4)
             fstdistfunc_ = L2SqrSIMD4ExtResiduals;
+#elif defined(__aarch64__) && defined(__ARM_NEON) && !defined(NO_MANUAL_VECTORIZATION)
+        if (dim >= 4)
+            fstdistfunc_ = L2SqrNEON;
 #endif
         dim_ = dim;
         data_size_ = dim * sizeof(float);

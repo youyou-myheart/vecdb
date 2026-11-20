@@ -5,10 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"example.com/vector-storage/internal/lease"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	tikverr "github.com/tikv/client-go/v2/error"
 	"github.com/tikv/client-go/v2/tikvrpc"
@@ -37,10 +39,11 @@ func enableNativeLease(t *testing.T, f *epochTiKVFixture) {
 // Pause AFTER the local lease check, then transfer leadership and advance the
 // storage guard. Both native 1PC and 2PC must reject the delayed old append.
 func TestIndexLeaseTiKVLateAppendAfterTakeover(t *testing.T) {
-	for _, twoPhase := range []bool{false, true} {
-		t.Run(fmt.Sprint(twoPhase), func(t *testing.T) {
+	for _, mode := range []string{"guard-1pc", "guard-2pc", "single-slot-1pc"} {
+		t.Run(mode, func(t *testing.T) {
 			f := newEpochTiKVFixture(t, 1)
 			f.c.coordinator.ttl = 1000
+			f.c.coordinator.holdReleasedLeases = mode == "single-slot-1pc"
 			enableNativeLease(t, f)
 			a := f.services[0]
 			g := a.graphReplica
@@ -72,72 +75,87 @@ func TestIndexLeaseTiKVLateAppendAfterTakeover(t *testing.T) {
 			j.c = &coord
 			var next *Service
 			fired := false
-			repo.beginTxn = func() (transactionAPI, error) {
-				tx, err := f.r.begin()
-				return dispatchHookTx{transactionAPI: tx, forceTwoPhase: twoPhase, beforeCommit: func() error {
-					if fired {
-						return errors.New("unexpected second old commit")
+			takeover := func() error {
+				if fired {
+					return errors.New("unexpected second old commit")
+				}
+				fired = true
+				// Wait for the actual persisted lease to expire, not an artificial release.
+				wait := time.Until(time.UnixMilli(g.writer.lease.Expires).Add(30 * time.Millisecond))
+				if wait > 0 {
+					timer := time.NewTimer(wait)
+					defer timer.Stop()
+					select {
+					case <-timer.C:
+					case <-f.ctx.Done():
+						return f.ctx.Err()
 					}
-					fired = true
-					// Wait for the actual persisted lease to expire, not an artificial release.
-					wait := time.Until(time.UnixMilli(g.writer.lease.Expires).Add(30 * time.Millisecond))
-					if wait > 0 {
-						timer := time.NewTimer(wait)
-						defer timer.Stop()
-						select {
-						case <-timer.C:
-						case <-f.ctx.Done():
-							return f.ctx.Err()
-						}
-					}
-					node := ClusterNode{ID: "replacement", Session: "new", URL: "http://localhost:2", Roles: []string{RoleWorker}}
-					if err := f.c.coordinator.Heartbeat(f.ctx, node); err != nil {
-						return err
-					}
-					id := replicaID(g.journal.id, node)
-					testAssignment(t, f.c.coordinator, node, id)
-					owner, err := f.c.coordinator.Acquire(f.ctx, id, node)
-					if err != nil {
-						return err
-					}
-					owner, err = f.c.coordinator.Update(f.ctx, owner, true, false)
-					if err != nil {
-						return err
-					}
-					old, err := f.c.coordinator.Plan(f.ctx, g.journal.id)
-					if err != nil {
-						return err
-					}
-					planned := ReplicaPlan{Publisher: id, Serving: []Assignment{{Partition: id, Node: node.ID, Session: node.Session}}}
-					switchTx, err := f.r.begin()
-					if err != nil {
-						return err
-					}
-					defer switchTx.Rollback()
-					if _, err = f.c.coordinator.protectPublisherLease(f.ctx, switchTx, g.journal.id, old, &planned); err != nil {
-						return err
-					}
-					if err = putJSON(switchTx, f.c.coordinator.planKey(g.journal.id), planned); err != nil {
-						return err
-					}
-					if err = switchTx.Commit(f.ctx); err != nil {
-						return err
-					}
-					copyRepo := *f.r
-					next, err = newGraphService(f.ctx, &copyRepo, f.c.objects, graphJournal{f.c.coordinator, g.journal.id, owner})
-					if err != nil {
-						return err
-					}
-					t.Cleanup(next.Index.graph.Close)
-					next.graphReplica.input = newRoutedInput(f.c)
-					next.graphReplica.writer = testIndexWriterWithReplicaLease(next.graphReplica)
-					if err = next.graphReplica.refreshLease(f.ctx, planned); err != nil {
-						return err
-					}
-					return next.Sync(f.ctx)
-				}}, err
+				}
+				node := ClusterNode{ID: "replacement", Session: "new", URL: "http://localhost:2", Roles: []string{RoleWorker}}
+				if err := f.c.coordinator.Heartbeat(f.ctx, node); err != nil {
+					return err
+				}
+				id := replicaID(g.journal.id, node)
+				testAssignment(t, f.c.coordinator, node, id)
+				owner, err := f.c.coordinator.Acquire(f.ctx, id, node)
+				if err != nil {
+					return err
+				}
+				owner, err = f.c.coordinator.Update(f.ctx, owner, true, false)
+				if err != nil {
+					return err
+				}
+				old, err := f.c.coordinator.Plan(f.ctx, g.journal.id)
+				if err != nil {
+					return err
+				}
+				planned := ReplicaPlan{Publisher: id, Serving: []Assignment{{Partition: id, Node: node.ID, Session: node.Session}}}
+				switchTx, err := f.r.begin()
+				if err != nil {
+					return err
+				}
+				defer switchTx.Rollback()
+				if _, err = f.c.coordinator.protectPublisherLease(f.ctx, switchTx, g.journal.id, old, &planned); err != nil {
+					return err
+				}
+				if err = putJSON(switchTx, f.c.coordinator.planKey(g.journal.id), planned); err != nil {
+					return err
+				}
+				if err = switchTx.Commit(f.ctx); err != nil {
+					return err
+				}
+				copyRepo := *f.r
+				next, err = newGraphService(f.ctx, &copyRepo, f.c.objects, graphJournal{f.c.coordinator, g.journal.id, owner})
+				if err != nil {
+					return err
+				}
+				t.Cleanup(next.Index.graph.Close)
+				next.graphReplica.input = newRoutedInput(f.c)
+				next.graphReplica.writer = testIndexWriterWithReplicaLease(next.graphReplica)
+				if err = next.graphReplica.refreshLease(f.ctx, planned); err != nil {
+					return err
+				}
+				return next.Sync(f.ctx)
 			}
-			_, e = j.commitWithAuthority(f.ctx, h, 1, "delta", Manifest{}, []Delivery{q}, f.c, payload, token, g.writer)
+			ctx := f.ctx
+			if mode == "single-slot-1pc" {
+				ctx = interceptor.WithRPCInterceptor(ctx, func(send interceptor.RPCInterceptorFunc) interceptor.RPCInterceptorFunc {
+					return func(target string, req *tikvrpc.Request) (*tikvrpc.Response, error) {
+						if req.Type == tikvrpc.CmdPrewrite && req.Prewrite().TryOnePc && !fired {
+							if err := takeover(); err != nil {
+								return nil, err
+							}
+						}
+						return send(target, req)
+					}
+				})
+			} else {
+				repo.beginTxn = func() (transactionAPI, error) {
+					tx, err := f.r.begin()
+					return dispatchHookTx{transactionAPI: tx, forceTwoPhase: mode == "guard-2pc", beforeCommit: takeover}, err
+				}
+			}
+			_, e = j.commitWithAuthority(ctx, h, 1, "delta", Manifest{}, []Delivery{q}, f.c, payload, token, g.writer)
 			if !fired || !tikverr.IsErrWriteConflict(e) {
 				t.Fatal("late transaction escaped storage fencing", e)
 			}
@@ -316,40 +334,70 @@ func TestNativeGraphInsertAndRecoveryFence(t *testing.T) {
 		t.Fatal("native insert disabled")
 	}
 	key := g.journal.key(fmt.Sprintf("entries/%020d", h.Committed.Sequence+1))
-	if err = native.insert(key, []byte("late")); err != nil {
-		t.Fatal(err)
-	}
 	if _, err = g.journal.claimLeased(f.ctx, token); err != nil {
 		t.Fatal(err)
 	}
-	if err = native.commitBeforeLeaseExpiry(f.ctx, g.writer.lease.Expires); err == nil {
+	if err = native.commitGraphSlot(f.ctx, key, []byte("late")); err == nil {
 		t.Fatal("recovery failed to fence delayed insert")
 	}
-	q := f.delivery(t, false)
-	if err := g.enqueue(f.ctx, q); err != nil {
-		t.Fatal(err)
+	// Separate the confirmed local authority from the store-clock field. A
+	// lease-derived MaxCommitTs (or StartTS expiry check) would reject both slots.
+	g.writer.replicaLease = &lease.Handle{}
+	if !g.writer.replicaLease.Confirm(time.Now(), lease.Grant{Epoch: g.journal.owner.Epoch, Expires: 1, Remaining: time.Minute}) {
+		t.Fatal("failed to publish test replica grant")
 	}
-	var guard, insert atomic.Bool
+	defer g.writer.replicaLease.Retire()
+	q := f.delivery(t, false)
+	// Exercise both the first source epoch barrier and its data delta. Inspect
+	// the store reply: merely enabling TryOnePc does not prove it was used.
+	var onePhase, separateCommits, extraKeys atomic.Int32
 	ctx := interceptor.WithRPCInterceptor(f.ctx, func(next interceptor.RPCInterceptorFunc) interceptor.RPCInterceptorFunc {
 		return func(target string, req *tikvrpc.Request) (*tikvrpc.Response, error) {
-			if req.Type == tikvrpc.CmdPrewrite {
-				for _, m := range req.Prewrite().Mutations {
-					if bytes.Equal(m.Key, g.journal.c.indexGuardKey(g.journal.id)) {
-						guard.Store(true)
-					}
-					if m.Op == kvrpcpb.Op_Insert && bytes.HasPrefix(m.Key, g.journal.key("entries/")) {
-						insert.Store(true)
+			if req.Type == tikvrpc.CmdCommit {
+				for _, k := range req.Commit().Keys {
+					if bytes.HasPrefix(k, g.journal.key("entries/")) {
+						separateCommits.Add(1)
 					}
 				}
 			}
-			return next(target, req)
+			resp, err := next(target, req)
+			if req.Type == tikvrpc.CmdPrewrite {
+				p := req.Prewrite()
+				for _, m := range p.Mutations {
+					if bytes.HasPrefix(m.Key, g.journal.key("entries/")) {
+						if len(p.Mutations) != 1 || m.Op != kvrpcpb.Op_Insert || !p.TryOnePc {
+							extraKeys.Add(1)
+						}
+						if err == nil && resp != nil {
+							reply := resp.Resp.(*kvrpcpb.PrewriteResponse)
+							if ts := reply.OnePcCommitTs; ts > p.StartVersion && (p.MaxCommitTs == 0 || ts <= p.MaxCommitTs) {
+								onePhase.Add(1)
+							}
+						}
+					}
+				}
+			}
+			return resp, err
 		}
 	})
+	if err = g.enqueue(ctx, q); err != nil {
+		t.Fatal(err)
+	}
 	if err = s.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if guard.Load() || !insert.Load() {
-		t.Fatal("expected immutable graph Insert without guard", guard.Load(), insert.Load())
+	if onePhase.Load() != 2 || separateCommits.Load() != 0 || extraKeys.Load() != 0 {
+		t.Fatal("expected two single-slot 1PC replies", onePhase.Load(), separateCommits.Load(), extraKeys.Load())
+	}
+	m := &metricText{}
+	if err = f.c.observations.pipeline.appendTo(m); err != nil {
+		t.Fatal(err)
+	}
+	metrics := m.String()
+	for _, stage := range []string{"graph_tikv_one_phase", "graph_tikv_latest_ts", "graph_tikv_prewrite", "graph_tikv_commit_ts", "graph_tikv_commit_primary", "graph_tikv_backoff"} {
+		if !strings.Contains(metrics, `stage="`+stage+`"`) {
+			t.Fatalf("missing native TiKV commit detail %s", stage)
+		}
 	}
 	h, err = g.journal.Head(f.ctx)
 	if err != nil || h.Sources["0"] != 1 {
@@ -362,10 +410,107 @@ func TestNativeGraphInsertAndRecoveryFence(t *testing.T) {
 	defer replay.Rollback()
 	native, _ = g.journal.nativeAppend(replay)
 	key = g.journal.key(fmt.Sprintf("entries/%020d", h.Committed.Sequence))
-	if err = native.insert(key, []byte("overwrite")); err != nil {
+	if err = native.commitGraphSlot(f.ctx, key, []byte("overwrite")); !errors.Is(err, ErrConflict) {
+		t.Fatal("duplicate graph slot overwritten")
+	}
+}
+
+func TestNativeGraphSlotRefusesTwoPhaseFallback(t *testing.T) {
+	f := newEpochTiKVFixture(t, 1)
+	f.c.coordinator.holdReleasedLeases = true
+	j := f.services[0].graphReplica.journal
+	key := j.key("test/graph-slot")
+	tx, err := f.r.begin()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err = native.commitBeforeLeaseExpiry(f.ctx, g.writer.lease.Expires); err == nil {
-		t.Fatal("duplicate graph slot overwritten")
+	defer tx.Rollback()
+	native, ok := j.nativeAppend(tx)
+	if !ok {
+		t.Fatal("missing native transaction")
+	}
+	var fallback, commits atomic.Int32
+	ctx := interceptor.WithRPCInterceptor(f.ctx, func(send interceptor.RPCInterceptorFunc) interceptor.RPCInterceptorFunc {
+		return func(target string, req *tikvrpc.Request) (*tikvrpc.Response, error) {
+			if req.Type == tikvrpc.CmdCommit {
+				commits.Add(1)
+			}
+			if req.Type != tikvrpc.CmdPrewrite {
+				return send(target, req)
+			}
+			// Force the store to return a real uncommitted 2PC lock.
+			req.Prewrite().MaxCommitTs = native.StartTS()
+			resp, err := send(target, req)
+			if err == nil && resp != nil {
+				if p := resp.Resp.(*kvrpcpb.PrewriteResponse); p.RegionError == nil && len(p.Errors) == 0 && p.OnePcCommitTs == 0 {
+					fallback.Add(1)
+				}
+			}
+			return resp, err
+		}
+	})
+	if err = native.commitGraphSlot(ctx, key, []byte("declined")); err == nil || fallback.Load() != 1 || commits.Load() != 0 {
+		t.Fatal("unexpected 1PC fallback outcome", err, fallback.Load(), commits.Load())
+	}
+	retry, err := f.r.begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer retry.Rollback()
+	if _, err = retry.Get(f.ctx, key); !tikverr.IsErrNotFound(err) {
+		t.Fatal("unconfirmed graph slot visible", err)
+	}
+	newTxn, _ := j.nativeAppend(retry)
+	if err = newTxn.commitGraphSlot(f.ctx, key, []byte("recovered")); err != nil {
+		t.Fatal("slot unavailable after declined 1PC", err)
+	}
+}
+
+func TestNativeGraphSlotLostReplyRecoversOnce(t *testing.T) {
+	f := newEpochTiKVFixture(t, 1)
+	f.c.coordinator.holdReleasedLeases = true
+	enableNativeLease(t, f)
+	s := f.services[0]
+	g := s.graphReplica
+	q := f.delivery(t, false)
+	if err := g.enqueue(f.ctx, q); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(f.ctx)
+	defer cancel()
+	var dropped atomic.Bool
+	ctx = interceptor.WithRPCInterceptor(ctx, func(send interceptor.RPCInterceptorFunc) interceptor.RPCInterceptorFunc {
+		return func(target string, req *tikvrpc.Request) (*tikvrpc.Response, error) {
+			resp, err := send(target, req)
+			if req.Type == tikvrpc.CmdPrewrite && err == nil && resp != nil &&
+				resp.Resp.(*kvrpcpb.PrewriteResponse).OnePcCommitTs > 0 && dropped.CompareAndSwap(false, true) {
+				cancel()
+				return nil, context.Canceled
+			}
+			return resp, err
+		}
+	})
+	if err := s.Sync(ctx); err == nil || !dropped.Load() {
+		t.Fatal("lost confirmed 1PC reply reported as success", err)
+	}
+	durable, err := g.journal.Head(f.ctx)
+	if err != nil || durable.Committed.Sequence != 2 || durable.Sources["0"] != 1 {
+		t.Fatal("missing durable delta", durable, err)
+	}
+	if g.position == durable.Committed {
+		t.Fatal("uncertain delta already applied")
+	}
+	if err = s.Sync(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = g.enqueue(f.ctx, q); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Sync(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	head, err := g.journal.Head(f.ctx)
+	if err != nil || head.Committed != durable.Committed || g.position != head.Committed {
+		t.Fatal("redelivery appended or applied a different position", head, g.position, err)
 	}
 }
