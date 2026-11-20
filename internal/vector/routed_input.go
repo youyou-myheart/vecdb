@@ -82,6 +82,7 @@ func (g *graphReplica) enqueue(ctx context.Context, q Delivery) (err error) {
 	}()
 	var h GraphHead
 	var e error
+	q.foldEpoch = g.repo.packed != nil && q.verified && g.writer != nil
 	if g.writer != nil {
 		h, e = g.admitLeased(ctx, q)
 	} else {
@@ -107,6 +108,7 @@ func (g *graphReplica) enqueue(ctx context.Context, q Delivery) (err error) {
 		delete(in.queue, q.Source)
 	}
 	if q.Through <= h.Sources[fmt.Sprint(q.Source)] {
+		in.cluster.signalGraphCommit(g.journal.id, q, nil)
 		in.cluster.observations.duplicates.Add(1)
 		return nil
 	}

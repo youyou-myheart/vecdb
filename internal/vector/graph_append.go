@@ -71,15 +71,15 @@ func (g *graphReplica) appendDelta(ctx context.Context, s *Service, h GraphHead,
 	})
 	commit(&e)
 	g.observeSourceEpochRejection("commit", e)
-	for _, q := range inputs {
-		cluster.signalGraphCommit(g.journal.id, q, e)
-	}
 	if g.fastAppend {
 		if e == nil {
 			g.writer.advance(entry)
 		} else {
 			g.writer.invalidate()
 		}
+	}
+	for _, q := range inputs {
+		cluster.signalGraphCommit(g.journal.id, q, e)
 	}
 	if e == nil {
 		// Reuse the prevalidated delta after a confirmed append. On an unknown

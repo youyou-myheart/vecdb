@@ -199,10 +199,13 @@ func (g *graphReplica) syncLeased(ctx context.Context, s *Service, rebuild bool,
 // Exact events and sparse coverage are proved at admission from immutable data
 // logs. Only the source epoch and advancing cursor can change before commit.
 func validateAdmitted(h GraphHead, q Delivery) error {
-	if err := checkSourceEpoch(h, q); err != nil {
-		return err
+	key := fmt.Sprint(q.Source)
+	if !q.foldEpoch || q.Owner.Epoch <= h.SourceEpochs[key] {
+		if err := checkSourceEpoch(h, q); err != nil {
+			return err
+		}
 	}
-	committed := h.Sources[fmt.Sprint(q.Source)]
+	committed := h.Sources[key]
 	if q.Through > committed && q.Previous < committed {
 		return ErrConflict
 	}
@@ -219,7 +222,21 @@ func (g *graphReplica) admitLeased(ctx context.Context, q Delivery) (GraphHead, 
 	if q.Owner.Epoch < h.SourceEpochs[key] {
 		return h, &SourceEpochError{q.Source, h.SourceEpochs[key], h.Sources[key]}
 	}
-	if q.Owner.Epoch == h.SourceEpochs[key] {
+	if q.foldEpoch && q.Owner.Epoch > h.SourceEpochs[key] {
+		// Authorize the new source incarnation using the asynchronously
+		// refreshed owner registry. The delivery MAC authenticates its WAL
+		// projection; the registry binds the claimed epoch and session.
+		c := g.input.cluster
+		routes, err := c.localSearchRoutes()
+		if err != nil {
+			return h, err
+		}
+		if !sameOwner(routes.Owners[q.Owner.Partition], q.Owner) {
+			c.expireSearchRoutes(routes)
+			return h, ErrFenced
+		}
+	}
+	if q.foldEpoch || q.Owner.Epoch == h.SourceEpochs[key] {
 		// Validation IO does not hold op; the consumer can build/commit concurrently.
 		var tx transactionAPI
 		if !q.verified && q.Through > h.Sources[key] {

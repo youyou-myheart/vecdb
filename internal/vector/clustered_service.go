@@ -2,7 +2,6 @@ package vector
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -11,23 +10,38 @@ import (
 func (c *ClusterService) Get(ctx context.Context, id string) (Record, error) {
 	d := c.router.DataForID(id)
 	repo := c.data[d]
-	if !repo.usesRawShardData() {
+	if !repo.usesRawShardData() && repo.packed == nil {
 		return repo.Get(ctx, id)
 	}
 	if err := ctx.Err(); err != nil {
 		return Record{}, err
 	}
-	if group, ok := repo.raw.local.Load(repo.Prefix); ok {
-		r, err := group.(*mutationGroup).readOwnedRecord(id)
+	var group *mutationGroup
+	if repo.packed != nil {
+		c.writerMu.RLock()
+		group = c.writers[d]
+		c.writerMu.RUnlock()
+	} else if local, ok := repo.raw.local.Load(repo.Prefix); ok {
+		group = local.(*mutationGroup)
+	}
+	if group != nil {
+		r, err := group.readOwnedRecord(id)
 		if !errors.Is(err, ErrFenced) {
 			return r, err
 		}
 	}
 	if c.routeHintsEnabled() {
-		if state, err := c.cachedSearchRoutes(ctx, false); err == nil {
+		ownerCtx := ctx
+		if repo.packed != nil {
+			// An unresponsive Worker must leave time for a durable WAL read.
+			var cancel context.CancelFunc
+			ownerCtx, cancel = context.WithTimeout(ctx, 250*time.Millisecond)
+			defer cancel()
+		}
+		if state, err := c.cachedSearchRoutes(ownerCtx, false); err == nil {
 			o := state.Owners[sourceID(d)]
 			if o.Epoch != 0 {
-				reply, err := c.sendPartition(ctx, o, partitionRPC{Namespace: c.root.Prefix, Partition: o.Partition, Epoch: o.Epoch, Session: o.Session, Source: &d, Operation: "get_owned", ID: id})
+				reply, err := c.sendPartition(ownerCtx, o, partitionRPC{Namespace: c.root.Prefix, Partition: o.Partition, Epoch: o.Epoch, Session: o.Session, Source: &d, Operation: "get_owned", ID: id})
 				if err == nil {
 					if reply.Record == nil {
 						return Record{}, ErrNotFound
@@ -88,7 +102,7 @@ func (c *ClusterService) Sync(ctx context.Context) error {
 				delete(targets, id)
 				continue
 			}
-			keys = append(keys, completedKey(c.data[id]))
+			keys = append(keys, c.dispatchProgressKey(id))
 		}
 		c.writerMu.RUnlock()
 		if len(keys) == 0 {
@@ -104,11 +118,9 @@ func (c *ClusterService) Sync(ctx context.Context) error {
 			return err
 		}
 		for id, n := range targets {
-			var completed uint64
-			if value, ok := values[string(completedKey(c.data[id]))]; ok {
-				if err := json.Unmarshal(value, &completed); err != nil {
-					return err
-				}
+			completed, err := c.decodeDispatchProgress(id, values[string(c.dispatchProgressKey(id))])
+			if err != nil {
+				return err
 			}
 			if completed >= n {
 				delete(targets, id)

@@ -33,6 +33,7 @@ const dispatchBytes = 2 << 20
 type Delivery struct {
 	proof        []byte
 	verified     bool
+	foldEpoch    bool
 	Source       DataPartitionID `json:"source"`
 	Owner        Ownership       `json:"owner"`
 	RouteVersion uint64          `json:"route_version"`
@@ -112,6 +113,30 @@ func completedKey(r *Repository) []byte { return []byte(r.Prefix + "dispatch-com
 func (c *ClusterService) completedIn(ctx context.Context, tx dataReader, d DataPartitionID) (uint64, error) {
 	return c.data[d].readCounter(ctx, tx, "dispatch-completed")
 }
+
+// The packed writer reports its confirmed prefix with the existing lease
+// renewal. Graph cursors remain authoritative during replay after takeover.
+func (c *ClusterService) dispatchProgressKey(id DataPartitionID) []byte {
+	if c.data[id].packed != nil {
+		return c.coordinator.ownerKey(sourceID(id))
+	}
+	return completedKey(c.data[id])
+}
+
+func (c *ClusterService) decodeDispatchProgress(id DataPartitionID, value []byte) (uint64, error) {
+	if len(value) == 0 {
+		return 0, nil
+	}
+	if c.data[id].packed != nil {
+		var owner Ownership
+		err := json.Unmarshal(value, &owner)
+		return owner.Offset, err
+	}
+	var completed uint64
+	err := json.Unmarshal(value, &completed)
+	return completed, err
+}
+
 func (c *ClusterService) eventTargets(e LogEvent) []IndexPartitionID {
 	if !e.Record.Deleted {
 		return []IndexPartitionID{c.layout.Routing.target(e.Record.Vector)}
@@ -219,6 +244,11 @@ func (c *ClusterService) runDispatcher(ctx context.Context, id DataPartitionID, 
 
 func (c *ClusterService) dispatchTick(ctx context.Context) {
 	defer c.observations.pipeline.track("dispatch_tick", "")(nil)
+	if c.root.packed != nil {
+		// Route refresh belongs to the control loop. Delivery and ACKs only
+		// consume published snapshots and can retry after a route change.
+		_, _ = c.cachedSearchRoutes(ctx, false)
+	}
 	assignments, err := c.placementValues(ctx, true)
 	if err != nil {
 		return
@@ -440,8 +470,19 @@ func (c *ClusterService) loadDispatchWindow(ctx context.Context, id DataPartitio
 	if s.writer != nil {
 		head = s.writer.lease.head.Load()
 	}
+	if s.writer != nil && s.writer.lease.wal != nil && !s.recovered {
+		s.completed = s.writer.lease.wal.base
+		s.persisted = s.completed
+		s.writer.lease.indexed.Store(s.completed)
+		s.recovered = true
+	}
 	if s.recovered && (len(s.window) > 0 || (s.writer != nil && s.completed == head)) {
 		return nil
+	}
+	if s.writer != nil && s.writer.lease.wal != nil {
+		var err error
+		s.window, err = s.writer.lease.wal.window(s.completed, head, dispatchLookahead)
+		return err
 	}
 	var tx dataReader
 	var e error
@@ -499,6 +540,9 @@ func (c *ClusterService) loadDispatchWindow(ctx context.Context, id DataPartitio
 	return nil
 }
 func (c *ClusterService) flushCompleted(ctx context.Context, id DataPartitionID, s *dataDispatcher, force bool) error {
+	if c.data[id].packed != nil && s.writer != nil && s.writer.lease.wal != nil {
+		return nil
+	}
 	if s.completed == s.persisted || !force && s.windows < 100 && time.Since(s.checkpointAt) < 500*time.Millisecond {
 		return nil
 	}
@@ -527,7 +571,7 @@ func (c *ClusterService) dispatchCommits(ctx context.Context, id DataPartitionID
 		// Old-epoch WAL may already be indexed beyond the durable source
 		// checkpoint. New WAL gets its first delivery without a graph read.
 		recovering := proof.checked.IsZero() && events[target][0].Sequence <= s.recoveryHead
-		stalled := proof.through < proof.offered && time.Since(proof.checked) >= 500*time.Millisecond
+		stalled := (s.writer.lease == nil || s.writer.lease.wal == nil) && proof.through < proof.offered && time.Since(proof.checked) >= 500*time.Millisecond
 		if recovering || stalled {
 			missing = append(missing, target)
 		}

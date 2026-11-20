@@ -18,9 +18,8 @@ type packedStore struct {
 	client    *txnkv.Client
 }
 
-// Pin the WAL and the physical views at exactly the metadata transaction's
-// timestamp. Only the latest batch can still be materializing. Overlay it in
-// a separate, never-committed MVCC buffer so point reads and scans agree.
+// Reconstruct logical data rows at the caller's MVCC timestamp. Physical
+// rows from earlier versions are the base; newer WAL batches overlay them.
 type packedSnapshot struct {
 	tikvTransaction
 	store  *packedStore
@@ -41,45 +40,35 @@ func (t *packedSnapshot) load(ctx context.Context, key []byte) error {
 	if _, checked := t.loaded[prefix]; prefix == "" || checked {
 		return nil
 	}
-	b, err := lastDataBatch(ctx, t.tikvTransaction, prefix)
+	batches, floor, err := unprojectedDataBatches(ctx, t.tikvTransaction, prefix)
 	if err != nil {
 		return err
 	}
-	pending := false
-	if len(b.Entries) > 0 {
-		r := Repository{Prefix: prefix}
-		_, err = t.tikvTransaction.Get(ctx, r.logKey(b.last()))
-		if err != nil && !tikverr.IsErrNotFound(err) {
-			return err
-		}
-		if tikverr.IsErrNotFound(err) {
-			floor, err := r.readCounter(ctx, t.tikvTransaction, "log-floor")
+	pending := len(batches) != 0
+	if pending {
+		if t.view == nil {
+			t.view, err = t.store.client.Begin(tikv.WithStartTS(t.StartTS()))
 			if err != nil {
 				return err
 			}
-			if floor < b.last() {
-				pending = true
-				if t.view == nil {
-					t.view, err = t.store.client.Begin(tikv.WithStartTS(t.StartTS()))
-					if err != nil {
-						return err
-					}
+		}
+		r := Repository{Prefix: prefix}
+		for _, batch := range batches {
+			rows, err := batchRows(prefix, batch)
+			if err != nil {
+				return err
+			}
+			for k, v := range rows {
+				if strings.HasPrefix(k, prefix+"log/") && k <= string(r.logKey(floor)) {
+					continue
 				}
-				rows, err := batchRows(prefix, b)
-				if err != nil {
+				if err = t.view.Set([]byte(k), v); err != nil {
 					return err
-				}
-				for k, v := range rows {
-					if strings.HasPrefix(k, prefix+"log/") && k <= string(r.logKey(floor)) {
-						continue
-					}
-					if err = t.view.Set([]byte(k), v); err != nil {
-						return err
-					}
 				}
 			}
 		}
 	}
+
 	if t.loaded == nil {
 		t.loaded = map[string]bool{}
 	}

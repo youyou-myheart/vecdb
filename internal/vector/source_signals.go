@@ -243,7 +243,11 @@ func (c *ClusterService) notifySource(ctx context.Context, id DataPartitionID) (
 		}
 	}()
 	if c.routeHintsEnabled() {
-		state, err = c.cachedSearchRoutes(ctx, false)
+		if c.root.packed != nil {
+			state, err = c.localSearchRoutes()
+		} else {
+			state, err = c.cachedSearchRoutes(ctx, false)
+		}
 		if err == nil {
 			owner = state.Owners[sourceID(id)]
 			if owner.Epoch == 0 {

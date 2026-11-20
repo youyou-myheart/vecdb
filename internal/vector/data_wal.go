@@ -3,20 +3,21 @@ package vector
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
-	"strings"
+	"maps"
+	"slices"
+	"sync"
 
 	"example.com/vector-storage/internal/shardlog"
 	tikverr "github.com/tikv/client-go/v2/error"
-	"github.com/tikv/client-go/v2/tikv"
 )
 
 // One entry is the durable decision for a whole mutation group. Current
 // records, subscription events and receipts are replayable materialized views.
-// The owner finishes projecting one entry before it can propose the next.
+// The WAL is the only durable mutation made by the writer.
 func dataWAL(prefix string) shardlog.Stream { return shardlog.Stream(prefix + "wal/") }
 
 func lastDataBatch(ctx context.Context, tx transactionAPI, prefix string) (mutationLogBatch, error) {
@@ -66,164 +67,110 @@ func batchRows(prefix string, b mutationLogBatch) (map[string][]byte, error) {
 	return rows, nil
 }
 
-// The last logical event is the completion witness. A successor cannot start
-// a later batch until this one is projected. A delayed helper therefore sees
-// either this witness (or its GC floor), or a write conflict on newer rows.
-func (r *Repository) projectDataBatch(ctx context.Context, b mutationLogBatch) error {
-	if b.Number == 0 {
-		return nil
-	}
-	rows, err := batchRows(r.Prefix, b)
+// Scan backwards to the last completed projection from the old storage
+// format. The remaining suffix is authoritative for records and receipts.
+func unprojectedDataBatches(ctx context.Context, tx tikvTransaction, prefix string) ([]mutationLogBatch, uint64, error) {
+	r := Repository{Prefix: prefix}
+	floor, err := r.readCounter(ctx, tx, "log-floor")
 	if err != nil {
-		return err
+		return nil, 0, err
 	}
-	last := string(r.logKey(b.last()))
-	keys := make([]string, 0, len(rows))
-	for k := range rows {
-		if k != last {
-			keys = append(keys, k)
-		}
-	}
-	sort.Strings(keys)
-	keys = append(keys, last)
-	return r.writeProjection(ctx, rows, keys, last, b.last())
-}
-
-func (r *Repository) writeProjection(ctx context.Context, rows map[string][]byte, keys []string, witness string, lastLSN uint64) error {
-	for ctx.Err() == nil {
-		err := r.writeProjectionOnce(ctx, rows, keys, witness, lastLSN)
-		if tikverr.IsErrWriteConflict(err) {
-			continue
-		}
-		if len(keys) < 2 || !errors.Is(err, shardlog.ErrSplitRequired) {
-			return err
-		}
-		// Region boundaries or the TiKV request-size limit can split a batch.
-		// Use the SDK's current Region cache. Persist the group which contains
-		// the witness last, even if the region splits again during a retry.
-		raw := make([][]byte, len(keys))
-		for i, key := range keys {
-			raw[i] = []byte(key)
-		}
-		groups, _, err := r.Client.GetRegionCache().GroupKeysByRegion(tikv.NewBackoffer(ctx, 1000), raw, nil)
-		if err != nil {
-			return err
-		}
-		if len(groups) == 1 {
-			mid := len(keys) / 2
-			if err = r.writeProjection(ctx, rows, keys[:mid], witness, lastLSN); err != nil {
-				return err
-			}
-			return r.writeProjection(ctx, rows, keys[mid:], witness, lastLSN)
-		}
-		var final []string
-		for _, group := range groups {
-			batch := make([]string, len(group))
-			for i, key := range group {
-				batch[i] = string(key)
-			}
-			if batch[len(batch)-1] == witness {
-				final = batch
-				continue
-			}
-			if err = r.writeProjection(ctx, rows, batch, witness, lastLSN); err != nil {
-				return err
-			}
-		}
-		if len(final) != 0 {
-			return r.writeProjection(ctx, rows, final, witness, lastLSN)
-		}
-		return nil
-	}
-	return ctx.Err()
-}
-
-func (r *Repository) writeProjectionOnce(ctx context.Context, rows map[string][]byte, keys []string, witness string, lastLSN uint64) error {
-	tx, err := r.Client.Begin()
+	it, err := tx.IterReverse([]byte(prefix + "wal0"))
 	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	value, err := tx.Get(ctx, []byte(witness))
-	if err == nil {
-		if !bytes.Equal(value, rows[witness]) {
-			return errors.New("data WAL projection differs from committed event")
-		}
-		return nil
-	}
-	if !tikverr.IsErrNotFound(err) {
-		return err
-	}
-	floor, err := r.readCounter(ctx, tikvTransaction{tx}, "log-floor")
-	if err != nil || floor >= lastLSN {
-		return err
-	}
-	through := string(r.logKey(floor))
-	for _, k := range keys {
-		if strings.HasPrefix(k, r.Prefix+"log/") && k <= through {
-			continue
-		}
-		if err = tx.Set([]byte(k), rows[k]); err != nil {
-			return err
-		}
-	}
-	if tx.Len() == 0 {
-		return nil
-	}
-	return shardlog.Commit(ctx, tx)
-}
-
-// Stage deletion of immutable batches covered by this certified logical floor.
-// Keep the tail slot as the durable batch-number anchor after complete GC.
-func (r *Repository) pruneDataBatches(ctx context.Context, tx transactionAPI, end uint64, limit int) (uint64, error) {
-	native, ok := nativeTiKV(tx)
-	if !ok {
-		return 0, errors.New("data WAL requires a TiKV snapshot")
-	}
-	tail, err := lastDataBatch(ctx, native, r.Prefix)
-	if err != nil || tail.Number == 0 {
-		return end, err
-	}
-	if _, err := native.Get(ctx, r.logKey(tail.last())); tikverr.IsErrNotFound(err) {
-		// GC must never certify entries whose records/receipts could still be
-		// missing. A previously compacted tail already has durable projections.
-		floor, err := r.readCounter(ctx, native, "log-floor")
-		if err != nil {
-			return 0, err
-		}
-		if floor < tail.last() {
-			end = min(end, tail.First-1)
-		}
-	} else if err != nil {
-		return 0, err
-	}
-	it, err := native.Iter([]byte(r.Prefix+"wal/"), dataWAL(r.Prefix).Key(tail.Number))
-	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	defer it.Close()
-	for n := 0; n < limit && it.Valid(); n++ {
+	var batches []mutationLogBatch
+	for it.Valid() && bytes.HasPrefix(it.Key(), []byte(prefix+"wal/")) {
 		if err := ctx.Err(); err != nil {
-			return 0, err
+			return nil, 0, err
 		}
 		var b mutationLogBatch
-		if err := json.Unmarshal(it.Value(), &b); err != nil {
-			return 0, err
+		if err = json.Unmarshal(it.Value(), &b); err != nil {
+			return nil, 0, err
 		}
-		if len(b.Entries) == 0 || b.First == 0 || b.last() < b.First || !bytes.Equal(it.Key(), dataWAL(r.Prefix).Key(b.Number)) {
-			return 0, errors.New("invalid GC batch")
+		if b.Number == 0 || b.First == 0 || len(b.Entries) == 0 || len(b.Entries) > mutationGroupRecords ||
+			b.last() < b.First || !bytes.Equal(it.Key(), dataWAL(prefix).Key(b.Number)) {
+			return nil, 0, errors.New("invalid data WAL batch")
 		}
-		if b.last() > end {
+		if len(batches) > 0 {
+			next := batches[len(batches)-1]
+			if next.Number != b.Number+1 || next.First != b.last()+1 {
+				return nil, 0, errors.New("data WAL gap")
+			}
+		}
+		if b.last() <= floor {
 			break
 		}
-		if err := tx.Delete(bytes.Clone(it.Key())); err != nil {
-			return 0, err
+		if !b.WALOnly {
+			_, err = tx.Get(ctx, r.logKey(b.last()))
+			if err == nil {
+				break
+			}
+			if !tikverr.IsErrNotFound(err) {
+				return nil, 0, err
+			}
 		}
-		if err := it.Next(); err != nil {
-			return 0, err
+		batches = append(batches, b)
+		if err = it.Next(); err != nil {
+			return nil, 0, err
 		}
 	}
-	return end, nil
+	slices.Reverse(batches)
+	return batches, floor, nil
+}
+
+type dataWALMemory struct {
+	state  mutationBatchState // owned by the mutation drainer
+	mu     sync.Mutex
+	base   uint64
+	events []LogEvent
+	latest map[string]Record
+}
+
+func (m *dataWALMemory) apply(b mutationLogBatch) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, entry := range b.Entries {
+		m.latest[entry.Record.ID] = entry.Record
+		m.events = append(m.events, LogEvent{Sequence: b.First + uint64(i), Record: entry.Record})
+	}
+}
+
+func (m *dataWALMemory) record(id string) (Record, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	record, found := m.latest[id]
+	return cloneRecord(record), found
+}
+
+func (m *dataWALMemory) window(after, head uint64, limit int) ([]LogEvent, error) {
+	m.mu.Lock()
+	if after < m.base || after > head || head-m.base > uint64(len(m.events)) {
+		m.mu.Unlock()
+		return nil, ErrInvalidLogCursor
+	}
+	drop := after - m.base
+	clear(m.events[:drop])
+	m.events = m.events[drop:]
+	m.base = after
+	events := slices.Clone(m.events[:min(head-after, uint64(limit))])
+	m.mu.Unlock()
+	size := 0
+	for i, event := range events {
+		raw, err := json.Marshal(event)
+		if err != nil {
+			return nil, err
+		}
+		size += len(raw)
+		if size > dispatchBytes {
+			if i == 0 {
+				return nil, errors.New("event exceeds dispatch byte budget")
+			}
+			return events[:i], nil
+		}
+	}
+	return events, nil
 }
 
 func (r *Repository) recoverDataWAL(ctx context.Context, state *appendLease) error {
@@ -253,11 +200,105 @@ func (r *Repository) recoverDataWAL(ctx context.Context, state *appendLease) err
 	if err = shardlog.Commit(ctx, tx); err != nil {
 		return err
 	}
-	if err = r.projectDataBatch(ctx, b); err != nil {
+	if err = r.loadDataMemory(ctx, state); err != nil {
 		return err
 	}
-	state.head.Store(max(tail, b.lastLSN()))
+	if state.wal.state.end != max(tail, b.lastLSN()) {
+		return errors.New("data WAL changed during recovery")
+	}
+	state.head.Store(state.wal.state.end)
 	state.batch = b.Number
+	state.wal.state.number = b.Number
+	return nil
+}
+
+func (r *Repository) loadDataMemory(ctx context.Context, state *appendLease) error {
+	tx, err := r.begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	head, err := r.logHead(ctx, tx)
+	if err != nil {
+		return err
+	}
+	floor, err := r.readCounter(ctx, tx, "log-floor")
+	if err != nil {
+		return err
+	}
+	completed, err := r.readCounter(ctx, tx, "dispatch-completed")
+	if err != nil {
+		return err
+	}
+	base := max(floor, completed, state.owner.Offset)
+	if base > head {
+		return ErrInvalidLogCursor
+	}
+	m := &dataWALMemory{
+		base:   base,
+		latest: make(map[string]Record),
+		state:  mutationBatchState{end: head, records: map[string]uint64{}, receipts: map[string]receipt{}},
+	}
+	reader := *r
+	reader.scanLimit = int(^uint(0) >> 1)
+	records, err := reader.scanTxn(ctx, tx, "record")
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		m.state.records[record.ID] = record.Revision
+		m.latest[record.ID] = record
+	}
+	router := IdentityPartitionRouter{layout: PartitionLayout{DataPartitions: r.packed.count}}
+	legacy := Repository{Prefix: r.collectionPrefix}
+	if r.collectionPrefix != "" {
+		if err = loadDataReceipts(ctx, tx, legacy.Prefix, m.state.receipts, func(ack receipt) bool {
+			return r.Prefix == fmt.Sprintf("%sdata/%04d/", legacy.Prefix, router.DataForID(ack.Record.ID))
+		}); err != nil {
+			return err
+		}
+	}
+	if err = loadDataReceipts(ctx, tx, r.Prefix, m.state.receipts, func(receipt) bool { return true }); err != nil {
+		return err
+	}
+	for after := base; after < head; {
+		page, err := r.readEventsAtHead(ctx, tx, after, head, head, dispatchLookahead, dispatchBytes)
+		if err != nil {
+			return err
+		}
+		m.events = append(m.events, page.Events...)
+		after = page.Events[len(page.Events)-1].Sequence
+	}
+	state.wal = m
+	return nil
+}
+
+func loadDataReceipts(ctx context.Context, tx transactionAPI, prefix string, receipts map[string]receipt, include func(receipt) bool) error {
+	start := prefix + "request/"
+	it, err := tx.Iter([]byte(start), []byte(prefix+"request0"))
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	for it.Valid() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var ack receipt
+		if err := json.Unmarshal(it.Value(), &ack); err != nil {
+			return err
+		}
+		if include(ack) {
+			id, err := hex.DecodeString(string(it.Key()[len(start):]))
+			if err != nil {
+				return err
+			}
+			receipts[string(id)] = ack
+		}
+		if err := it.Next(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -268,77 +309,53 @@ func (b mutationLogBatch) lastLSN() uint64 {
 	return b.last()
 }
 
-// Semantic preparation uses the materialized state of the previous batch.
-// All operations in the proposed batch share one WAL slot, including receipts.
+// Revision checks and idempotency use the owner’s recovered in-memory state.
 func (r *Repository) proposeDataBatch(ctx context.Context, requests []*mutationRequest, state *appendLease) ([]mutationResult, error) {
-	results := make([]mutationResult, len(requests))
-	// Pin before local admission. An old snapshot conflicts with the successor's
-	// recovery tombstone even if this goroutine pauses before its prewrite.
-	tx, err := r.Client.Begin()
-	if err == nil {
+	var results []mutationResult
+	err := state.WithLeader(ctx, state.owner.Epoch, func(ctx context.Context) error {
+		// Production writers recover before admission.
+		if state.wal == nil {
+			return ErrFenced
+		}
+		current := &state.wal.state
+		staged := mutationBatchState{number: current.number, end: current.end, records: make(map[string]uint64, len(requests)), receipts: make(map[string]receipt, len(requests))}
+		for _, q := range requests {
+			staged.records[q.id] = current.records[q.id]
+			if ack, ok := current.receipts[q.mutation.RequestID]; ok {
+				staged.receipts[q.mutation.RequestID] = ack
+			}
+		}
+		var b mutationLogBatch
+		var err error
+		results, b, err = staged.prepare(requests)
+		if err != nil || len(b.Entries) == 0 {
+			return err
+		}
+		b.WALOnly = true
+		raw, err := json.Marshal(b)
+		if err != nil {
+			return err
+		}
+		// Propose rechecks the local lease after pinning the transaction.
+		// A delayed append admitted by Propose conflicts with the successor's
+		// recovery tombstone.
+		tx, err := r.Client.Begin()
+		if err != nil {
+			return err
+		}
 		defer tx.Rollback()
-		err = state.WithLeader(ctx, state.owner.Epoch, func(ctx context.Context) error {
-			keys := make([][]byte, 0, 3*len(requests))
-			for _, q := range requests {
-				keys = append(keys, r.key("record", q.id), r.key("request", q.mutation.RequestID))
-				if r.collectionPrefix != "" {
-					keys = append(keys, (&Repository{Prefix: r.collectionPrefix}).key("request", q.mutation.RequestID))
-				}
-			}
-			values, err := tx.BatchGet(ctx, keys)
-			if err != nil {
-				return err
-			}
-			prepared := mutationBatchState{number: state.batch, end: state.head.Load(), records: make(map[string]uint64, len(requests)), receipts: make(map[string]receipt, len(requests))}
-			legacyRepo := Repository{Prefix: r.collectionPrefix}
-			router := IdentityPartitionRouter{layout: PartitionLayout{DataPartitions: r.packed.count}}
-			for _, q := range requests {
-				if raw := values[string(r.key("record", q.id))]; raw != nil {
-					var record Record
-					if err := json.Unmarshal(raw, &record); err != nil {
-						return err
-					}
-					prepared.records[q.id] = record.Revision
-				}
-				id := q.mutation.RequestID
-				raw := values[string(r.key("request", id))]
-				legacy := raw == nil && r.collectionPrefix != ""
-				if legacy {
-					raw = values[string(legacyRepo.key("request", id))]
-				}
-				if raw != nil {
-					var ack receipt
-					if err := json.Unmarshal(raw, &ack); err != nil {
-						return err
-					}
-					if !legacy || router.DataForID(ack.Record.ID) == router.DataForID(q.id) {
-						prepared.receipts[id] = ack
-					}
-				}
-			}
-			var b mutationLogBatch
-			results, b, err = prepared.prepare(requests)
-			if err != nil {
-				return err
-			}
-			if len(b.Entries) == 0 {
-				return nil
-			}
-			raw, err := json.Marshal(b)
-			if err != nil {
-				return err
-			}
-			if err = r.dataLog(&state.Node, tikvTransaction{tx}, nil, false).Propose(ctx, state.owner.Epoch, shardlog.Slot{Sequence: b.Number, Value: raw}); err != nil {
-				return fmt.Errorf("data WAL append not confirmed: %w", err)
-			}
-			state.batch = b.Number
-			if err = r.projectDataBatch(ctx, b); err != nil {
-				return fmt.Errorf("data WAL committed; projection pending: %w", err)
-			}
-			state.head.Store(b.last())
-			return nil
-		})
-	}
+		if err = r.dataLog(&state.Node, tikvTransaction{tx}, nil, false).Propose(ctx, state.owner.Epoch, shardlog.Slot{Sequence: b.Number, Value: raw}); err != nil {
+			return fmt.Errorf("data WAL append not confirmed: %w", err)
+		}
+		maps.Copy(current.records, staged.records)
+		maps.Copy(current.receipts, staged.receipts)
+		current.end, current.number = staged.end, staged.number
+		state.wal.apply(b)
+		state.batch = b.Number
+		state.head.Store(b.last())
+		return nil
+	})
+
 	if err != nil {
 		state.StepDown()
 		state.uncertain.Store(true)
@@ -352,6 +369,10 @@ func (r *Repository) proposeDataBatch(ctx context.Context, requests []*mutationR
 		results = make([]mutationResult, len(requests))
 		for i := range results {
 			results[i] = mutationResult{err: err}
+		}
+	} else {
+		for i := range results {
+			results[i].record = cloneRecord(results[i].record)
 		}
 	}
 	return results, err

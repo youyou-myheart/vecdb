@@ -107,12 +107,15 @@ def main():
 
     def delete(id, client):
         request_id = uuid.uuid4().hex
-        try:
-            client.delete(id, request_id=request_id)
-        except grpc.RpcError as exc:
-            if exc.code() != grpc.StatusCode.UNAVAILABLE:
-                raise
-            client.delete(id, request_id=request_id)
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                client.delete(id, request_id=request_id, timeout=max(.1, deadline - time.monotonic()))
+                break
+            except grpc.RpcError as exc:
+                if exc.code() != grpc.StatusCode.UNAVAILABLE or time.monotonic() >= deadline:
+                    raise
+                time.sleep(.1)
         expected.pop(id, None)
 
     def metrics(url=None):
@@ -169,13 +172,13 @@ def main():
                 raise AssertionError('write ACK with every data owner paused')
             except grpc.RpcError as exc:
                 assert exc.code() in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED), exc
-            assert client.get('offline').revision == 1
+            assert client.get('offline', timeout=3).revision == 1
             for node in paused:
                 os.kill(c.children[node].pid, signal.SIGCONT)
             paused.clear()
             put('offline', [-10, 1], request='during-stop')
             wait('dispatcher resumes from durable data', caught)
-            check('owner_unavailable_no_write_ack_raw_read_available_retry_once')
+            check('owner_unavailable_no_write_ack_durable_read_available_retry_once')
             for i in range(90):
                 center = centers[i%3]
                 put(str(i), [center[0]+(i//3)*.001, center[1]])
@@ -192,10 +195,11 @@ def main():
             client.prune(timeout=60)
             assert client.consumer('data-0000').floor == 0
             page = client.changes('data-0001')
-            assert page.reset_required and page.checkpoint.format == 'data-records-v1'
+            assert not page.reset_required and page.floor == 0 and page.data
+            assert [event.sequence for event in page.data] == list(range(1, page.next + 1))
             for i in range(3):
                 assert client.changes(f'index-{i:04d}', stream='graph').reset_required
-            check('independent_subscriptions_consumer_pin_snapshot_GC_reset')
+            check('graph_subscription_resets_after_GC_and_data_WAL_remains_readable')
 
             # A paused old owner resumes after replacement: its former epoch must
             # never overwrite newer graph or source progress.

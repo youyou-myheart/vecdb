@@ -44,10 +44,10 @@ def run(mode):
             and h.get('checkpoint_bytes', 0) == h.get('log_bytes', 0) and h.get('checkpoint_sources') == h.get('sources')
             and h.get('checkpoint_source_epochs') == h.get('source_epochs') for h in hs.values())
 
-    def fully_pruned():
+    def graph_pruned_and_data_indexed():
         s = c.status()
         return full_checkpoint() and all(h['floor'] == h['checkpoint_position'] for h in s['graph_heads'].values()) and all(
-            d['head'] > 0 and d['head'] == d['completed_lsn'] == d['floor'] for d in s['data_progress'].values())
+            d['head'] > 0 and d['head'] == d['completed_lsn'] and d['floor'] == 0 for d in s['data_progress'].values())
 
     def write(client, start, end):
         for n in range(start, end):
@@ -82,36 +82,48 @@ def run(mode):
             assert all(d['floor'] == 0 for d in s['data_progress'].values())
             for index in leases:
                 page = client.changes(index, stream='graph', limit=256)
-                assert page.graph and page.graph[0].kind == 'source_epoch'
+                assert page.graph and page.graph[0].kind == 'delta'
+                previous_epochs = {}
+                previous_sources = {}
                 for entry in page.graph:
-                    if entry.kind == 'source_epoch':
-                        assert entry.source_epochs and not entry.payload_data and not entry.object.key
-                        assert entry.position.data_offset == entry.previous.data_offset
-                    else:
-                        assert entry.kind == 'delta'
-                first = next(entry for entry in page.graph if entry.kind == 'delta')
-                assert first.payload_data and not first.object.key
-                assert hashlib.sha256(first.payload_data).hexdigest() == first.payload.sha256
-                assert json.loads(first.payload_data)['format'] == 'hnsw-data-reference-v1'
-            report['checks'].append('graph_lease_keeps_epoch_controls_TiKV_payloads_and_source_events_after_checkpoint')
+                    assert entry.kind == 'delta' and entry.sources and entry.source_epochs
+                    assert set(entry.sources) == set(entry.source_epochs)
+                    assert all(epoch > 0 for epoch in entry.source_epochs.values())
+                    assert all(entry.source_epochs.get(source, 0) >= epoch for source, epoch in previous_epochs.items())
+                    assert all(entry.sources.get(source, 0) >= lsn for source, lsn in previous_sources.items())
+                    assert entry.position.data_offset > entry.previous.data_offset
+                    assert entry.payload_data and not entry.object.key
+                    assert hashlib.sha256(entry.payload_data).hexdigest() == entry.payload.sha256
+                    assert json.loads(entry.payload_data)['format'] == 'hnsw-data-reference-v1'
+                    previous_epochs = dict(entry.source_epochs)
+                    previous_sources = dict(entry.sources)
+                assert previous_epochs == s['graph_heads'][index]['source_epochs']
+                assert previous_sources == s['graph_heads'][index]['sources']
+            report['checks'].append('graph_lease_preserves_deltas_with_source_epochs_and_reference_payloads')
             for index, epoch in leases.items():
                 client.consumer(index, stream='graph', action='release', consumer='reference-test', session=session, epoch=epoch)
-            wait('automatic_graph_then_data_GC_without_manual_checkpoint_or_prune', fully_pruned)
+            wait('automatic_graph_GC_preserves_data_WAL', graph_pruned_and_data_indexed)
+            for partition, progress in c.status()['data_progress'].items():
+                page = client.changes(partition, limit=256)
+                assert not page.reset_required and page.floor == 0
+                assert page.head == page.next == progress['head']
+                assert [event.sequence for event in page.data] == list(range(1, page.head + 1))
+
             before = {i: h['checkpoint']['generation'] for i, h in c.status()['graph_heads'].items()}
             time.sleep(4)
             after = {i: h['checkpoint']['generation'] for i, h in c.status()['graph_heads'].items()}
             assert before == after
             report['checks'].append('idle_graph_does_not_repeat_checkpoints')
-            # Kill all workers after both streams have been compacted. TiKV
-            # point reads stay available. Recovered writers resume at the GC floor.
+            # Kill all workers after graph compaction. Point reads and writer
+            # recovery use the retained data WAL.
             for node in list(c.workers):
                 c.children[node].kill()
                 c.children[node].wait(timeout=10)
             c.workers.clear()
-            assert client.get('0').id == '0'
+            assert client.get('0', timeout=3).id == '0'
             c.scale(3)
             c.wait_ready()
-            wait('all source writers recover after GC', lambda: all(d['owner_available'] for d in c.status()['data_progress'].values()))
+            wait('all source writers recover from retained WAL', lambda: all(d['owner_available'] for d in c.status()['data_progress'].values()))
             write(client, 120, 135)
             client.search([0, 0], k=1, min_visible=messages.Token(id=str(max(map(int, expected))), revision=1), timeout=60)
             wait('restored_query_replicas_reach_the_durable_graph_tail', lambda: converged(c.status(), 4, 3))

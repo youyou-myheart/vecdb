@@ -17,13 +17,13 @@ flowchart TD
     AA -. 30 MB 或 3 分钟 .-> C[SeaweedFS：完整检查点]
 ```
 
-数据分片按 ID hash 划分；索引按固定簇划分，两者独立。业务写入等待数据分片的批日志与记录、回执投影完成。A 生成和预校验可逆补丁后，去掉其中的向量字节和属性，留下精确的图结构变化与数据引用。旧节点向量从本地不可变 label 读取，新节点向量从引用的数据日志读取。更新会创建新 label，旧 label 不因记录更新而改变。Follower 不重新选择邻居，同一图位置的邻接表、记录版本、墓碑、节点映射和 RNG 状态应完全相同。
+数据分片按 ID hash 划分；索引按固定簇划分，两者独立。TxnKV 业务写入等待数据分片批日志提交并更新内存视图。A 生成和预校验可逆补丁后，去掉其中的向量字节和属性，留下精确的图结构变化与数据引用。旧节点向量从本地不可变 label 读取，新节点向量从引用的数据日志读取。更新会创建新 label，旧 label 不因记录更新而改变。Follower 不重新选择邻居，同一图位置的邻接表、记录版本、墓碑、节点映射和 RNG 状态应完全相同。
 
 ## 图日志实际保存什么
 
 | 位置 | 内容 |
 |---|---|
-| TiKV data/log/LSN | 该历史版本的完整记录：向量、属性、revision、墓碑 |
+| TiKV data/wal/batch | 包含对应逻辑 LSN 的完整历史记录：向量、属性、revision、墓碑。旧版的物理 `data/log/LSN` 仍可读取。 |
 | TiKV graph/entries/sequence | previous、position、term、kind、累计 sources/source_epochs、累计 log_bytes、created_ms，以及内联的图增量正文、大小和 SHA-256 |
 | 旧版 TiKV graph/payload/sequence/chunk | 升级前的外置图增量，按原描述读取，在对应条目 GC 时回收 |
 | SeaweedFS checkpoint | 完整的可恢复状态，见下一节 |
@@ -34,7 +34,7 @@ flowchart TD
 
 Follower 按固定目标位点分批回放，在同一个 TiKV 快照中检查回收边界和日志哈希链，按原始载荷大小限制每批解压量。已完成检查点所覆盖的图日志在独立的回收锁下删除，采集订阅水位、校验检查点以及 TiKV 事务中的 fencing 仍然生效。
 
-每个 Worker 的数据回收任务先在一个 TiKV 快照里批读各 Index 的 `floor_sources`。某个来源已有图引用被回收时，再批读对应来源的连续完成位点和数据日志回收位点。只有仍有可能推进的 DataPartition 才启动分片级检查。真正删除日志的事务会重新验证检查点、订阅和每条事件的目标分片。Worker 级筛选耗时记录在 `data_gc_preflight`，分片级检查和回收耗时记录在 `data_checkpoint_gc`。
+TxnKV 数据 WAL 保留用于恢复记录和回执，也供 Follower 解析历史图引用。已有图检查点覆盖的图增量继续按图日志回收规则清理。
 
 `head` 只在领取任期、检查点发布、清理时更新；最新位置、sources 和 source_epochs 从尾条目派生。`Committed == Visible`，Visible 是兼容别名，不代表每个副本已应用。B 可以先于 A 应用最后一条持久化日志。
 

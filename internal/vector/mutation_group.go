@@ -3,6 +3,8 @@ package vector
 import (
 	"context"
 	"errors"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -60,6 +62,16 @@ func (b *mutationGroup) mutate(ctx context.Context, id string, m Mutation, delet
 	q, err := b.repo.prepareMutation(id, m, deleted)
 	if err != nil {
 		return Record{}, err
+	}
+	if b.repo.packed != nil {
+		// The queued mutation can outlive the caller, and its accepted record
+		// remains in the owner's view after the response.
+		q.mutation.Vector = slices.Clone(m.Vector)
+		q.mutation.Payload = maps.Clone(m.Payload)
+		if m.ExpectedRevision != nil {
+			revision := *m.ExpectedRevision
+			q.mutation.ExpectedRevision = &revision
+		}
 	}
 	// Admission bounds both count and encoded bytes. One oversized request can
 	// run alone, preserving the existing single-request validation contract.
@@ -170,12 +182,12 @@ func (b *mutationGroup) drain(batch []*mutationRequest) {
 		measure(&err)
 		cancel()
 		b.metrics.observeBatch("data_commit", b.partition, len(active), err)
+		for n, q := range active {
+			q.result <- results[n]
+		}
 		if b.onCommit != nil {
 			// Also reconcile an uncertain commit, even if all callers canceled.
 			b.onCommit()
-		}
-		for n, q := range active {
-			q.result <- results[n]
 		}
 	}
 }

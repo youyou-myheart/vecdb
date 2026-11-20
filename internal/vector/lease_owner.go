@@ -128,6 +128,11 @@ func (c *Coordinator) Acquire(ctx context.Context, id IndexPartitionID, node Clu
 		return old, errors.New("ownership epoch exhausted")
 	}
 	o := Ownership{WriteEndpoint: registered.WriteEndpoint, Ready: id == masterLeaseID, Partition: id, Node: node.ID, Session: node.Session, URL: strings.TrimRight(node.URL, "/"), Epoch: old.Epoch + 1, Expires: now + c.ttl}
+	if c.root.packed != nil && strings.HasPrefix(string(id), "data-") {
+		// This prefix was confirmed by every destination and reported in
+		// an existing lease renewal. It is safe to resume after takeover.
+		o.Offset = old.Offset
+	}
 	if e = putJSON(tx, c.ownerKey(id), o); e != nil {
 		return o, e
 	}
@@ -206,6 +211,10 @@ func (c *Coordinator) Resolve(ctx context.Context, id IndexPartitionID) (Ownersh
 		return Ownership{}, e
 	}
 	defer tx.Rollback()
+	return c.resolveIn(ctx, tx, id)
+}
+
+func (c *Coordinator) resolveIn(ctx context.Context, tx transactionAPI, id IndexPartitionID) (Ownership, error) {
 	o, e := c.readOwner(ctx, tx, id)
 	if e != nil {
 		return o, e

@@ -241,7 +241,12 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 		}
 	}
 	for _, input := range inputs {
-		if e = checkSourceEpoch(h, input); e != nil {
+		if input.foldEpoch && nativeSlot {
+			e = validateAdmitted(h, input)
+		} else {
+			e = checkSourceEpoch(h, input)
+		}
+		if e != nil {
 			return entry, e
 		}
 	}
@@ -269,7 +274,14 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 		if h.Sources == nil {
 			h.Sources = map[string]uint64{}
 		}
-		h.Sources[fmt.Sprint(input.Source)] = input.Through
+		key := fmt.Sprint(input.Source)
+		h.Sources[key] = input.Through
+		if input.foldEpoch && nativeSlot && input.Owner.Epoch > h.SourceEpochs[key] {
+			if h.SourceEpochs == nil {
+				h.SourceEpochs = map[string]uint64{}
+			}
+			h.SourceEpochs[key] = input.Owner.Epoch
+		}
 	}
 	if e = j.adoptObject(ctx, tx, object); e != nil {
 		return entry, e

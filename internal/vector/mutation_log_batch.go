@@ -12,14 +12,14 @@ type mutationLogEntry struct {
 // batch. Replaying a contiguous prefix needs no volatile writer state.
 type mutationLogBatch struct {
 	Number  uint64             `json:"number"`
+	WALOnly bool               `json:"wal_only,omitempty"`
 	First   uint64             `json:"first"`
 	Entries []mutationLogEntry `json:"entries"`
 }
 
 func (b mutationLogBatch) last() uint64 { return b.First + uint64(len(b.Entries)) - 1 }
 
-// The RawKV drainer retains this state across writes. A TxnKV owner loads
-// just the revisions and receipts needed for its current group.
+// The partition owner retains revisions and receipts in memory across appends.
 type mutationBatchState struct {
 	records  map[string]uint64
 	receipts map[string]receipt

@@ -218,13 +218,22 @@ type rawReadCache struct {
 
 func (b *mutationGroup) readOwnedRecord(id string) (Record, error) {
 	var before, after uint64
-	if b.rawWriter == nil || !b.lease.InLeaderLease(&before) || before != b.rawWriter.owner.Epoch {
+	if b.lease == nil || !b.lease.InLeaderLease(&before) || before != b.lease.owner.Epoch {
 		return Record{}, ErrFenced
 	}
-	history := b.rawWriter.history
-	snap := rawShardSnapshot{history: history, end: history.end()}
-	record, found := snap.record(id)
-	record = cloneRecord(record)
+	var record Record
+	var found bool
+	switch {
+	case b.lease.wal != nil:
+		record, found = b.lease.wal.record(id)
+	case b.rawWriter != nil && before == b.rawWriter.owner.Epoch:
+		history := b.rawWriter.history
+		snap := rawShardSnapshot{history: history, end: history.end()}
+		record, found = snap.record(id)
+		record = cloneRecord(record)
+	default:
+		return Record{}, ErrFenced
+	}
 	if !b.lease.InLeaderLease(&after) || after != before {
 		return Record{}, ErrFenced
 	}

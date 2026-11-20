@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -147,32 +146,25 @@ func TestDataWALTiKVRecoveryAndDispatch(t *testing.T) {
 	if page, err := view.ReadCommitted(ctx, shardlog.Window{After: 1, Limit: 8}); err != nil || page.Head != 2 || len(page.Events) != 1 || page.Events[0].Record.ID != "east" {
 		t.Fatal(page, err)
 	}
-	// Simulate a certified prefix. Keep the tail anchor and records/receipts.
-	if err := func() error {
-		gc, err := repo.begin()
-		if err != nil {
-			return err
-		}
-		defer gc.Rollback()
-		end, err := repo.pruneDataBatches(f.ctx, gc, 3, 64)
-		if err != nil || end != 3 {
-			return fmt.Errorf("prune end %d: %v", end, err)
-		}
-		return gc.Commit(f.ctx)
-	}(); err != nil {
-		t.Fatal(err)
+	// The durable WAL is the only write. Older batches remain available
+	// even after several subsequent appends and with no physical projection.
+	if floor, err := repo.PruneEvents(f.ctx, 64); err != nil || floor != 0 {
+		t.Fatal(floor, err)
 	}
-	probe, err := repo.begin()
+	probe, err := repo.Client.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer probe.Rollback()
-	if _, err := probe.Get(ctx, dataWAL(repo.Prefix).Key(1)); !tikverr.IsErrNotFound(err) {
-		t.Fatal("old batch retained", err)
+	for _, key := range [][]byte{repo.logKey(1), repo.logKey(3), repo.key("record", "west"), repo.key("request", "three")} {
+		if _, err := probe.Get(ctx, key); !tikverr.IsErrNotFound(err) {
+			t.Fatalf("unexpected physical projection %q: %v", key, err)
+		}
 	}
-	if _, err := probe.Get(ctx, dataWAL(repo.Prefix).Key(2)); err != nil {
-		t.Fatal("tail lost", err)
+	if rows, head, err := repo.Bootstrap(ctx); err != nil || head != 3 || len(rows) != 3 {
+		t.Fatal(rows, head, err)
 	}
+
 	// Same shard rejects conflicting reuse. A second shard may use the same id.
 	results, err = repo.proposeDataBatch(ctx, []*mutationRequest{rawTestRequest(t, &repo, "different", "one")}, next)
 	if err != nil || !errors.Is(results[0].err, ErrConflict) {
@@ -180,7 +172,11 @@ func TestDataWALTiKVRecoveryAndDispatch(t *testing.T) {
 	}
 	other := repo
 	other.Prefix = f.r.Prefix + "data/0001/"
-	results, err = other.proposeDataBatch(ctx, []*mutationRequest{rawTestRequest(t, &other, "new", "one")}, state(1))
+	otherWriter := state(1)
+	if err := other.recoverDataWAL(ctx, otherWriter); err != nil {
+		t.Fatal(err)
+	}
+	results, err = other.proposeDataBatch(ctx, []*mutationRequest{rawTestRequest(t, &other, "new", "one")}, otherWriter)
 	if err != nil || results[0].record.Revision != 1 {
 		t.Fatal(results, err)
 	}
@@ -279,6 +275,7 @@ func TestDataWALTiKVAmbiguousAppend(t *testing.T) {
 	// A stale local cursor can encounter an occupied slot. This is a
 	// route/recovery retry, never a business-level revision conflict.
 	stale := &appendLease{owner: Ownership{Epoch: 1}}
+	stale.wal = &dataWALMemory{state: mutationBatchState{records: map[string]uint64{}, receipts: map[string]receipt{}}}
 	confirmAppendGrant(t, stale, 1, time.Now().Add(time.Minute).UnixMilli(), time.Minute)
 	if _, err := r.proposeDataBatch(f.ctx, []*mutationRequest{rawTestRequest(t, &r, "x", "other")}, stale); !errors.Is(err, ErrFenced) || errors.Is(err, ErrConflict) {
 		t.Fatal("occupied WAL slot reported as a semantic conflict", err)
@@ -286,5 +283,91 @@ func TestDataWALTiKVAmbiguousAppend(t *testing.T) {
 	results, err := r.proposeDataBatch(f.ctx, batch, next)
 	if err != nil || results[0].record.Revision != 1 || next.batch != 1 || next.head.Load() != 1 {
 		t.Fatal("lost reply produced another event", results, next.batch, err)
+	}
+}
+
+// Exercise the first delivery to an index, including the source epoch
+// transition, through the ordinary data-owner and dispatcher entry points.
+func TestDataWALTiKVTwoAppendPipeline(t *testing.T) {
+	f := newEpochTiKVFixture(t, 1)
+	c := f.c
+	f.r.packed = &packedStore{namespace: f.r.Prefix, count: 1, client: f.r.Client}
+	repo := *f.r
+	repo.Prefix += "data/0000/"
+	c.data[0] = &repo
+	c.coordinator.holdReleasedLeases = true
+	c.node, c.replicas, c.cachedRouting = f.node, 2, true
+	c.token = "integration-delivery-token"
+	c.outboundSignals = newSourceSignals()
+	g := f.services[0].graphReplica
+	g.repo.packed = repo.packed
+	c.indexes = map[IndexPartitionID]PartitionIndex{g.journal.id: &remotePartition{cluster: c, id: g.journal.id}}
+	c.locals = map[IndexPartitionID]*localPartition{g.journal.owner.Partition: {owner: g.journal.owner, service: f.services[0]}}
+	enableNativeLease(t, f)
+	if _, err := c.cachedSearchRoutes(f.ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	var data, graph, other atomic.Int32
+	ctx := interceptor.WithRPCInterceptor(f.ctx, func(send interceptor.RPCInterceptorFunc) interceptor.RPCInterceptorFunc {
+		return func(target string, req *tikvrpc.Request) (*tikvrpc.Response, error) {
+			resp, err := send(target, req)
+			if req.Type != tikvrpc.CmdPrewrite {
+				other.Add(1)
+				return resp, err
+			}
+			p := req.Prewrite()
+			if err != nil || resp == nil || !p.TryOnePc || len(p.Mutations) != 1 || p.Mutations[0].Op != kvrpcpb.Op_Insert ||
+				resp.Resp.(*kvrpcpb.PrewriteResponse).OnePcCommitTs == 0 {
+				other.Add(1)
+			} else if bytes.HasPrefix(p.PrimaryLock, []byte(repo.Prefix+"wal/")) {
+				data.Add(1)
+			} else if bytes.HasPrefix(p.PrimaryLock, []byte(g.journal.stream())) {
+				graph.Add(1)
+			} else {
+				other.Add(1)
+			}
+			return resp, err
+		}
+	})
+	c.runCtx = ctx
+	group, err := c.recoverWriter(f.ctx, 0, f.source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer group.close()
+	confirmAppendGrant(t, group.lease, f.source.Epoch, f.source.Expires, time.Minute)
+	c.writers = map[DataPartitionID]*mutationGroup{0: group}
+	dispatcher := &dataDispatcher{owner: f.source, writer: group}
+
+	record, err := c.MutateOwned(ctx, c.root.Prefix, 0, f.source.Epoch, f.source.Session, "point", Mutation{RequestID: "request", Vector: []float64{1, 2}}, false)
+	if err != nil || record.Revision != 1 || data.Load() != 1 || graph.Load() != 0 {
+		t.Fatal(record, err, data.Load(), graph.Load())
+	}
+	if got, err := c.Get(ctx, "point"); err != nil || got.Revision != record.Revision {
+		t.Fatal(got, err)
+	}
+	if err := c.dispatchSource(ctx, 0, dispatcher); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.services[0].Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Lose the first graph ACK and allow a retry of the admitted batch.
+	group.proofs.mu.Lock()
+	proof := group.proofs.byIndex[g.journal.id]
+	proof.through, proof.admittedAt = 0, time.Time{}
+	group.proofs.byIndex[g.journal.id] = proof
+	group.proofs.mu.Unlock()
+	for range 2 {
+		if err := c.dispatchSource(ctx, 0, dispatcher); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if data.Load() != 1 || graph.Load() != 1 || other.Load() != 0 || dispatcher.completed != 1 {
+		t.Fatal("data / graph / other / completed", data.Load(), graph.Load(), other.Load(), dispatcher.completed)
+	}
+	h, err := g.journal.Head(f.ctx)
+	if err != nil || h.Committed.Sequence != 1 || h.SourceEpochs["0"] != f.source.Epoch || h.Sources["0"] != 1 || g.position != h.Committed {
+		t.Fatal(h, g.position, err)
 	}
 }

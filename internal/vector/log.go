@@ -175,9 +175,17 @@ func (r *Repository) PruneEvents(ctx context.Context, limit int) (uint64, error)
 	if limit < 1 || limit > LogBatchSize {
 		return 0, errors.New("invalid prune batch size")
 	}
-	if r.usesRawShardData() {
-		// Raw WAL entries also back record and receipt recovery. Keep the
+	if r.usesRawShardData() || r.packed != nil {
+		// WAL entries also back record and receipt recovery. Keep the
 		// entire history until a durable checkpoint can replace it.
+		if r.packed != nil {
+			tx, err := r.begin()
+			if err != nil {
+				return 0, err
+			}
+			defer tx.Rollback()
+			return r.readCounter(ctx, tx, "log-floor")
+		}
 		return 0, ctx.Err()
 	}
 	tx, e := r.begin()
@@ -234,12 +242,6 @@ func (r *Repository) PruneEvents(ctx context.Context, limit int) (uint64, error)
 	}
 	if end-floor > uint64(limit) {
 		end = floor + uint64(limit)
-	}
-	if r.packed != nil && end > floor {
-		end, e = r.pruneDataBatches(ctx, tx, end, limit)
-		if e != nil {
-			return floor, e
-		}
 	}
 	if end == floor {
 		return floor, nil

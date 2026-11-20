@@ -22,6 +22,7 @@ type appendLease struct {
 	head          atomic.Uint64
 	indexed       atomic.Uint64 // contiguous source prefix confirmed by every target
 	// Only the partition's drainer counts confirmed, nonempty commits.
+	wal               *dataWALMemory
 	batch             uint64 // committed single-key WAL batch number; serialized by the drainer
 	batchesSinceGuard int
 	// An ambiguous commit stops admission until the dispatcher recovers a new epoch.

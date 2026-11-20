@@ -295,7 +295,7 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 		go c.notifySourceLoop(runCtx)
 	}
 	go c.run(runCtx, cfg.LeaseTTL/3)
-	if c.graphReplication && cfg.Routing != nil && c.worker != nil && !rawBackend {
+	if c.graphReplication && cfg.Routing != nil && c.worker != nil && !rawBackend && root.packed == nil {
 		c.maintenanceDone = make(chan struct{})
 		go c.dataMaintenanceLoop(runCtx)
 	}

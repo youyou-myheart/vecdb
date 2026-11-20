@@ -53,12 +53,15 @@ func (c *ClusterService) Status(ctx context.Context) (ClusterStatus, error) {
 				return s, e
 			}
 			done, e := c.completedIn(ctx, tx, d)
-			_ = tx.Rollback()
 			if e != nil {
+				_ = tx.Rollback()
 				return s, e
 			}
-			owner, ownerErr := c.coordinator.Resolve(ctx, sourceID(d))
-			// Show the durable prefix even between owner renewals.
+			owner, ownerErr := c.coordinator.resolveIn(ctx, tx, sourceID(d))
+			_ = tx.Rollback()
+			if r.packed != nil {
+				done = max(done, owner.Offset)
+			}
 			if owner.Epoch != 0 {
 				owner.Offset = done
 			}

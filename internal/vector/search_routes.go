@@ -155,6 +155,15 @@ func (c *ClusterService) cachedSearchRoutes(ctx context.Context, force bool) (*C
 	return &fresh, nil
 }
 
+func (c *ClusterService) localSearchRoutes() (*ClusterStatus, error) {
+	c.searchRoutes.mu.Lock()
+	defer c.searchRoutes.mu.Unlock()
+	if c.searchRoutes.state == nil || c.searchRoutes.deadline.IsZero() {
+		return nil, ErrPartitionUnavailable
+	}
+	return c.searchRoutes.state, nil
+}
+
 // SearchRouting returns a detached public hint snapshot: callers cannot mutate
 // the Gateway's cached owner/session/epoch addresses.
 func (c *ClusterService) SearchRouting(ctx context.Context) (ClusterStatus, error) {
@@ -210,7 +219,13 @@ func (p *remotePartition) cachedRoutedCall(ctx context.Context, op string, q Sea
 			case <-timer.C:
 			}
 		}
-		state, err := p.cluster.cachedSearchRoutes(ctx, false)
+		var state *ClusterStatus
+		var err error
+		if op == "deliver" && p.cluster.root.packed != nil && len(delivery.proof) > 0 {
+			state, err = p.cluster.localSearchRoutes()
+		} else {
+			state, err = p.cluster.cachedSearchRoutes(ctx, false)
+		}
 		if err != nil {
 			return partitionReply{}, fmt.Errorf("%w: %w", ErrPartitionUnavailable, err)
 		}
