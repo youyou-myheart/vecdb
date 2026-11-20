@@ -115,6 +115,8 @@ func (r *Repository) ensureRoutedLayoutWithBackend(ctx context.Context, n int, r
 	mode := previous + "-owner-append-v1"
 	if rawBackend {
 		mode += "-data-raw-v1"
+	} else {
+		mode += "-data-wal-v1"
 	}
 	key = []byte(r.Prefix + "cluster-mode")
 	raw, e = tx.Get(ctx, key)
@@ -122,7 +124,7 @@ func (r *Repository) ensureRoutedLayoutWithBackend(ctx context.Context, n int, r
 		if rawBackend {
 			return l, errors.New("DATA_BACKEND=raw requires a fresh namespace")
 		}
-		if string(raw) != previous {
+		if string(raw) != previous && string(raw) != previous+"-owner-append-v1" {
 			return l, errors.New("incompatible cluster routing protocol")
 		}
 		nodes, err := (&Coordinator{root: r}).nodesIn(ctx, tx)

@@ -125,7 +125,10 @@ func (r *Repository) readEventsAtHead(ctx context.Context, tx dataReader, after,
 	if after >= end {
 		return out, nil
 	}
-	it, e := tx.Iter(r.logKey(after+1), []byte(r.Prefix+"log0"))
+	// Bound TiKV's scan too. A short projection must not prefetch hundreds
+	// of subsequent WAL values that the caller will never inspect.
+	end = after + min(end-after, uint64(limit))
+	it, e := tx.Iter(r.logKey(after+1), append(r.logKey(end), 0))
 	if e != nil {
 		return out, e
 	}
@@ -231,6 +234,12 @@ func (r *Repository) PruneEvents(ctx context.Context, limit int) (uint64, error)
 	}
 	if end-floor > uint64(limit) {
 		end = floor + uint64(limit)
+	}
+	if r.packed != nil && end > floor {
+		end, e = r.pruneDataBatches(ctx, tx, end, limit)
+		if e != nil {
+			return floor, e
+		}
 	}
 	if end == floor {
 		return floor, nil

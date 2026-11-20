@@ -24,6 +24,7 @@ type graphReplica struct {
 	input         *routedInput
 	retention     bool
 	checkpointMu  sync.Mutex
+	pruneMu       sync.Mutex
 	viewMu        sync.RWMutex
 	appliedChange chan struct{}
 	journal       graphJournal

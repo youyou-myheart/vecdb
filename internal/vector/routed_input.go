@@ -137,7 +137,7 @@ func (g *graphReplica) enqueue(ctx context.Context, q Delivery) (err error) {
 
 // Combine only work already queued; never delay admission to fill a batch.
 // Retain source rotation and bound both construction work and encoded input.
-const indexBatchRecords = 128
+const indexBatchRecords = dispatchBatchSize
 
 func (in *routedInput) takeBatch() []*queuedDelivery {
 	in.mu.Lock()

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math/rand"
 	"os"
 	"sync"
 	"testing"
@@ -99,9 +100,25 @@ func TestTiKVDurableGraphTailAndCompetingAppends(t *testing.T) {
 	if err != nil || tail.Committed != entries[winner].Position || tail.Visible != tail.Committed {
 		t.Fatal(tail, err)
 	}
-	payload, err := j.loadPayload(ctx, entries[winner])
+	persisted, err := j.Entry(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Payload == nil || persisted.Payload.Chunks != 0 || len(persisted.PayloadData) <= graphPayloadChunk {
+		t.Fatal("expected a single inline entry larger than the legacy chunk size")
+	}
+	verify, err := r.begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = verify.Last(ctx, j.key("payload/"), j.key("payload0"))
+	_ = verify.Rollback()
+	if !tikverr.IsErrNotFound(err) {
+		t.Fatal("unexpected external payload key", err)
+	}
+	payload, err := j.loadPayload(ctx, persisted)
 	if err != nil || !bytes.Equal(payload, bytes.Repeat([]byte{byte(winner + 1)}, graphPayloadChunk+17)) {
-		t.Fatal("atomic payload chunks differ from winning entry", err)
+		t.Fatal("atomic inline payload differs from winning entry", err)
 	}
 	snapshot, err := j.headIn(ctx, old)
 	if err != nil || snapshot.Committed.Sequence != 0 {
@@ -109,6 +126,19 @@ func TestTiKVDurableGraphTailAndCompetingAppends(t *testing.T) {
 	}
 	if _, _, err = old.Last(ctx, j.key("missing/"), j.key("missing0")); !tikverr.IsErrNotFound(err) {
 		t.Fatal("last read escaped prefix", err)
+	}
+	// Exercise the single-key storage limit at the largest supported delta.
+	large := maximumGraphTestPayload(t)
+	if _, err := j.commitPayload(ctx, tail, 2, "delta", Manifest{}, nil, nil, large); err != nil {
+		t.Fatal("commit maximum inline delta", err)
+	}
+	stored, err := j.Entry(ctx, 2)
+	if err != nil || stored.Payload == nil || stored.Payload.Chunks != 0 || !bytes.Equal(stored.PayloadData, large) {
+		t.Fatal("read maximum inline delta", err)
+	}
+	tail, err = j.Head(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
 	// Revoke ownership after the append read its snapshot but before commit.
 	base := *r
@@ -129,5 +159,35 @@ func TestTiKVDurableGraphTailAndCompetingAppends(t *testing.T) {
 	after, err := j.Head(ctx)
 	if err != nil || after.Committed != tail.Committed {
 		t.Fatal("stale append changed tail", after, err)
+	}
+}
+
+func maximumGraphTestPayload(t *testing.T) []byte {
+	t.Helper()
+	large := make([]byte, maxGraphPayload)
+	// Incompressible data exercises the physical TiKV entry limit too.
+	if _, err := rand.New(rand.NewSource(42)).Read(large); err != nil {
+		t.Fatal(err)
+	}
+	return large
+}
+
+func TestNativeGraphSlotMaximumInlinePayload(t *testing.T) {
+	f := newEpochTiKVFixture(t, 1)
+	f.c.coordinator.holdReleasedLeases = true
+	enableNativeLease(t, f)
+	g := f.services[0].graphReplica
+	h, token, err := g.writer.snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	large := maximumGraphTestPayload(t)
+	entry, err := g.journal.commitWithAuthority(f.ctx, h, 1, "delta", Manifest{}, nil, nil, large, token, g.writer)
+	if err != nil {
+		t.Fatal("one-phase commit of maximum inline delta", err)
+	}
+	stored, err := g.journal.Entry(f.ctx, entry.Position.Sequence)
+	if err != nil || stored.Position != entry.Position || stored.Payload == nil || stored.Payload.Chunks != 0 || !bytes.Equal(stored.PayloadData, large) {
+		t.Fatal("read maximum single-slot delta", err)
 	}
 }

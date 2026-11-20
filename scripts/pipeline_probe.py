@@ -16,6 +16,7 @@ def parse_metrics(text, *, progress_only=False):
     histograms, queues, applied, applied_epochs, consumers, route_fallbacks, source_signals = {}, {}, {}, {}, {}, {}, {}
     source_epochs = dict(advances={}, rejections={})
     index_leases = {}
+    graph_entry_bytes = {}
     for line in text.splitlines():
         if not line or line.startswith('#'): continue
         # The timed frontier probe needs both gauges from every endpoint. Full
@@ -51,6 +52,8 @@ def parse_metrics(text, *, progress_only=False):
             consumers.setdefault(labels['index_partition'], {})['waiting'] = int(value)
         elif name == 'vecdb_graph_commit_conflict_retries_total':
             consumers.setdefault(labels['index_partition'], {})['commit_conflict_retries'] = int(value)
+        elif name == 'vecdb_graph_entry_bytes_total':
+            graph_entry_bytes.setdefault(labels['index_partition'], {})[labels['representation']] = int(value)
         elif name == 'vecdb_index_source_epoch_advances_total':
             source_epochs['advances'].setdefault(labels['index_partition'], {})[labels['source']] = int(value)
         elif name == 'vecdb_index_source_epoch_rejections_total':
@@ -59,7 +62,7 @@ def parse_metrics(text, *, progress_only=False):
             route_fallbacks[labels['index_partition']] = int(value)
         elif name == 'vecdb_dispatch_wake_total':
             source_signals.setdefault(labels['data_partition'],{})[labels['reason']] = int(value)
-    return dict(histograms=histograms, queues=queues, applied=applied, applied_epochs=applied_epochs, consumers=consumers, route_fallbacks=route_fallbacks, source_signals=source_signals, source_epochs=source_epochs, index_leases=index_leases)
+    return dict(histograms=histograms, queues=queues, applied=applied, applied_epochs=applied_epochs, consumers=consumers, route_fallbacks=route_fallbacks, source_signals=source_signals, source_epochs=source_epochs, index_leases=index_leases, graph_entry_bytes=graph_entry_bytes)
 
 
 def collect(endpoints, token, *, progress_only=False):

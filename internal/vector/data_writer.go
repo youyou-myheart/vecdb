@@ -10,19 +10,26 @@ import (
 
 // Recovery happens during acquisition, before the new owner accepts requests.
 func (c *ClusterService) recoverWriter(ctx context.Context, id DataPartitionID, o Ownership) (_ *mutationGroup, err error) {
+	return c.recoverWriterWithLease(ctx, id, o, &appendLease{})
+}
+
+func (c *ClusterService) recoverWriterWithLease(ctx context.Context, id DataPartitionID, o Ownership, state *appendLease) (_ *mutationGroup, err error) {
 	defer c.observations.pipeline.track("data_writer_recover", string(o.Partition))(&err)
 	repo := c.data[id]
-	lease := &appendLease{owner: o, guard: c.coordinator.writeGuardKey(o.Partition), token: epochToken(o.Epoch),
-		boundCommitTS: c.coordinator.holdReleasedLeases}
+	state.owner, state.guard, state.token = o, c.coordinator.writeGuardKey(o.Partition), epochToken(o.Epoch)
+	state.boundCommitTS = c.coordinator.holdReleasedLeases
 	group := newMutationGroup(c.runCtx, repo, &c.observations.pipeline, string(o.Partition))
-	group.lease = lease
+	group.lease = state
 	group.onCommit = func() { c.signalSource(id, "write", true) }
+	if repo.packed != nil {
+		return group, repo.recoverDataWAL(ctx, state)
+	}
 	if repo.raw != nil {
 		writer, err := repo.raw.recover(ctx, repo.Prefix, o)
 		if err != nil {
 			return nil, err
 		}
-		lease.head.Store(writer.history.end())
+		state.head.Store(writer.history.end())
 		group.rawWriter = writer
 		return group, nil
 	}
@@ -36,7 +43,7 @@ func (c *ClusterService) recoverWriter(ctx context.Context, id DataPartitionID, 
 	if err != nil {
 		return nil, err
 	}
-	lease.head.Store(head)
+	state.head.Store(head)
 	return group, nil
 }
 func (c *ClusterService) retireWriter(id DataPartitionID) {

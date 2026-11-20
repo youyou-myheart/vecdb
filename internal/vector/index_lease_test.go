@@ -148,7 +148,7 @@ func TestIndexLeaseRetirementFailsClosedAndDelayedGrant(t *testing.T) {
 	f, _, o := leasedFixture(t)
 	g := f.services[0].graphReplica
 	w := g.writer
-	w.leaderLease.Retire()
+	w.leaderLease.StepDown()
 	f.write(t, "v", false)
 	if e := g.enqueue(f.ctx, deliveryFor(t, f, o, 0)); !errors.Is(e, ErrFenced) {
 		t.Fatal(e)
@@ -356,5 +356,13 @@ func TestIndexLeaseRejectsV13Namespace(t *testing.T) {
 	}
 	if string(db.data[r.Prefix+"cluster-mode"]) != string(old) {
 		t.Fatal("rewrote an existing namespace")
+	}
+}
+
+func (w *indexWriter) install(start time.Time, grant indexLease) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if confirmTestGrant(&w.leaderLease, start, lease.Grant{Epoch: grant.Generation, Expires: grant.Expires, Remaining: grant.remaining}) {
+		w.adoptGrantLocked(grant)
 	}
 }

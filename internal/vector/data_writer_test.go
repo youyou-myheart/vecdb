@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"example.com/vector-storage/internal/lease"
+	"example.com/vector-storage/internal/shardlog"
 )
 
 type countingTail struct {
@@ -29,7 +30,7 @@ func (tx boundedAppendTestTx) commitBeforeLeaseExpiry(ctx context.Context, _ int
 
 func confirmAppendGrant(t *testing.T, l *appendLease, epoch uint64, expires int64, remaining time.Duration) {
 	t.Helper()
-	if !l.Confirm(time.Now(), lease.Grant{Epoch: epoch, Expires: expires, Remaining: remaining}) {
+	if !confirmTestGrant(&l.Node, time.Now(), lease.Grant{Epoch: epoch, Expires: expires, Remaining: remaining}) {
 		t.Fatal("test lease was not confirmed")
 	}
 }
@@ -158,7 +159,7 @@ func TestExpiredAppendGrantStopsBeforeTiKV(t *testing.T) {
 	group := newMutationGroup(ctx, repo, &pipelineMetrics{}, "data-0000")
 	defer group.close()
 	group.lease = &appendLease{}
-	if group.lease.Confirm(time.Now().Add(-time.Second), lease.Grant{Epoch: 1, Expires: 1 << 60, Remaining: time.Second}) {
+	if confirmTestGrant(&group.lease.Node, time.Now().Add(-time.Second), lease.Grant{Epoch: 1, Expires: 1 << 60, Remaining: time.Second}) {
 		t.Fatal("expired grant confirmed")
 	}
 	repo.beginTxn = func() (transactionAPI, error) { t.Fatal("expired owner started a transaction"); return nil, injected }
@@ -193,7 +194,7 @@ func TestMutateOwnedRejectsAcknowledgmentAfterLeaseLoss(t *testing.T) {
 	defer group.close()
 	confirmAppendGrant(t, group.lease, owner.Epoch, 1<<60, time.Minute)
 	c.writers[0] = group
-	group.onCommit = group.lease.Retire
+	group.onCommit = group.lease.StepDown
 	m := Mutation{RequestID: "a", Vector: []float64{1, 2}}
 	if _, err := c.MutateOwned(ctx, repo.Prefix, 0, owner.Epoch, owner.Session, "a", m, false); !errors.Is(err, ErrFenced) {
 		t.Fatal("acknowledged write after lease loss", err)
@@ -293,4 +294,8 @@ func TestDataWriterProtocolUpgradeRequiresOfflineCluster(t *testing.T) {
 	if err := upgrade(); err != nil || string(db.data[key]) == previous {
 		t.Fatal(err)
 	}
+}
+
+func confirmTestGrant(node *shardlog.Node, start time.Time, grant lease.Grant) bool {
+	return node.Campaign(context.Background(), func(context.Context) (lease.Grant, time.Time, error) { return grant, start, nil }) == nil
 }

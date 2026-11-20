@@ -47,7 +47,7 @@ func (p *PartitionedService) changeSource(q ChangeRequest) (*Repository, error) 
 		if b.Index == q.Partition {
 			repo := *p.data[b.Data]
 			if p.layout.DataPartitions > 1 {
-				repo.IndexPrefix = repo.ReceiptPrefix + "index/" + string(b.Index) + "/"
+				repo.IndexPrefix = repo.collectionPrefix + "index/" + string(b.Index) + "/"
 			}
 			return &repo, nil
 		}

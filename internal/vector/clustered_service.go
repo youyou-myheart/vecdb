@@ -229,21 +229,16 @@ func (c *ClusterService) PruneState(ctx context.Context) (any, error) {
 		return nil, e
 	}
 	floors := map[string]uint64{}
-	routes, err := c.cachedSearchRoutes(ctx, false)
-	if err != nil {
-		return nil, err
-	}
 	for d := range c.data {
 		id := sourceID(d)
-		owner := routes.Owners[id]
-		if owner.Epoch == 0 {
-			c.expireSearchRoutes(routes)
-			return nil, ErrPartitionUnavailable
+		// A cached search route can predate a completed data handoff.
+		owner, err := c.coordinator.Resolve(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("%w: prune %s: %w", ErrPartitionUnavailable, id, err)
 		}
 		reply, err := c.sendPartition(ctx, owner, partitionRPC{Namespace: c.root.Prefix, Partition: id, Session: owner.Session, Epoch: owner.Epoch, Source: &d, Operation: "prune_data"})
 		if err != nil {
-			c.expireSearchRoutes(routes)
-			return nil, err
+			return nil, fmt.Errorf("prune %s: %w", id, err)
 		}
 		floors[string(id)] = reply.Floor
 	}
@@ -331,7 +326,7 @@ func (p *PartitionedService) clusteredSource(q ChangeRequest) (*Repository, erro
 		for _, b := range p.layout.Bindings {
 			if b.Index == q.Partition {
 				r := *p.data[0]
-				r.Prefix = r.ReceiptPrefix + "index/" + string(b.Index) + "/"
+				r.Prefix = r.collectionPrefix + "index/" + string(b.Index) + "/"
 				r.IndexPrefix = r.Prefix
 				return &r, nil
 			}

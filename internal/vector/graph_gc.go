@@ -3,7 +3,6 @@ package vector
 import (
 	"context"
 	"errors"
-	"fmt"
 )
 
 // Deletion is bounded, snapshot-certified and serialized against consumer lease
@@ -44,9 +43,9 @@ func (j graphJournal) Prune(ctx context.Context, r *Repository, limit int) (Grap
 	pos := h.Floor
 	for n := pos.Sequence; n < end; {
 		n++
-		key := j.key(fmt.Sprintf("entries/%020d", n))
+		key := j.stream().Key(n)
 		var entry GraphEntry
-		if e = readJSON(ctx, tx, key, &entry); e != nil {
+		if e = readGraphEntry(ctx, tx, key, &entry, false); e != nil {
 			return h.Floor, e
 		}
 		if entry.Previous != pos || entry.Position.Sequence != n || entryHash(entry) != entry.Position.Hash {
@@ -59,7 +58,7 @@ func (j graphJournal) Prune(ctx context.Context, r *Repository, limit int) (Grap
 			return h.Floor, e
 		}
 		if p := entry.Payload; p != nil {
-			if p.Size <= 0 || p.Size > maxGraphPayload || p.Chunks != (p.Size+graphPayloadChunk-1)/graphPayloadChunk {
+			if !p.validSize() {
 				return h.Floor, errors.New("invalid GC payload descriptor")
 			}
 			for chunk := 0; chunk < p.Chunks; chunk++ {

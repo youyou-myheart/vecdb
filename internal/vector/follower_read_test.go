@@ -157,7 +157,7 @@ func TestFollowerLeaderCaptureUsesPublishedViewAndLeaseWithoutKV(t *testing.T) {
 	if err = g.followerAuthority(); !errors.Is(err, ErrFenced) {
 		t.Fatal("leader accepted follower read", err)
 	}
-	g.writer.leaderLease.Retire()
+	g.writer.leaderLease.StepDown()
 	if _, err = g.leaderApplied(); !errors.Is(err, ErrFenced) {
 		t.Fatal("retired leader issued barrier", err)
 	}

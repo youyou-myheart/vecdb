@@ -2,10 +2,11 @@ package vector
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"sync"
+
+	"example.com/vector-storage/internal/shardlog"
+	"github.com/klauspost/compress/s2"
 )
 
 const graphReplayEntries = 16
@@ -21,35 +22,20 @@ func (j graphJournal) replayEntries(ctx context.Context, after GraphPosition, ta
 		return nil, err
 	}
 	defer tx.Rollback()
-	h, err := j.headIn(ctx, tx)
-	if err != nil {
-		return nil, err
-	}
-	if after.Sequence < h.Floor.Sequence {
-		return nil, ErrLogCompacted
-	}
-	if after.Sequence >= target.Sequence || target.Sequence > h.Visible.Sequence {
+	if after.Sequence >= target.Sequence {
 		return nil, errors.New("invalid graph replay range")
 	}
-	count := min(uint64(graphReplayEntries), target.Sequence-after.Sequence)
-	keys := make([][]byte, count)
-	for n := range keys {
-		keys[n] = j.key(fmt.Sprintf("entries/%020d", after.Sequence+uint64(n)+1))
-	}
-	values, err := batchGet(ctx, tx, keys)
+	values, err := j.log(nil, tx).ReadCommitted(ctx, shardlog.Window{After: after.Sequence, Through: target.Sequence, Limit: graphReplayEntries})
 	if err != nil {
 		return nil, err
 	}
-	entries := make([]GraphEntry, 0, count)
+	entries := make([]GraphEntry, 0, len(values))
 	var bytes int64
 	previous := after
-	for n, key := range keys {
-		raw, ok := values[string(key)]
-		if !ok {
-			return nil, errors.New("graph journal gap")
-		}
+	for n, raw := range values {
 		var entry GraphEntry
-		if err = json.Unmarshal(raw, &entry); err != nil {
+		body, err := graphEntryHeader(raw, &entry)
+		if err != nil {
 			return nil, err
 		}
 		if entry.Position.Sequence != after.Sequence+uint64(n)+1 || entry.Position.Hash != entryHash(entry) || entry.Previous != previous {
@@ -67,6 +53,12 @@ func (j graphJournal) replayEntries(ctx context.Context, after GraphPosition, ta
 		}
 		if entry.Position.Sequence == target.Sequence && entry.Position != target {
 			return nil, errors.New("graph durable hash mismatch")
+		}
+		if body != nil {
+			entry.PayloadData, err = s2.Decode(nil, body)
+			if err != nil {
+				return nil, err
+			}
 		}
 		entries = append(entries, entry)
 		bytes += size

@@ -2,9 +2,13 @@ package vector
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -52,7 +56,7 @@ func TestRawOwnerReadersOnlySeeConfirmedHistory(t *testing.T) {
 	if err != nil || len(log.Events) != 1 || log.Head != 1 {
 		t.Fatal(log, err)
 	}
-	group.lease.Retire()
+	group.lease.StepDown()
 	if _, err := group.readOwnedRecord("confirmed"); !errors.Is(err, ErrFenced) {
 		t.Fatal("retired owner served read", err)
 	}
@@ -179,12 +183,27 @@ func TestNewTargetFirstDeliverySkipsGraphPollAndTakeoverRecoversItsCommit(t *tes
 	if _, err := c.cachedSearchRoutes(f.ctx, false); err != nil {
 		t.Fatal(err)
 	}
+	c.token = "test-internal-token"
 	requests := 0
-	c.client = &http.Client{Transport: routeTransport(func(*http.Request) (*http.Response, error) {
+	c.client = &http.Client{Transport: routeTransport(func(req *http.Request) (*http.Response, error) {
+		var wire partitionRPC
+		if err := json.NewDecoder(req.Body).Decode(&wire); err != nil || wire.Delivery == nil {
+			return nil, errors.New("missing projected delivery")
+		}
+		d := *wire.Delivery
+		d.proof, _ = hex.DecodeString(req.Header.Get(deliveryProofHeader))
+		if !c.verifyDelivery(id, d) {
+			return nil, errors.New("missing valid TxnKV WAL signature")
+		}
+		d.Events = nil
+		if c.verifyDelivery(id, d) {
+			return nil, errors.New("WAL proof accepted an omitted event")
+		}
 		requests++
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("{}"))}, nil
 	})}
 	s := &dataDispatcher{owner: owner, writer: &mutationGroup{lease: &appendLease{owner: owner}}, recovered: true, window: q.Events}
+	confirmAppendGrant(t, s.writer.lease, owner.Epoch, owner.Expires, time.Minute)
 	start := f.r.beginTxn
 	f.r.beginTxn = func() (transactionAPI, error) {
 		t.Fatal("initial delivery of new WAL polled durable graph state")
@@ -196,6 +215,15 @@ func TestNewTargetFirstDeliverySkipsGraphPollAndTakeoverRecoversItsCommit(t *tes
 	proof := s.writer.proofs.read(id)
 	if requests != 1 || proof.offered != q.Through || proof.through != 0 {
 		t.Fatal("delivery marked an incorrect LSN", requests, proof)
+	}
+	// A successful admission is volatile. Suppress only the exact repeat.
+	if err := c.dispatchSource(f.ctx, 0, s); err != nil || requests != 1 || s.completed != 0 {
+		t.Fatal("admission advanced the cursor or resent a live batch", requests, s.completed, err)
+	}
+	proof.admittedAt = time.Now().Add(-2 * dispatchControlInterval)
+	s.writer.proofs.byIndex[id] = proof
+	if err := c.dispatchSource(f.ctx, 0, s); err != nil || requests != 2 || s.completed != 0 {
+		t.Fatal("lost volatile delivery was not retried", requests, s.completed, err)
 	}
 	f.r.beginTxn = start
 
@@ -259,5 +287,55 @@ func TestRoutedVisibilityWaitsForActualReplicaApply(t *testing.T) {
 	f.r.beginTxn = func() (transactionAPI, error) { t.Fatal("visible token reopened metadata"); return nil, injected }
 	if _, err := c.searchVisibleReplica(ctx, entry, q); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTxnDispatchConsumesDenseLookaheadInOrderedRPCs(t *testing.T) {
+	f, c, owner := routedFixture(t)
+	const count = 2*dispatchBatchSize + 1
+	id := f.services[0].graphReplica.journal.id
+	c.cachedRouting, c.replicas, c.token = true, 2, "test-internal-token"
+	if _, err := c.cachedSearchRoutes(f.ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	lease := &appendLease{owner: owner}
+	confirmAppendGrant(t, lease, owner.Epoch, owner.Expires, time.Minute)
+	s := &dataDispatcher{owner: owner, writer: &mutationGroup{lease: lease}, recovered: true}
+	for seq := uint64(1); seq <= count; seq++ {
+		seed(f.db, f.r.logKey(seq), LogEvent{Sequence: seq, Record: Record{ID: fmt.Sprint(seq), Revision: 1, Vector: []float64{1, 2}}})
+	}
+	lease.head.Store(count)
+	var through uint64
+	var sizes []int
+	c.client = &http.Client{Transport: routeTransport(func(req *http.Request) (*http.Response, error) {
+		var wire partitionRPC
+		if err := json.NewDecoder(req.Body).Decode(&wire); err != nil {
+			return nil, err
+		}
+		q := *wire.Delivery
+		q.proof, _ = hex.DecodeString(req.Header.Get(deliveryProofHeader))
+		if !c.verifyDelivery(id, q) || q.Previous != through || len(q.Events) > dispatchBatchSize {
+			return nil, errors.New("invalid or overlapping delivery")
+		}
+		for _, e := range q.Events {
+			through++
+			if e.Sequence != through {
+				return nil, errors.New("missing event in dense projection")
+			}
+		}
+		if q.Through != through {
+			return nil, errors.New("wrong delivery end")
+		}
+		sizes = append(sizes, len(q.Events))
+		s.writer.proofs.record(id, through, false)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+	})}
+	for n := 0; n < 5 && s.completed < count; n++ {
+		if err := c.dispatchSource(f.ctx, 0, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s.completed != count || !slices.Equal(sizes, []int{dispatchBatchSize, dispatchBatchSize, 1}) {
+		t.Fatal("dense target failed to drain ordered deliveries", s.completed, sizes)
 	}
 }

@@ -48,7 +48,6 @@ type ClusterService struct {
 	writeRoutes        map[DataPartitionID]Ownership
 	mutationGroups     map[DataPartitionID]*mutationGroup
 	observations       clusterObservations
-	dispatchMu         sync.Mutex
 	dispatchers        map[DataPartitionID]*dataDispatcher
 	dispatchDone       chan struct{}
 	dispatchSignals    *sourceSignals
@@ -213,6 +212,11 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 		return nil, e
 	}
 	started := false
+	if !rawBackend && cfg.Routing != nil && root.Client != nil {
+		walRoot := *root
+		walRoot.packed = &packedStore{namespace: root.Prefix, count: count, client: root.Client}
+		root = &walRoot
+	}
 	if rawBackend {
 		raw, err := openRawDataStore(ctx, root.pd, root.Prefix)
 		if err != nil {
@@ -257,7 +261,7 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 	}
 	for _, b := range dataBindings {
 		data := *root
-		data.ReceiptPrefix = root.Prefix
+		data.collectionPrefix = root.Prefix
 		data.DataSnapshots = cfg.Routing != nil
 		if count > 1 || cfg.Routing != nil {
 			data.Prefix = fmt.Sprintf("%sdata/%04d/", root.Prefix, b.Data)
@@ -302,8 +306,34 @@ func (c *ClusterService) run(ctx context.Context, interval time.Duration) {
 	defer close(c.done)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	// A slow shard report or placement pass must not starve membership renewals.
+	// Reconciliation stays serialized and is scheduled only after a heartbeat.
+	work := make(chan struct{}, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		for range work {
+			if ctx.Err() != nil {
+				return
+			}
+			c.reconcile(ctx)
+		}
+	}()
+	defer func() { close(work); <-finished }()
 	for {
-		c.reconcile(ctx)
+		node := c.node
+		node.Draining = c.draining.Load()
+		if c.worker != nil {
+			node.Load = c.sampleLoad()
+		}
+		if err := c.coordinator.Heartbeat(ctx, node); err == nil {
+			select {
+			case work <- struct{}{}:
+			default:
+			}
+		} else if ctx.Err() == nil {
+			log.Printf("cluster heartbeat failed: %v", err)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -313,17 +343,6 @@ func (c *ClusterService) run(ctx context.Context, interval time.Duration) {
 }
 func (c *ClusterService) reconcile(ctx context.Context) {
 	c.flushRetirements(ctx)
-	node := c.node
-	node.Draining = c.draining.Load()
-	if c.worker != nil {
-		node.Load = c.sampleLoad()
-	}
-	if e := c.coordinator.Heartbeat(ctx, node); e != nil {
-		if ctx.Err() == nil {
-			log.Printf("cluster heartbeat failed: %v", e)
-		}
-		return
-	}
 	if c.master != nil {
 		var nodes []ClusterNode
 		var e error

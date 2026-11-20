@@ -33,7 +33,7 @@ func transformPatch(data []byte, dimension int, vector func(uint64) ([]float32, 
 	if r.u32() != from {
 		return nil, errors.New("unsupported compact patch")
 	}
-	out := binary.LittleEndian.AppendUint32(nil, to)
+	out := binary.LittleEndian.AppendUint32(make([]byte, 0, len(data)), to)
 	start := r.data
 	r.meta()
 	stride, upper := r.meta()
@@ -49,39 +49,38 @@ func transformPatch(data []byte, dimension int, vector func(uint64) ([]float32, 
 			if r.err != nil {
 				return nil, r.err
 			}
+			out = binary.LittleEndian.AppendUint32(out, uint32(level))
 			if level == -1 {
 				if len(base) != 0 || len(extra) != 0 {
 					return nil, errors.New("invalid absent node image")
 				}
+				out = binary.LittleEndian.AppendUint64(out, 0)
 			} else {
-				want := stride
+				compacted := stride - uint64(dimension*4)
+				input, output := stride, compacted
 				if vector != nil {
-					want -= uint64(dimension * 4)
+					input, output = compacted, stride
 				}
-				if level < 0 || level > 64 || uint64(len(base)) != want || uint64(len(extra)) != uint64(level)*upper {
+				if level < 0 || level > 64 || uint64(len(base)) != input || uint64(len(extra)) != uint64(level)*upper {
 					return nil, errors.New("invalid compact node image")
 				}
-				cut := len(base) - 8
-				if vector == nil {
-					base = append(append([]byte(nil), base[:cut-dimension*4]...), base[cut:]...)
-				} else {
-					v, err := vector(binary.LittleEndian.Uint64(base[cut:]))
+				out = binary.LittleEndian.AppendUint64(out, output)
+				out = append(out, base[:compacted-8]...)
+				label := base[len(base)-8:]
+				if vector != nil {
+					v, err := vector(binary.LittleEndian.Uint64(label))
 					if err != nil {
 						return nil, err
 					}
 					if len(v) != dimension {
 						return nil, errors.New("patch vector dimension mismatch")
 					}
-					full := append([]byte(nil), base[:cut]...)
 					for _, f := range v {
-						full = binary.LittleEndian.AppendUint32(full, math.Float32bits(f))
+						out = binary.LittleEndian.AppendUint32(out, math.Float32bits(f))
 					}
-					base = append(full, base[cut:]...)
 				}
+				out = append(out, label...)
 			}
-			out = binary.LittleEndian.AppendUint32(out, uint32(level))
-			out = binary.LittleEndian.AppendUint64(out, uint64(len(base)))
-			out = append(out, base...)
 			out = binary.LittleEndian.AppendUint64(out, uint64(len(extra)))
 			out = append(out, extra...)
 		}

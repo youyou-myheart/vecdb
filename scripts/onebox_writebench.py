@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
+import threading
 import time
 
 import grpc
@@ -22,6 +24,8 @@ from vectorstore import Client
 
 
 class BenchGuard(ResourceGuard):
+    limit_owned_disk = False
+
     def processes(self):
         return super().processes() + list(self.fixture.drivers)
 
@@ -94,6 +98,7 @@ def catchup(client, load, *, centers, read_state, check_background, logs, drain_
     until = time.monotonic() + drain_seconds
     check_at = 0
     status_read = None
+    attempt, first_probe_ms = 0, None
     # Keep probing while the control plane reads all source and graph positions.
     observer = ThreadPoolExecutor(max_workers=1)
     try:
@@ -102,14 +107,25 @@ def catchup(client, load, *, centers, read_state, check_background, logs, drain_
             if status_read is None and time.monotonic() >= check_at:
                 status_read = observer.submit(read_state)
             sent = time.monotonic()
+            attempt += 1
+            sent_ms = (sent - t0) * 1000
+            if first_probe_ms is None:
+                first_probe_ms = sent_ms
             try:
                 result = client.follower_search(centers[0], k=1, timeout=2)
             except grpc.RpcError as err:
-                observations.append(dict(at_ms=(time.monotonic() - t0) * 1000, grpc_error=err.code().name))
+                observations.append(dict(attempt=attempt, sent_ms=sent_ms, at_ms=(time.monotonic() - t0) * 1000,
+                                         grpc_error=err.code().name))
             else:
-                samples.append(follower_sample(result, len(samples) + 1, sent, time.monotonic(), t0))
+                samples.append(follower_sample(result, attempt, sent, time.monotonic(), t0))
             if status_read is not None and status_read.done():
-                state = status_read.result()
+                try:
+                    state = status_read.result()
+                except TimeoutError as err:
+                    observations.append(dict(at_ms=(time.monotonic() - t0) * 1000, status_error=str(err)))
+                    status_read = None
+                    check_at = time.monotonic() + .5
+                    continue
                 status_read = None
                 data = state['data_progress']
                 assert set(data) == {f'data-{i:04d}' for i in range(len(load['ack_shards']))}
@@ -130,10 +146,13 @@ def catchup(client, load, *, centers, read_state, check_background, logs, drain_
             if frontier:
                 hit = summarize_capture(samples, frontier)
                 if hit and hit['hit']:
+                    hit['first_probe_ms'] = first_probe_ms
                     return dict(status='confirmed', **hit, pinned_durable_events=sum(pinned.values()),
                                 probe_errors=sum('grpc_error' in obs for obs in observations))
             time.sleep(.1)
-        return dict(status='not_confirmed', last_observation=observations[-1] if observations else None,
+        return dict(status='not_confirmed', first_probe_ms=first_probe_ms,
+                    probe_errors=sum('grpc_error' in obs for obs in observations),
+                    last_observation=observations[-1] if observations else None,
                     budget_seconds=drain_seconds)
     finally:
         observer.shutdown(wait=True)
@@ -151,7 +170,30 @@ def ready_follower(client, centers):
     return len(result.follower_reads) == len(centers)
 
 
-def write_window(args, logs, token, drivers, check_background):
+def worker_stage_sample(urls, token):
+    started = time.time_ns()
+    nodes = collect(urls, token)
+    return dict(started_ns=started, captured_ns=time.time_ns(), nodes=nodes)
+
+
+def capture_drain_stages(stop, urls, token, logs, last_ack_ns, before_stop=None):
+    """Sample worker histograms off the Follower Read and status paths."""
+    with (logs / 'worker-stages.jsonl').open('w') as out:
+        def write(sample):
+            sample['since_last_ack_s'] = (sample['captured_ns'] - last_ack_ns) / 1e9
+            out.write(json.dumps(sample) + '\n')
+            out.flush()
+
+        if before_stop is not None:
+            write(before_stop.result())
+        while True:
+            write(worker_stage_sample(urls, token))
+            if stop.is_set():
+                return
+            stop.wait(5)
+
+
+def write_window(args, logs, token, drivers, check_background, before_end=None):
     outputs = []
     barrier = logs / 'start-ns'
     env = dict(os.environ, API_TOKEN=token, GOMAXPROCS='2')
@@ -176,11 +218,16 @@ def write_window(args, logs, token, drivers, check_background):
             raise TimeoutError('load driver readiness')
         time.sleep(.05)
     tmp = barrier.with_suffix('.tmp')
-    tmp.write_text(str(time.time_ns() + 1_000_000_000))
+    start_ns = time.time_ns() + 1_000_000_000
+    sample_at = start_ns + max(0, args.seconds - 2) * 1_000_000_000
+    tmp.write_text(str(start_ns))
     tmp.replace(barrier)
     print('WRITING', args.qps, 'planned RPC/s for', args.seconds, 'seconds', flush=True)
     deadline = time.monotonic() + args.seconds + 12
     while any(p.poll() is None for p in drivers):
+        if before_end is not None and time.time_ns() >= sample_at:
+            before_end()
+            before_end = None
         if time.monotonic() > deadline:
             raise TimeoutError('load drivers')
         time.sleep(.01)
@@ -212,7 +259,7 @@ def run(args):
     args.rounds = 1
     args.latency_only = True
     args.max_seconds = args.seconds + args.drain_seconds + 130
-    reason = limit_reason(host_sample(ROOT))
+    reason = limit_reason(host_sample(ROOT), limit_owned_disk=BenchGuard.limit_owned_disk)
     if reason:
         raise RuntimeError(reason)
     trial = CapacityTrial(args)
@@ -224,8 +271,14 @@ def run(args):
     trial.report.update(kind='open-loop unique vector inserts', qps=args.qps, seconds=args.seconds,
                         write_gateways=args.write_gateways, write_routing=args.write_routing,
                         clients=args.clients, max_inflight_per_client=args.inflight, timeout_seconds=3,
+                        service_gomaxprocs=os.environ.get('GOMAXPROCS', 'runtime default'), client_gomaxprocs=2,
                         background_services=args.background_services, target_met=False)
     try:
+        if sys.platform == 'darwin':
+            trial.report['executables'] = {
+                role: subprocess.check_output(['/usr/bin/file', '-b', str(binary)], text=True).strip()
+                for role, binary in [('server', trial.c.server_binary), ('client', ROOT / '.tools/writebench')]
+            }
         guard.sample()
         guard.thread.start()
         trial.storage.start()
@@ -237,13 +290,21 @@ def run(args):
                 subprocess.run(['/usr/sbin/taskpolicy', '-b', '-p', str(process.pid)], check=True)
         trial.wait('publishers', lambda: publishers_ready(trial.state()))
         trial.wait('data sources', lambda: all(d['owner_available'] for d in trial.state()['data_progress'].values()))
-        with Client(f'127.0.0.1:{args.base_port + 180}', trial.c.env['API_TOKEN']) as reader:
+        with Client(f'127.0.0.1:{args.base_port + 180}', trial.c.env['API_TOKEN']) as reader, ThreadPoolExecutor(max_workers=1) as sampler:
             trial.wait('all follower read paths', lambda: ready_follower(reader, args.centers))
             endpoints = dict(zip(('gateway-0', 'gateway-1'), trial.urls))
             if args.write_stages:
                 before = collect(endpoints, trial.c.env['API_TOKEN'])
             trial.measurements.phase = 'write'
-            load = write_window(args, trial.logs, trial.c.env['API_TOKEN'], trial.drivers, trial.check_background)
+            urls = {name: trial.c.urls[name] for slot, name in trial.slots.items() if slot in (3, 4, 5)}
+            before_stop = None
+
+            def start_stage_sample():
+                nonlocal before_stop
+                before_stop = sampler.submit(worker_stage_sample, urls, trial.c.env['API_TOKEN'])
+
+            load = write_window(args, trial.logs, trial.c.env['API_TOKEN'], trial.drivers, trial.check_background,
+                                before_end=start_stage_sample if args.drain_stages else None)
             trial.report['writes'] = load
             trial.report['target_met'] = load['full_window'] and load['durable_acks'] == load['planned'] and load['ack_after_window'] == 0
             trial.persist()
@@ -253,8 +314,17 @@ def run(args):
                 after = collect(endpoints, trial.c.env['API_TOKEN'])
                 save(trial.logs / 'gateway-stages.json', interval(before, after))
             trial.measurements.phase = 'follower_read'
-            trial.report['catchup'] = catchup(reader, load, centers=trial.centers, read_state=trial.state,
-                check_background=trial.check_background, logs=trial.logs, drain_seconds=args.drain_seconds)
+            stop = threading.Event()
+            if args.drain_stages:
+                stages = sampler.submit(capture_drain_stages, stop, urls, trial.c.env['API_TOKEN'],
+                                        trial.logs, load['last_ack_ns'], before_stop)
+            try:
+                trial.report['catchup'] = catchup(reader, load, centers=trial.centers, read_state=trial.state,
+                    check_background=trial.check_background, logs=trial.logs, drain_seconds=args.drain_seconds)
+            finally:
+                stop.set()
+                if args.drain_stages:
+                    stages.result()
             trial.report['status'] = 'measured'
     except BaseException as exc:
         trial.report.update(status='interrupted', error=repr(exc))
@@ -282,6 +352,8 @@ if __name__ == '__main__':
                         help='number of Gateways receiving inserts; both services stay active')
     parser.add_argument('--write-stages', action='store_true',
                         help='scrape Gateway histograms around the write window; delays first follower probe')
+    parser.add_argument('--drain-stages', action='store_true',
+                        help='sample local Worker stage histograms during catch-up')
     parser.add_argument('--write-routing', choices=('client', 'mixed', 'partition'), default='client',
                         help='assign a Gateway per client, mix each partition across both, or route by partition')
     parser.add_argument('--inflight', type=int, default=128)

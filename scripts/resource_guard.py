@@ -47,17 +47,19 @@ def host_sample(root, pids=()):
         owned_rss_bytes=sum(p['rss_bytes'] for p in owned),owned_processes=owned)
 
 
-def limit_reason(row):
+def limit_reason(row, *, limit_owned_disk=True):
     # Stop below the hard 2 GiB allowance to leave room for shutdown/compaction.
     if row['disk_free_bytes'] <= 15*GIB: return 'disk free at or below 15 GiB'
     if row['memory_pressure'] != 1: return 'macOS memory pressure is not normal'
-    if row.get('owned_bytes',0) >= 1.5*GIB: return 'owned data/logs reached 1.5 GiB soft limit (2 GiB hard budget)'
+    if limit_owned_disk and row.get('owned_bytes',0) >= 1.5*GIB: return 'owned data/logs reached 1.5 GiB soft limit (2 GiB hard budget)'
     if row.get('owned_rss_bytes',0) >= 3*GIB: return 'owned processes reached 3 GiB RSS'
     if row.get('elapsed_seconds',0) >= 240: return 'trial reached 240 second runtime budget'
     return None
 
 
 class ResourceGuard:
+    limit_owned_disk = True
+
     def __init__(self, fixture, report_root):
         self.fixture, self.report_root = fixture, report_root
         self.stop = threading.Event()
@@ -99,7 +101,7 @@ class ResourceGuard:
                     self.stop.wait(2)
                     continue
                 row = self.sample()
-                reason = limit_reason(dict(row, elapsed_seconds=0))
+                reason = limit_reason(dict(row, elapsed_seconds=0), limit_owned_disk=self.limit_owned_disk)
                 if row.get("elapsed_seconds", 0) >= getattr(getattr(self.fixture, "args", None), "max_seconds", 240):
                     reason = reason or "trial reached configured runtime budget"
                 busy = busy+1 if row['system_cpu_percent'] > row['logical_cpus']*80 else 0

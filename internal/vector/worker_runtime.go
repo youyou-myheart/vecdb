@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"example.com/vector-storage/internal/lease"
+	"golang.org/x/sync/errgroup"
 )
 
 type localPartition struct {
@@ -268,8 +269,6 @@ func (c *ClusterService) replicaTick(ctx context.Context) {
 	}
 	checkedPlans := map[IndexPartitionID]bool{}
 	allowed := map[IndexPartitionID]PartitionBinding{}
-	versions := map[IndexPartitionID]uint64{}
-	publishers := map[IndexPartitionID]IndexPartitionID{}
 	plans := map[IndexPartitionID]ReplicaPlan{}
 	for _, b := range c.layout.Bindings {
 		p, e := c.coordinator.planIn(ctx, hints, b.Index)
@@ -280,12 +279,12 @@ func (c *ClusterService) replicaTick(ctx context.Context) {
 		for _, a := range p.Serving {
 			if a.Node == c.node.ID && a.Session == c.node.Session {
 				allowed[a.Partition] = b
-				versions[a.Partition] = p.Version
-				publishers[a.Partition] = p.Publisher
 				plans[a.Partition] = p
 			}
 		}
 	}
+	var renewals errgroup.Group
+	renewals.SetLimit(4)
 	for _, entry := range c.entries() {
 		if c.graphReplication {
 			entry.setMaintenancePlan(plans[entry.owner.Partition])
@@ -307,44 +306,13 @@ func (c *ClusterService) replicaTick(ctx context.Context) {
 			}
 			continue
 		}
-		entry.mu.RLock()
-		ready := entry.service != nil
-		var offset uint64
-		var graphPos GraphPosition
-		var journal *graphJournal
-		if ready {
-			if g := entry.service.graphReplica; g != nil {
-				if g.input != nil {
-					g.input.planChanged(versions[entry.owner.Partition], publishers[entry.owner.Partition])
-				}
-				g.viewMu.RLock()
-				graphPos = g.position
-				g.viewMu.RUnlock()
-				offset = graphPos.DataOffset
-				journal = &g.journal
-			} else {
-				entry.service.syncMu.Lock()
-				offset = entry.service.cursor
-				entry.service.syncMu.Unlock()
-			}
-		}
-		entry.mu.RUnlock()
-		if renewed, e := c.renewReplica(ctx, entry, ready); errors.Is(e, ErrFenced) {
-			c.remove(entry)
-		} else if e == nil && ready {
-			entry.mu.RLock()
-			if entry.service != nil && entry.service.graphReplica != nil {
-				_ = entry.service.graphReplica.refreshLease(ctx, plans[entry.owner.Partition])
-			}
-			entry.mu.RUnlock()
-			id, version := allowed[entry.owner.Partition].Index, versions[entry.owner.Partition]
-			if journal == nil {
-				_ = c.coordinator.ReportReplica(ctx, id, version, entry.owner, "Ready", "", offset)
-			} else {
-				_ = entry.reportGraphProgress(ctx, *journal, version, renewed, graphPos, &c.observations.pipeline)
-			}
-		}
+		binding, plan := allowed[entry.owner.Partition], plans[entry.owner.Partition]
+		renewals.Go(func() error {
+			c.renewAssignedReplica(ctx, entry, binding, plan)
+			return nil
+		})
 	}
+	_ = renewals.Wait()
 	for id, b := range allowed {
 		c.mu.Lock()
 		_, exists := c.locals[id]
@@ -357,5 +325,45 @@ func (c *ClusterService) replicaTick(ctx context.Context) {
 			continue
 		}
 		c.startLoad(ctx, b, o)
+	}
+}
+
+func (c *ClusterService) renewAssignedReplica(ctx context.Context, entry *localPartition, binding PartitionBinding, plan ReplicaPlan) {
+	entry.mu.RLock()
+	ready := entry.service != nil
+	var offset uint64
+	var graphPos GraphPosition
+	var journal *graphJournal
+	if ready {
+		if g := entry.service.graphReplica; g != nil {
+			if g.input != nil {
+				g.input.planChanged(plan.Version, plan.Publisher)
+			}
+			g.viewMu.RLock()
+			graphPos = g.position
+			g.viewMu.RUnlock()
+			offset = graphPos.DataOffset
+			journal = &g.journal
+		} else {
+			entry.service.syncMu.Lock()
+			offset = entry.service.cursor
+			entry.service.syncMu.Unlock()
+		}
+	}
+	entry.mu.RUnlock()
+	if renewed, e := c.renewReplica(ctx, entry, ready); errors.Is(e, ErrFenced) {
+		c.remove(entry)
+	} else if e == nil && ready {
+		entry.mu.RLock()
+		if entry.service != nil && entry.service.graphReplica != nil {
+			_ = entry.service.graphReplica.refreshLease(ctx, plan)
+		}
+		entry.mu.RUnlock()
+		id, version := binding.Index, plan.Version
+		if journal == nil {
+			_ = c.coordinator.ReportReplica(ctx, id, version, entry.owner, "Ready", "", offset)
+		} else {
+			_ = entry.reportGraphProgress(ctx, *journal, version, renewed, graphPos, &c.observations.pipeline)
+		}
 	}
 }

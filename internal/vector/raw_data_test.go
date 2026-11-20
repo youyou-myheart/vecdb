@@ -340,7 +340,7 @@ func TestRawGroupLimitsConcurrentWritesAndBatchSize(t *testing.T) {
 		if len(keys) != 1 {
 			return 0, errors.New("raw batch split into multiple keys")
 		}
-		var envelope rawAcceptedBatch
+		var envelope mutationLogBatch
 		if err := json.Unmarshal(values[0], &envelope); err != nil {
 			return 0, err
 		}

@@ -6,6 +6,9 @@ import (
 	"errors"
 	"example.com/vector-storage/internal/ann"
 	"fmt"
+	"maps"
+	"math"
+	"slices"
 )
 
 const referenceDeltaFormat = "hnsw-data-reference-v1"
@@ -28,14 +31,27 @@ type ReferenceDelta struct {
 	Changes []ReferenceChange `json:"changes"`
 }
 
-func recordHash(r Record) string { b, _ := json.Marshal(r); return fmt.Sprintf("%x", sha256.Sum256(b)) }
+func hashRecord(r Record) string { b, _ := json.Marshal(r); return fmt.Sprintf("%x", sha256.Sum256(b)) }
+
+var absentRecordHash = hashRecord(Record{})
+
+func recordHash(r Record) string {
+	if r.Revision == 0 && r.ID == "" && !r.Deleted && len(r.Vector) == 0 && len(r.Payload) == 0 {
+		return absentRecordHash
+	}
+	return hashRecord(r)
+}
 
 func referenceDelta(d GraphDelta, inputs []Delivery) ([]byte, error) {
-	refs := map[string]DataReference{}
+	type sourceEvent struct {
+		source DataPartitionID
+		event  LogEvent
+	}
+	refs := make(map[string]sourceEvent, len(d.Records))
 	for _, q := range inputs {
 		for _, e := range q.Events {
-			if old, ok := refs[e.Record.ID]; !ok || e.Record.Revision > old.Revision {
-				refs[e.Record.ID] = DataReference{q.Source, e.Sequence, e.Record.ID, e.Record.Revision, recordHash(e.Record)}
+			if old, ok := refs[e.Record.ID]; !ok || e.Record.Revision > old.event.Record.Revision {
+				refs[e.Record.ID] = sourceEvent{q.Source, e}
 			}
 		}
 	}
@@ -52,11 +68,13 @@ func referenceDelta(d GraphDelta, inputs []Delivery) ([]byte, error) {
 			// Scrub removes misplaced records without inventing a source event.
 			change.Tombstone = Record{ID: ch.After.ID, Revision: ch.After.Revision, Deleted: true}
 		} else {
-			ref, ok := refs[ch.After.ID]
-			if !ok || ref.Revision != ch.After.Revision || ref.Hash != recordHash(ch.After) {
+			src, ok := refs[ch.After.ID]
+			r := src.event.Record
+			if !ok || r.Deleted || r.Revision != ch.After.Revision || !maps.Equal(r.Payload, ch.After.Payload) ||
+				!slices.EqualFunc(r.Vector, ch.After.Vector, func(a, b float64) bool { return math.Float64bits(a) == math.Float64bits(b) }) {
 				return nil, errors.New("graph mutation lacks an exact data log reference")
 			}
-			change.Ref = &ref
+			change.Ref = &DataReference{src.source, src.event.Sequence, r.ID, r.Revision, recordHash(r)}
 		}
 		w.Changes = append(w.Changes, change)
 	}

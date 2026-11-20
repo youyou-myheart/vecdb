@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"example.com/vector-storage/internal/lease"
+	"example.com/vector-storage/internal/shardlog"
 )
 
 // op serializes graph appends, including epoch barriers and maintenance. mu
@@ -16,7 +17,7 @@ type indexWriter struct {
 	op             sync.Mutex
 	mu             sync.Mutex
 	lease          indexLease
-	leaderLease    lease.Handle
+	leaderLease    shardlog.Node
 	replicaLease   *lease.Handle
 	publisher      IndexPartitionID
 	publisherRoute Assignment
@@ -37,22 +38,17 @@ func cloneGraphHead(h GraphHead) GraphHead {
 func (w *indexWriter) snapshot() (GraphHead, []byte, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if !w.replicaLive() || !w.leaderLease.InLeaderLease(nil) || !w.known {
+	grant, live := w.leaderLease.Snapshot()
+	if !w.replicaLive() || !live || grant.Epoch != w.lease.Generation || !w.known {
 		return GraphHead{}, nil, ErrFenced
 	}
 	return cloneGraphHead(w.head), w.lease.token(), nil
 }
 func (w *indexWriter) authority(token []byte) error {
-	return w.appendAuthority(token, nil)
-}
-func (w *indexWriter) appendAuthority(token []byte, tx transactionAPI) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	grant, ok := w.leaderLease.Snapshot()
-	if !ok || !w.replicaLive() || string(token) != string(w.lease.token()) {
-		return ErrFenced
-	}
-	if tx != nil && txnMillis(tx) >= grant.Expires {
+	if !ok || grant.Epoch != w.lease.Generation || !w.replicaLive() || string(token) != string(w.lease.token()) {
 		return ErrFenced
 	}
 	return nil
@@ -61,7 +57,7 @@ func (w *indexWriter) commitExpiry(token []byte) (int64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	leader, ok := w.leaderLease.Snapshot()
-	if !ok || w.replicaLease == nil || string(token) != string(w.lease.token()) {
+	if !ok || leader.Epoch != w.lease.Generation || w.replicaLease == nil || string(token) != string(w.lease.token()) {
 		return 0, ErrFenced
 	}
 	replica, ok := w.replicaLease.Snapshot()
@@ -79,7 +75,7 @@ func (w *indexWriter) invalidate() {
 }
 func (w *indexWriter) retire() {
 	w.mu.Lock()
-	w.leaderLease.Retire()
+	w.leaderLease.StepDown()
 	w.known = false
 	w.mu.Unlock()
 }
@@ -101,7 +97,8 @@ func (g *graphReplica) syncLeased(ctx context.Context, s *Service, rebuild bool,
 	defer w.op.Unlock()
 	w.mu.Lock()
 	live := w.replicaLive()
-	leader := w.leaderLease.InLeaderLease(nil)
+	grant, liveGrant := w.leaderLease.Snapshot()
+	leader := liveGrant && grant.Epoch == w.lease.Generation
 	expectedLeader := w.publisher == g.journal.owner.Partition
 	known := w.known
 	generation := w.lease.Generation

@@ -83,7 +83,7 @@ func TestRawTiKVFallbackReadsContiguousBatchKeys(t *testing.T) {
 	if empty, err := reader.snapshot(ctx, repo.Prefix); err != nil || empty.end != 0 {
 		t.Fatal(empty, err)
 	}
-	var batches []rawAcceptedBatch
+	var batches []mutationLogBatch
 	for _, id := range []string{"a", "b", "c"} {
 		_, b, err := writer.prepare([]*mutationRequest{rawTestRequest(t, repo, id, id)})
 		if err != nil {

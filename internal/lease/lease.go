@@ -26,6 +26,8 @@ type Snapshot struct {
 type Handle struct {
 	mu      sync.Mutex
 	retired bool
+	last    *Snapshot // highest confirmed grant, retained after expiry
+	timer   *time.Timer
 	current atomic.Pointer[Snapshot]
 }
 
@@ -39,12 +41,19 @@ func (h *Handle) Confirm(started time.Time, grant Grant) bool {
 	if h.retired || grant.Epoch == 0 || !time.Now().Before(deadline) {
 		return false
 	}
-	if prev := h.current.Load(); prev != nil {
+	if prev := h.last; prev != nil {
 		if grant.Epoch < prev.Epoch || grant.Epoch == prev.Epoch && grant.Expires < prev.Expires {
 			return false
 		}
 	}
-	h.current.Store(&Snapshot{Epoch: grant.Epoch, Expires: grant.Expires, Deadline: deadline})
+	if h.timer != nil {
+		h.timer.Stop()
+	}
+	next := &Snapshot{Epoch: grant.Epoch, Expires: grant.Expires, Deadline: deadline}
+	h.last = next
+	h.current.Store(next)
+	// A callback already running during renewal can withdraw only its own grant.
+	h.timer = time.AfterFunc(time.Until(deadline), func() { h.current.CompareAndSwap(next, nil) })
 	return true
 }
 
@@ -52,8 +61,17 @@ func (h *Handle) Confirm(started time.Time, grant Grant) bool {
 func (h *Handle) Retire() {
 	h.mu.Lock()
 	h.retired = true
+	if h.timer != nil {
+		h.timer.Stop()
+	}
 	h.current.Store(nil)
 	h.mu.Unlock()
+}
+
+// ActiveTerm reads the state published by the control loop and expiry timer.
+func (h *Handle) ActiveTerm(term uint64) bool {
+	s := h.current.Load()
+	return s != nil && s.Epoch == term
 }
 
 // Snapshot returns the current grant only while its local monotonic deadline

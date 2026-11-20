@@ -3,6 +3,7 @@ package vector
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -54,8 +55,8 @@ func TestReferenceGraphReplaysHistoricalDataWithoutObjects(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if e.Payload == nil || e.Object.Key != "" {
-			t.Fatal("normal delta still uses S3")
+		if e.Payload == nil || e.Payload.Chunks != 0 || len(e.PayloadData) != e.Payload.Size || e.Object.Key != "" {
+			t.Fatal("expected inline graph delta")
 		}
 		payload, err := a.graphReplica.journal.loadPayload(f.ctx, e)
 		if err != nil {
@@ -75,7 +76,7 @@ func TestReferenceGraphReplaysHistoricalDataWithoutObjects(t *testing.T) {
 }
 
 func TestReferenceReplayRejectsMissingOrCorruptDependencies(t *testing.T) {
-	for _, damage := range []string{"missing_event", "wrong_event", "missing_chunk", "wrong_chunk"} {
+	for _, damage := range []string{"missing_event", "wrong_event", "missing_inline", "wrong_inline"} {
 		t.Run(damage, func(t *testing.T) {
 			f := newGraphFixture(t)
 			enableReferences(f)
@@ -85,12 +86,26 @@ func TestReferenceReplayRejectsMissingOrCorruptDependencies(t *testing.T) {
 				t.Fatal(err)
 			}
 			key := string(f.r.logKey(1))
-			if damage == "missing_chunk" || damage == "wrong_chunk" {
-				key = string(a.graphReplica.journal.payloadKey(1, 0))
-			}
-			if damage == "missing_event" || damage == "missing_chunk" {
+			switch damage {
+			case "missing_inline", "wrong_inline":
+				key = string(a.graphReplica.journal.key("entries/00000000000000000001"))
+				var entry GraphEntry
+				if err := decodeGraphEntry(f.db.data[key], &entry, true); err != nil {
+					t.Fatal(err)
+				}
+				if damage == "missing_inline" {
+					entry.PayloadData = nil
+				} else {
+					entry.PayloadData[0] ^= 1
+				}
+				raw, err := encodeGraphEntry(entry)
+				if err != nil {
+					t.Fatal(err)
+				}
+				f.db.data[key] = raw
+			case "missing_event":
 				delete(f.db.data, key)
-			} else {
+			case "wrong_event":
 				f.db.data[key] = []byte(`{"sequence":1,"record":{"id":"wrong","revision":1,"vector":[1,2]}}`)
 			}
 			if err := b.Sync(f.ctx); err == nil {
@@ -100,6 +115,64 @@ func TestReferenceReplayRejectsMissingOrCorruptDependencies(t *testing.T) {
 				t.Fatal("partial graph published")
 			}
 		})
+	}
+}
+
+// Construct the pre-inline representation to exercise recovery without a migration.
+func TestReferenceReplayAndGCOfLegacyChunks(t *testing.T) {
+	f := newGraphFixture(t)
+	enableReferences(f)
+	a, b := f.services[0], f.services[1]
+	j := a.graphReplica.journal
+	f.write(t, "legacy", false)
+	if err := a.Sync(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	e, err := j.Entry(f.ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := append(e.PayloadData, bytes.Repeat([]byte(" "), graphPayloadChunk)...)
+	e.PayloadData = nil
+	e.Payload = &GraphPayload{Size: len(raw), Chunks: 2, SHA256: fmt.Sprintf("%x", sha256.Sum256(raw))}
+	e.Position.Hash = entryHash(e)
+	seed(f.db, j.key("entries/00000000000000000001"), e)
+	f.db.data[string(j.payloadKey(1, 0))] = raw[:graphPayloadChunk]
+	lastKey := string(j.payloadKey(1, 1))
+	a.graphReplica.position = e.Position
+	if err := b.Sync(f.ctx); err == nil || b.graphReplica.position.Sequence != 0 {
+		t.Fatal("accepted a missing legacy chunk")
+	}
+	damaged := bytes.Clone(raw[graphPayloadChunk:])
+	damaged[0] ^= 1
+	f.db.data[lastKey] = damaged
+	if err := b.Sync(f.ctx); err == nil || b.graphReplica.position.Sequence != 0 {
+		t.Fatal("accepted a corrupt legacy chunk")
+	}
+	f.db.data[lastKey] = raw[graphPayloadChunk:]
+	if err = b.Sync(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	equalGraph(t, a.Index, b.Index)
+	f.write(t, "inline", false)
+	if err = a.Sync(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = b.Sync(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	equalGraph(t, a.Index, b.Index)
+	if _, err = a.Checkpoint(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	pos, err := j.Prune(f.ctx, a.graphReplica.repo, 256)
+	if err != nil || pos.Sequence != 2 {
+		t.Fatal(pos, err)
+	}
+	for n := 0; n < 2; n++ {
+		if _, ok := f.db.data[string(j.payloadKey(1, n))]; ok {
+			t.Fatal("legacy chunk leaked", n)
+		}
 	}
 }
 
@@ -213,6 +286,15 @@ func TestReferenceGCProtectsPinnedGraphData(t *testing.T) {
 		}
 	}
 	seed(f.db, completedKey(f.r), uint64(2))
+	expectMaintenance := func(want bool) {
+		t.Helper()
+		owners, err := c.dataMaintenanceCandidates(f.ctx, map[DataPartitionID]Ownership{0: owner})
+		got, selected := owners[0]
+		if err != nil || selected != want || selected && got != owner {
+			t.Fatalf("maintenance candidate: selected=%v want=%v err=%v", selected, want, err)
+		}
+	}
+	expectMaintenance(false)
 	safe := func() uint64 {
 		tx, _ := f.r.begin()
 		defer tx.Rollback()
@@ -240,6 +322,10 @@ func TestReferenceGCProtectsPinnedGraphData(t *testing.T) {
 	if safe() != 1 {
 		t.Fatal("remaining graph references not protected", safe())
 	}
+	expectMaintenance(true)
+	seed(f.db, completedKey(f.r), uint64(0))
+	expectMaintenance(false)
+	seed(f.db, completedKey(f.r), uint64(2))
 	e, err := a.graphReplica.journal.Entry(f.ctx, 3)
 	if err != nil {
 		t.Fatal(err)
@@ -269,6 +355,7 @@ func TestReferenceGCProtectsPinnedGraphData(t *testing.T) {
 	if batch, err := f.r.ReadEvents(f.ctx, 0, 0, 10); !errors.Is(err, ErrLogCompacted) || batch.Floor != 2 {
 		t.Fatal("automatic data snapshot/GC failed", batch, err)
 	}
+	expectMaintenance(false)
 	if err = b.Sync(f.ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -313,9 +400,9 @@ func TestReferenceAppendFailureAndUnknownOutcome(t *testing.T) {
 			if h.Committed.Sequence != 1+want || h.Sources["0"] != want {
 				t.Fatal("partial source ACK", h)
 			}
-			_, exists := f.db.data[string(g.journal.payloadKey(2, 0))]
+			_, exists := f.db.data[string(g.journal.key("entries/00000000000000000002"))]
 			if exists != unknown {
-				t.Fatal("orphan/missing payload")
+				t.Fatal("unexpected durable entry after uncertain append")
 			}
 			if err = g.enqueue(f.ctx, q); err != nil {
 				t.Fatal(err)

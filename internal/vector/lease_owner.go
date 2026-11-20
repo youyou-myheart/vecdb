@@ -134,7 +134,7 @@ func (c *Coordinator) Acquire(ctx context.Context, id IndexPartitionID, node Clu
 	if e = putJSON(tx, c.fenceKey(id), o); e != nil {
 		return o, e
 	}
-	if c.root.raw == nil && strings.HasPrefix(string(id), "data-") {
+	if c.root.raw == nil && c.root.packed == nil && strings.HasPrefix(string(id), "data-") {
 		if e = tx.Set(c.writeGuardKey(id), epochToken(o.Epoch)); e != nil {
 			return o, e
 		}
@@ -189,7 +189,7 @@ func (c *Coordinator) update(ctx context.Context, expected Ownership, ready, rel
 		return o, e
 	}
 	if release {
-		if c.root.raw == nil && strings.HasPrefix(string(o.Partition), "data-") {
+		if c.root.raw == nil && c.root.packed == nil && strings.HasPrefix(string(o.Partition), "data-") {
 			if e = tx.Set(c.writeGuardKey(o.Partition), epochToken(0)); e != nil {
 				return o, e
 			}
@@ -237,13 +237,21 @@ func (c *Coordinator) Fence(expected Ownership) func(context.Context, transactio
 
 // Return the grant verified at this transaction's timestamp so a dependent
 // lease can use its expiry without another KV read.
-func (c *Coordinator) fenceOwner(ctx context.Context, tx transactionAPI, expected Ownership) (Ownership, error) {
+func (c *Coordinator) liveOwner(ctx context.Context, tx transactionAPI, expected Ownership) (Ownership, error) {
 	o, err := c.readOwner(ctx, tx, expected.Partition)
 	if err != nil {
 		return o, err
 	}
 	if !sameOwner(o, expected) || !o.Ready || o.Expires <= txnMillis(tx) {
 		return o, ErrFenced
+	}
+	return o, nil
+}
+
+func (c *Coordinator) fenceOwner(ctx context.Context, tx transactionAPI, expected Ownership) (Ownership, error) {
+	o, err := c.liveOwner(ctx, tx, expected)
+	if err != nil {
+		return o, err
 	}
 	b, err := tx.Get(ctx, c.fenceKey(o.Partition))
 	if err != nil {

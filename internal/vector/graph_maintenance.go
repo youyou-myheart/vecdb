@@ -40,7 +40,7 @@ func (j graphJournal) nextCheckpoint(ctx context.Context, bytes uint64, age time
 		return h, 0, nil
 	}
 	var first GraphEntry
-	if err = readJSON(ctx, tx, j.key(fmt.Sprintf("entries/%020d", h.CheckpointPosition.Sequence+1)), &first); err != nil {
+	if err = readGraphEntry(ctx, tx, j.stream().Key(h.CheckpointPosition.Sequence+1), &first, false); err != nil {
 		return h, 0, err
 	}
 	if first.CreatedMS <= 0 {
@@ -170,31 +170,16 @@ func (c *ClusterService) retainGraphReferences(ctx context.Context, tx transacti
 	if end <= floor {
 		return floor, nil
 	}
-	commits := map[IndexPartitionID]uint64{}
-	// FloorSources lives in the control anchor and changes only with graph GC.
-	// Reading immutable tails here is both unnecessary and expensive: it would
-	// multiply reverse scans by data partitions * index partitions every tick.
-	keys := make([][]byte, len(c.layout.Bindings))
-	for n, b := range c.layout.Bindings {
-		keys[n] = (graphJournal{c: c.coordinator, id: b.Index}).key("head")
-	}
-	values, err := batchGet(ctx, tx, keys)
+	floors, err := c.retiredGraphSources(ctx, tx)
 	if err != nil {
 		return 0, err
 	}
+	source := fmt.Sprint(d)
+	commits := make(map[IndexPartitionID]uint64, len(floors))
 	var maximum uint64
-	for n, b := range c.layout.Bindings {
-		var h GraphHead
-		if raw, ok := values[string(keys[n])]; ok {
-			if err = json.Unmarshal(raw, &h); err != nil {
-				return 0, err
-			}
-		}
-		if h.Floor.Sequence > h.CheckpointPosition.Sequence {
-			return 0, errors.New("graph floor exceeds recovery checkpoint")
-		}
-		commits[b.Index] = h.FloorSources[fmt.Sprint(d)]
-		maximum = max(maximum, commits[b.Index])
+	for id, retired := range floors {
+		commits[id] = retired[source]
+		maximum = max(maximum, commits[id])
 	}
 	if maximum <= floor {
 		return floor, nil
@@ -204,6 +189,85 @@ func (c *ClusterService) retainGraphReferences(ctx context.Context, tx transacti
 		return 0, err
 	}
 	return completedPrefix(batch.Events, floor, c.eventTargets, commits), nil
+}
+
+func (c *ClusterService) retiredGraphSources(ctx context.Context, tx transactionAPI) (map[IndexPartitionID]map[string]uint64, error) {
+	// FloorSources lives in the control anchor and changes only with graph GC.
+	// Reading immutable tails here is both unnecessary and expensive: it would
+	// multiply reverse scans by data partitions * index partitions every tick.
+	keys := make([][]byte, len(c.layout.Bindings))
+	for n, b := range c.layout.Bindings {
+		keys[n] = (graphJournal{c: c.coordinator, id: b.Index}).key("head")
+	}
+	values, err := batchGet(ctx, tx, keys)
+	if err != nil {
+		return nil, err
+	}
+	sources := make(map[IndexPartitionID]map[string]uint64, len(keys))
+	for n, b := range c.layout.Bindings {
+		var h GraphHead
+		if raw, ok := values[string(keys[n])]; ok {
+			if err = json.Unmarshal(raw, &h); err != nil {
+				return nil, err
+			}
+		}
+		if h.Floor.Sequence > h.CheckpointPosition.Sequence {
+			return nil, errors.New("graph floor exceeds recovery checkpoint")
+		}
+		sources[b.Index] = h.FloorSources
+	}
+	return sources, nil
+}
+
+// Each worker preflights all its owned sources at a single MVCC snapshot.
+// A zero retired watermark or an already reclaimed prefix needs no per-source
+// transaction. Positive candidates still pass every check inside maintainData.
+func (c *ClusterService) dataMaintenanceCandidates(ctx context.Context, owners map[DataPartitionID]Ownership) (map[DataPartitionID]Ownership, error) {
+	if len(owners) == 0 {
+		return nil, nil
+	}
+	tx, err := c.root.begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	floors, err := c.retiredGraphSources(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	var keys [][]byte
+	limits := make(map[DataPartitionID]uint64, len(owners))
+	for d := range owners {
+		source := fmt.Sprint(d)
+		var highest uint64
+		for _, retired := range floors {
+			highest = max(highest, retired[source])
+		}
+		if highest == 0 {
+			delete(owners, d)
+			continue
+		}
+		limits[d] = highest
+		keys = append(keys, []byte(c.data[d].Prefix+"log-floor"), completedKey(c.data[d]))
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	values, err := batchGet(ctx, tx, keys)
+	if err != nil {
+		return nil, err
+	}
+	cached := prefetchedTransaction{transactionAPI: tx, values: values}
+	for d, highest := range limits {
+		floor, floorErr := c.data[d].readCounter(ctx, cached, "log-floor")
+		done, doneErr := c.completedIn(ctx, cached, d)
+		// Leave malformed counters to the owning source's maintenance path
+		// so it reports the error independently of healthy local sources.
+		if floorErr == nil && doneErr == nil && min(highest, done) <= floor {
+			delete(owners, d)
+		}
+	}
+	return owners, ctx.Err()
 }
 
 // Start maintenance for live local writers. Publishing and pruning still
@@ -229,7 +293,16 @@ func (c *ClusterService) dataMaintenanceLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
-		for d, owner := range c.localDataOwners() {
+		measure := c.observations.pipeline.track("data_gc_preflight", "")
+		owners, err := c.dataMaintenanceCandidates(ctx, c.localDataOwners())
+		measure(&err)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("data maintenance preflight: %v", err)
+			}
+			continue
+		}
+		for d, owner := range owners {
 			work, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			measure := c.observations.pipeline.track("data_checkpoint_gc", string(sourceID(d)))
 			err := c.maintainData(work, d, owner)
