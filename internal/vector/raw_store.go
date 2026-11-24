@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/tikv/client-go/v2/rawkv"
 )
 
@@ -66,7 +67,9 @@ func openRawDataStore(ctx context.Context, pd []string, namespace string) (*rawD
 	if len(pd) == 0 {
 		return nil, errors.New("raw data backend requires PD endpoints")
 	}
-	client, err := rawkv.NewClientWithOpts(ctx, pd)
+	// API v2 isolates these direct writes from the transactional ownership
+	// metadata and gives both clients compatible region boundaries.
+	client, err := rawkv.NewClientWithOpts(ctx, pd, rawkv.WithAPIVersion(kvrpcpb.APIVersion_V2))
 	if err != nil {
 		return nil, err
 	}

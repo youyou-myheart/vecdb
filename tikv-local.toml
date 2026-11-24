@@ -1,6 +1,10 @@
 # Local development only. Keep disk protection enabled within a small capacity budget.
 memory-usage-limit = "2GiB"
 [storage]
+# RawKV logs and TxnKV ownership metadata coexist only with API v2.
+# Existing API v1 data needs migration to a new cluster; do not reuse its directory.
+api-version = 2
+enable-ttl = true
 reserve-space = "512MiB"
 [storage.block-cache]
 capacity = "256MiB"

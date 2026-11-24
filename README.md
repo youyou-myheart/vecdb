@@ -44,6 +44,10 @@ onebox 默认分片数现为 32；负载放置调度使用 `--replicas 2 --sched
 
 ## 启动基础组件
 
+服务统一使用 TiKV API v2，让普通日志写入和选主事务安全地共用 TiKV。服务端必须设置 `[storage]` 下的 `api-version = 2` 和 `enable-ttl = true`；仓库内的本机、CI 和压测配置已经启用。普通日志仍使用 RawKV `BatchPut`，不会因此增加事务。
+
+**旧数据升级：不能直接把已有 API v1 数据目录改成 v2，也不能只换 namespace。** 请保留原集群与备份，停止旧服务后，将数据迁移到单独部署的 API v2 集群，再切换服务。当前代码不会自动迁移、清空旧数据或退回 v1。已有日志和元数据都需要迁移，不能只复制 SeaweedFS 的图快照。此处的格式兼容要求见 [TiKV API v2 官方说明](https://tikv.org/docs/7.1/concepts/explore-tikv-features/api-v2/)。长期运行还需要配置 TiKV 的旧版本数据回收；短期独立测试在结束时清理本轮数据。
+
 实测 PD/TiKV 8.5.8、SeaweedFS 4.53，macOS ARM64。安装包和 Go 缓存在 `.tools/`，数据在 `.state/`。已有本次安装包时，在三个终端分别启动，已运行的组件不要重复启动：
 
 ```bash

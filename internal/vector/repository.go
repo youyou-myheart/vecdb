@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	tikverr "github.com/tikv/client-go/v2/error"
 	"github.com/tikv/client-go/v2/txnkv"
 	"github.com/tikv/client-go/v2/txnkv/transaction"
@@ -57,14 +58,16 @@ func NewRepository(pd []string, namespace string, dimension int) (*Repository, e
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	c, err := txnkv.NewClient(pd)
+	// Raw logs and transactional ownership metadata share this TiKV cluster.
+	// API v1 cannot safely mix them, including at automatic region splits.
+	c, err := txnkv.NewClient(pd, txnkv.WithAPIVersion(kvrpcpb.APIVersion_V2))
 	if err != nil {
 		return nil, err
 	}
 	r := &Repository{Client: c, Prefix: "vector-v0/" + hex.EncodeToString([]byte(namespace)) + "/", Dimension: dimension, pd: append([]string(nil), pd...)}
 	if err = r.ensureSchema(ctx); err != nil {
 		c.Close()
-		return nil, err
+		return nil, fmt.Errorf("open collection on TiKV API v2 (requires storage.api-version=2 and storage.enable-ttl=true; existing API v1 data must be migrated to a new cluster): %w", err)
 	}
 	return r, nil
 }

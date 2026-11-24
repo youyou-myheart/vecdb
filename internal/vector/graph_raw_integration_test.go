@@ -62,6 +62,10 @@ func TestGraphRawTiKVAppendAndSeal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(probe.keys) != 1 {
+		t.Fatal("expected one raw graph append", probe.keys)
+	}
+	splitRawRegion(t, f.ctx, store.client.(tikvRawDataClient), probe.keys[0])
 	old, err := g.journal.Head(f.ctx)
 	if err != nil || old.Committed.Sequence != 1 || old.SourceEpochs["0"] != f.source.Epoch ||
 		old.RawActive == nil || len(probe.keys) != 1 ||
