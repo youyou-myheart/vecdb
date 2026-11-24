@@ -40,7 +40,7 @@ func (j graphJournal) nextCheckpoint(ctx context.Context, bytes uint64, age time
 		return h, 0, nil
 	}
 	var first GraphEntry
-	if err = readGraphEntry(ctx, tx, j.stream().Key(h.CheckpointPosition.Sequence+1), &first, false); err != nil {
+	if err = j.readEntryIn(ctx, tx, h, h.CheckpointPosition.Sequence+1, &first, false); err != nil {
 		return h, 0, err
 	}
 	if first.CreatedMS <= 0 {
@@ -248,7 +248,7 @@ func (c *ClusterService) dataMaintenanceCandidates(ctx context.Context, owners m
 			continue
 		}
 		limits[d] = highest
-		keys = append(keys, []byte(c.data[d].Prefix+"log-floor"), completedKey(c.data[d]))
+		keys = append(keys, []byte(c.data[d].Prefix+"log-floor"), completedKey(c.data[d]), c.coordinator.ownerKey(sourceID(d)))
 	}
 	if len(keys) == 0 {
 		return nil, nil

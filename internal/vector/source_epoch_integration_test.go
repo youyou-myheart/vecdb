@@ -234,7 +234,7 @@ func TestSourceEpochTiKVStaleSnapshotCannotAppendAfterBarrierOrGC(t *testing.T) 
 					if e := a.Sync(f.ctx); e != nil {
 						return e
 					}
-					if e := f.c.advanceCompleted(f.ctx, 0, f.source, 0, 1); e != nil {
+					if _, e := f.c.coordinator.update(f.ctx, f.source, true, false, func(o *Ownership) { o.Offset = 1 }); e != nil {
 						return e
 					}
 					if _, e := a.Checkpoint(f.ctx); e != nil {

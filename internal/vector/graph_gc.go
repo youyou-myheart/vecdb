@@ -3,6 +3,7 @@ package vector
 import (
 	"context"
 	"errors"
+	"slices"
 )
 
 // Deletion is bounded, snapshot-certified and serialized against consumer lease
@@ -43,9 +44,8 @@ func (j graphJournal) Prune(ctx context.Context, r *Repository, limit int) (Grap
 	pos := h.Floor
 	for n := pos.Sequence; n < end; {
 		n++
-		key := j.stream().Key(n)
 		var entry GraphEntry
-		if e = readGraphEntry(ctx, tx, key, &entry, false); e != nil {
+		if e = j.readEntryIn(ctx, tx, h, n, &entry, false); e != nil {
 			return h.Floor, e
 		}
 		if entry.Previous != pos || entry.Position.Sequence != n || entryHash(entry) != entry.Position.Hash {
@@ -54,8 +54,10 @@ func (j graphJournal) Prune(ctx context.Context, r *Repository, limit int) (Grap
 		if e = j.retireObject(ctx, tx, r, entry.Object); e != nil {
 			return h.Floor, e
 		}
-		if e = tx.Delete(key); e != nil {
-			return h.Floor, e
+		if _, raw := j.rawStreamAt(h, n); !raw {
+			if e = tx.Delete(j.stream().Key(n)); e != nil {
+				return h.Floor, e
+			}
 		}
 		if p := entry.Payload; p != nil {
 			if !p.validSize() {
@@ -77,6 +79,7 @@ func (j graphJournal) Prune(ctx context.Context, r *Repository, limit int) (Grap
 		return pos, nil
 	}
 	h.Floor = pos
+	h.RawSealed = slices.DeleteFunc(h.RawSealed, func(run graphRawRun) bool { return run.Through <= pos.Sequence })
 	if e = putJSON(tx, j.key("head"), h); e != nil {
 		return pos, e
 	}

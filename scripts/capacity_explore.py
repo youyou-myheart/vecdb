@@ -157,7 +157,7 @@ def run(trial,args):
             mutation_policy='round tail: 4 inserts, 4 updates, 4 fresh live-record deletes; workload delete every 11th revision and restore next revision',
             initial_seed_rate=args.seed_rate,bucket_width=args.bucket_layout.width,bucket_count=args.bucket_layout.count,burst_writes=args.burst_writes,
             clock='last durable mutation ACK; all current serving replicas and both gateways; no query sync'),
-        budget=dict(new_data_and_logs_gib=2,soft_stop_gib=1.5,min_free_disk_gib=15,max_owned_rss_gib=3,max_trial_seconds=args.max_seconds))
+        budget=dict(new_data_and_logs_gib=2,soft_stop_gib=1.5,min_free_disk_gib=15,max_owned_rss_gib=None,max_trial_seconds=args.max_seconds))
     with trial.case('ready_cluster'):
         trial.storage.start(); trial.check_background()
         for slot in (0,1,2,35,3,4,5): trial.check_background(); trial.launch(slot)

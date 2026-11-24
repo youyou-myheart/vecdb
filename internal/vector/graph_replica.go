@@ -61,7 +61,7 @@ func newGraphServiceWithPolicy(ctx context.Context, r *Repository, o ObjectAPI, 
 			s.Index.graph.Close()
 		}
 	}()
-	head, e := j.Head(ctx)
+	head, e := j.bootstrapHead(ctx)
 	if e != nil {
 		return nil, e
 	}

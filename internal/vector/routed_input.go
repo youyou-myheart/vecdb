@@ -82,7 +82,7 @@ func (g *graphReplica) enqueue(ctx context.Context, q Delivery) (err error) {
 	}()
 	var h GraphHead
 	var e error
-	q.foldEpoch = g.repo.packed != nil && q.verified && g.writer != nil
+	q.foldEpoch = (g.repo.packed != nil || g.journal.c.rawGraph != nil) && q.verified && g.writer != nil
 	if g.writer != nil {
 		h, e = g.admitLeased(ctx, q)
 	} else {
@@ -316,12 +316,27 @@ func (g *graphReplica) scrub(ctx context.Context, s *Service) error {
 	if len(removes) > 0 {
 		if g.writer != nil {
 			g.writer.op.Lock()
-			g.writer.invalidate()
-		}
-		e = g.commitRecords(ctx, s, h, removes, nil)
-		if g.writer != nil {
+			if g.journal.c.rawGraph != nil {
+				h, _, e = g.writer.snapshot()
+				if e == nil {
+					g.fastAppend = true
+					e = g.commitRecords(ctx, s, h, removes, nil)
+					g.fastAppend = false
+				}
+				if e == nil {
+					e = g.applyPrepared(s)
+				}
+				if e != nil {
+					g.writer.invalidate()
+				}
+			} else {
+				g.writer.invalidate()
+				e = g.commitRecords(ctx, s, h, removes, nil)
+			}
 			g.writer.op.Unlock()
 			g.input.notify()
+		} else {
+			e = g.commitRecords(ctx, s, h, removes, nil)
 		}
 		if e != nil {
 			return e

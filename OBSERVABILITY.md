@@ -112,6 +112,6 @@ Graph committed 与 visible 在新协议中相等，均表示持久化可回放�
 聚类布局下，Worker 的 `vecdb_pipeline_stage_seconds` 按分片记录三个阶段。通过 `stage="data_writer_recover"` 的 `_count` 和 `_sum` 查看恢复次数和耗时，聚类 TxnKV 恢复会读取批日志尾、逻辑事件尾或回收位点，并补齐末批的记录和回执。连续写入时观察 `data_owner_mutate` 的请求数和 `data_group_commit` 的批次数。后者的耗时包括批日志持久化和记录、事件、回执投影。Dispatcher 的日志读取另计入 `dispatch_read_log`。SDK 直连的写入计入 Worker 指标。Gateway 的 `data_mutate` 只统计从 Gateway 转发的调用。运维查询 `data_progress` 可以在 owner 离线时从 TiKV 快照读取持久化 head、floor、completed_lsn。
 
 
-在 Worker 指标中，`vecdb_pipeline_batch_items{stage="source_heads"}` 记录每个来源窗口实际读取的 Index 数量。用同一时间段的 `_sum` 增量除以 `_count` 增量，可以区分单簇窗口与多目标窗口的平均读取量。`vecdb_pipeline_stage_seconds_count{stage="graph_progress_report"}` 统计尝试提交图副本状态的次数，已确认且连续无变化的心跳跳过该事务。各阶段对应的键和计数见 [TiKV 元数据访问清单](CLUSTER_ROUTING.md#tikv-元数据访问清单)。
+在 Worker 指标中，`vecdb_pipeline_batch_items{stage="source_heads"}` 记录每个来源窗口实际读取的 Index 数量。用同一时间段的 `_sum` 增量除以 `_count` 增量，可以区分单簇窗口与多目标窗口的平均读取量。图副本进度随 owner 续期保存，状态接口和 `vecdb_graph_replica_applied_sequence` 使用最近一次保存的位置。历史 `graph_progress_report` 阶段对应的单独进度事务已移除。各阶段对应的键和计数见 [TiKV 元数据访问清单](CLUSTER_ROUTING.md#tikv-元数据访问清单)。
 
 轻量路由快照刷新使用阶段 `search_route_snapshot`，按缓存未命中的实际扫描次数计数。租约读普通查询的缓存命中不会产生 `route_plan`/`route_owner` 读取样本；这些阶段仍用于非租约查询与维护。`replica_rpc_search` 继续包含实际分片调用耗时。

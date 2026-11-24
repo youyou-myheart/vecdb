@@ -28,7 +28,7 @@ func TestRawOwnerReadersOnlySeeConfirmedHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = writer.write(ctx, pending); err != nil {
+	if _, err = writer.write(ctx, pending); err != nil {
 		t.Fatal(err)
 	}
 	// Any accidental WAL read panics. Any StartTS request fails the test.
@@ -164,13 +164,65 @@ func TestGraphCommitProofsCoalesceAndRecoverLostNotification(t *testing.T) {
 	if err != nil || got[id] != 2 {
 		t.Fatal("lost ACK did not recover", got, err)
 	}
-	s.completed, s.windows, s.checkpointAt = 2, 99, time.Now()
-	if err := c.flushCompleted(f.ctx, 0, s, false); err != nil || s.persisted != 0 {
-		t.Fatal("checkpoint written early", err)
+
+}
+
+func TestRawDispatchReportsProgressOnlyWithLeaseRenewal(t *testing.T) {
+	f, c, owner := routedFixture(t)
+	data := *f.r
+	data.Prefix += "data/0000/"
+	store := newRawDataStore(newFakeRawData(), f.r.Prefix)
+	f.r.raw, data.raw = store, store
+	c.data[0] = &data
+	group := &mutationGroup{lease: &appendLease{owner: owner}}
+	confirmAppendGrant(t, group.lease, owner.Epoch, 1<<60, time.Minute)
+	group.rawWriter = rawTestRecover(t, f.ctx, store, &data, owner)
+	for _, id := range []string{"one", "two", "three"} {
+		rawTestAccept(t, f.ctx, group.rawWriter, rawTestRequest(t, &data, id, id))
 	}
-	s.windows++
-	if err := c.flushCompleted(f.ctx, 0, s, false); err != nil || s.persisted != 2 {
-		t.Fatal("checkpoint did not persist", err)
+	store.local.Store(data.Prefix, group)
+	group.lease.head.Store(3)
+	if _, err := c.coordinator.update(f.ctx, owner, true, false, func(o *Ownership) { o.Offset = 1 }); err != nil {
+		t.Fatal(err)
+	}
+	s := &dataDispatcher{owner: owner, writer: group}
+	if err := c.loadDispatchWindow(f.ctx, 0, s); err != nil || s.completed != 1 ||
+		len(s.window) != 2 || s.window[0].Sequence != 2 {
+		t.Fatal("recovery did not start at the reported progress", s.completed, s.window, err)
+	}
+	target := c.layout.Bindings[0].Index
+	group.proofs.record(target, 3, false)
+	begin := f.r.beginTxn
+	f.r.beginTxn = func() (transactionAPI, error) {
+		t.Fatal("confirming a cached RawKV window opened a metadata transaction")
+		return nil, injected
+	}
+	if err := c.dispatchSource(f.ctx, 0, s); err != nil || group.lease.indexed.Load() != 3 {
+		t.Fatal("RawKV progress was not advanced in memory", s.completed, err)
+	}
+	f.r.beginTxn = begin
+	if current, err := c.coordinator.Resolve(f.ctx, owner.Partition); err != nil || current.Offset != 1 {
+		t.Fatal("progress changed before renewal", current, err)
+	}
+	if _, err := c.coordinator.update(f.ctx, owner, true, false, func(o *Ownership) {
+		o.Offset = group.lease.indexed.Load()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.coordinator.Update(f.ctx, owner, false, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range f.nodes {
+		if node.ID != owner.Node {
+			continue
+		}
+		next, err := c.coordinator.Acquire(f.ctx, owner.Partition, node)
+		if err != nil || next.Epoch <= owner.Epoch || next.Offset != 3 {
+			t.Fatal("takeover lost the reported progress", next, err)
+		}
+	}
+	if _, found := f.db.data[string(completedKey(&data))]; found {
+		t.Fatal("dispatcher wrote the old progress key")
 	}
 }
 

@@ -55,10 +55,6 @@ func (t tikvTransaction) Commit(ctx context.Context) error {
 	return t.KVTxn.Commit(ctx)
 }
 
-func (t tikvTransaction) commitOnePhaseBefore(ctx context.Context, expires int64) error {
-	return logStorageError(shardlog.CommitBefore(ctx, t.KVTxn, expires))
-}
-
 // A successor starts its recovery snapshot at or after expires. Use 2PC so
 // all keys, including every log entry, are prewritten before choosing commitTS.
 // A recovery read then sees the old result or resolves its locks at a snapshot

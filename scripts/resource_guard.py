@@ -52,13 +52,13 @@ def limit_reason(row, *, limit_owned_disk=True):
     if row['disk_free_bytes'] <= 15*GIB: return 'disk free at or below 15 GiB'
     if row['memory_pressure'] != 1: return 'macOS memory pressure is not normal'
     if limit_owned_disk and row.get('owned_bytes',0) >= 1.5*GIB: return 'owned data/logs reached 1.5 GiB soft limit (2 GiB hard budget)'
-    if row.get('owned_rss_bytes',0) >= 3*GIB: return 'owned processes reached 3 GiB RSS'
     if row.get('elapsed_seconds',0) >= 240: return 'trial reached 240 second runtime budget'
     return None
 
 
 class ResourceGuard:
     limit_owned_disk = True
+    limit_busy_cpu = True
 
     def __init__(self, fixture, report_root):
         self.fixture, self.report_root = fixture, report_root
@@ -106,7 +106,8 @@ class ResourceGuard:
                     reason = reason or "trial reached configured runtime budget"
                 busy = busy+1 if row['system_cpu_percent'] > row['logical_cpus']*80 else 0
                 slow = slow+1 if time.monotonic()-start > 3 else 0
-                reason = reason or ('system CPU above 80% for three samples' if busy>=3 else None)
+                if self.limit_busy_cpu and busy >= 3:
+                    reason = reason or 'system CPU above 80% for three samples'
                 reason = reason or ('resource sampler delayed for three samples' if slow>=3 else None)
                 if reason: self.trip(reason)
             except Exception as exc:

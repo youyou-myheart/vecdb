@@ -102,7 +102,7 @@ func (c *ClusterService) Sync(ctx context.Context) error {
 				delete(targets, id)
 				continue
 			}
-			keys = append(keys, c.dispatchProgressKey(id))
+			keys = append(keys, c.coordinator.ownerKey(sourceID(id)), completedKey(c.data[id]))
 		}
 		c.writerMu.RUnlock()
 		if len(keys) == 0 {
@@ -117,8 +117,9 @@ func (c *ClusterService) Sync(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		progress := prefetchedTransaction{values: values}
 		for id, n := range targets {
-			completed, err := c.decodeDispatchProgress(id, values[string(c.dispatchProgressKey(id))])
+			completed, err := c.completedIn(ctx, progress, id)
 			if err != nil {
 				return err
 			}

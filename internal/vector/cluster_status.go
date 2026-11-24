@@ -52,17 +52,15 @@ func (c *ClusterService) Status(ctx context.Context) (ClusterStatus, error) {
 				_ = tx.Rollback()
 				return s, e
 			}
-			done, e := c.completedIn(ctx, tx, d)
+			done, e := r.readCounter(ctx, tx, "dispatch-completed")
 			if e != nil {
 				_ = tx.Rollback()
 				return s, e
 			}
 			owner, ownerErr := c.coordinator.resolveIn(ctx, tx, sourceID(d))
 			_ = tx.Rollback()
-			if r.packed != nil {
-				done = max(done, owner.Offset)
-			}
 			if owner.Epoch != 0 {
+				done = max(done, owner.Offset)
 				owner.Offset = done
 			}
 			if ownerErr != nil {
@@ -142,8 +140,9 @@ func (c *ClusterService) Status(ctx context.Context) (ClusterStatus, error) {
 				o, e := c.coordinator.Resolve(ctx, a.Partition)
 				if e == nil {
 					if c.graphReplication {
-						pos, err := j.Progress(ctx, o)
-						if err == nil {
+						if o.GraphPosition != nil {
+							s.GraphPositions[o.Partition] = *o.GraphPosition
+						} else if pos, err := j.Progress(ctx, o); err == nil {
 							s.GraphPositions[o.Partition] = pos
 						}
 					}

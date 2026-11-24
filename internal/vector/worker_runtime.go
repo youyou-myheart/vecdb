@@ -19,7 +19,6 @@ type localPartition struct {
 	readLease       lease.Handle
 	cancel          context.CancelFunc
 	loadDone        chan struct{}
-	lastGraphReport atomic.Pointer[replicaGraphReport]
 	queryNanos      atomic.Int64
 	retired         bool
 	owner           Ownership
@@ -230,38 +229,6 @@ func (c *ClusterService) MaybeRebuild(ctx context.Context) error {
 	return first
 }
 
-type replicaGraphReport struct {
-	version  uint64
-	position GraphPosition
-}
-
-// The owner renewal already returned its durable phase and offset. Report the
-// graph position and replica status together only when the last confirmed
-// report or the renewed status differs. A new incarnation has an empty cache.
-func (entry *localPartition) reportGraphProgress(ctx context.Context, j graphJournal, version uint64, renewed Ownership, pos GraphPosition, p *pipelineMetrics) (err error) {
-	now := replicaGraphReport{version: version, position: pos}
-	if last := entry.lastGraphReport.Load(); last != nil && *last == now && (renewed.Epoch == 0 || renewed.Phase == "Ready" && renewed.LastError == "" && renewed.Offset == pos.DataOffset) {
-		return nil
-	}
-	defer p.track("graph_progress_report", string(j.id))(&err)
-	tx, err := j.c.root.begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err = j.c.reportReplicaIn(ctx, tx, j.id, version, j.owner, "Ready", "", pos.DataOffset); err != nil {
-		return err
-	}
-	if err = putJSON(tx, j.key("progress/"+string(j.owner.Partition)), graphAck{j.owner, pos}); err != nil {
-		return err
-	}
-	if err = tx.Commit(ctx); err != nil {
-		return err
-	}
-	entry.lastGraphReport.Store(&now)
-	return nil
-}
-
 func (c *ClusterService) replicaTick(ctx context.Context) {
 	hints, err := c.indexPlacement(ctx)
 	if err != nil {
@@ -332,18 +299,24 @@ func (c *ClusterService) renewAssignedReplica(ctx context.Context, entry *localP
 	entry.mu.RLock()
 	ready := entry.service != nil
 	var offset uint64
-	var graphPos GraphPosition
-	var journal *graphJournal
+	var report func(*Ownership)
 	if ready {
 		if g := entry.service.graphReplica; g != nil {
 			if g.input != nil {
 				g.input.planChanged(plan.Version, plan.Publisher)
 			}
 			g.viewMu.RLock()
-			graphPos = g.position
+			graphPos := g.position
 			g.viewMu.RUnlock()
-			offset = graphPos.DataOffset
-			journal = &g.journal
+			report = func(o *Ownership) {
+				// An older capture cannot replace newer progress from this owner.
+				if graphPos.DataOffset < o.Offset || o.GraphPosition != nil && graphPos.Sequence < o.GraphPosition.Sequence {
+					return
+				}
+				o.Offset = graphPos.DataOffset
+				o.GraphPosition = &graphPos
+				o.Phase, o.LastError = "Ready", ""
+			}
 		} else {
 			entry.service.syncMu.Lock()
 			offset = entry.service.cursor
@@ -351,7 +324,7 @@ func (c *ClusterService) renewAssignedReplica(ctx context.Context, entry *localP
 		}
 	}
 	entry.mu.RUnlock()
-	if renewed, e := c.renewReplica(ctx, entry, ready); errors.Is(e, ErrFenced) {
+	if _, e := c.renewReplica(ctx, entry, ready, report); errors.Is(e, ErrFenced) {
 		c.remove(entry)
 	} else if e == nil && ready {
 		entry.mu.RLock()
@@ -359,11 +332,8 @@ func (c *ClusterService) renewAssignedReplica(ctx context.Context, entry *localP
 			_ = entry.service.graphReplica.refreshLease(ctx, plan)
 		}
 		entry.mu.RUnlock()
-		id, version := binding.Index, plan.Version
-		if journal == nil {
-			_ = c.coordinator.ReportReplica(ctx, id, version, entry.owner, "Ready", "", offset)
-		} else {
-			_ = entry.reportGraphProgress(ctx, *journal, version, renewed, graphPos, &c.observations.pipeline)
+		if report == nil {
+			_ = c.coordinator.ReportReplica(ctx, binding.Index, plan.Version, entry.owner, "Ready", "", offset)
 		}
 	}
 }

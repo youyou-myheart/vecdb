@@ -11,11 +11,13 @@ import (
 const rawWritesInFlight = 16
 
 type rawPendingWrite struct {
-	requests []*mutationRequest
-	results  []mutationResult
-	batch    mutationLogBatch
-	done     chan struct{}
-	err      error
+	requests  []*mutationRequest
+	results   []mutationResult
+	batches   []mutationLogBatch
+	required  []int
+	confirmed int
+	done      chan struct{}
+	err       error
 }
 
 func (w *rawPendingWrite) ready() bool {
@@ -68,7 +70,7 @@ func (b *mutationGroup) drainRaw(ctx context.Context, batch []*mutationRequest) 
 				batch = nil
 				if write != nil {
 					pending = append(pending, write)
-					if write.batch.Number == 0 {
+					if len(write.batches) == 0 {
 						close(write.done)
 					} else {
 						writes.Add(1)
@@ -128,8 +130,26 @@ func (b *mutationGroup) prepareRawWrite(batch []*mutationRequest) (*rawPendingWr
 	if len(active) == 0 {
 		return nil, nil
 	}
-	results, accepted, err := b.rawWriter.prepare(active)
-	return &rawPendingWrite{requests: active, results: results, batch: accepted, done: make(chan struct{})}, err
+	work := &rawPendingWrite{
+		requests: active,
+		results:  make([]mutationResult, len(active)),
+		required: make([]int, len(active)),
+		done:     make(chan struct{}),
+	}
+	for i := range active {
+		results, accepted, err := b.rawWriter.prepare(active[i : i+1])
+		if err != nil {
+			return work, err
+		}
+		if accepted.Number != 0 {
+			work.batches = append(work.batches, accepted)
+		}
+		work.results[i] = results[0]
+		// Even a duplicate or a revision conflict can depend on an earlier
+		// request in this group. Only answer once that prefix is confirmed.
+		work.required[i] = len(work.batches)
+	}
+	return work, nil
 }
 
 func (b *mutationGroup) writeRawBatch(ctx context.Context, work *rawPendingWrite) {
@@ -137,36 +157,41 @@ func (b *mutationGroup) writeRawBatch(ctx context.Context, work *rawPendingWrite
 	callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	measure := b.metrics.track("data_group_commit", b.partition)
-	group := shardlog.Open(&b.lease.Node, func(ctx context.Context, p mutationLogBatch) error {
-		return b.rawWriter.write(ctx, p)
+	group := shardlog.Open(&b.lease.Node, func(ctx context.Context, slots []mutationLogBatch) error {
+		var err error
+		work.confirmed, err = b.rawWriter.write(ctx, slots...)
+		return err
 	}, dataLogReader{repo: b.repo})
-	work.err = logStorageError(group.Propose(callCtx, b.lease.owner.Epoch, work.batch))
+	work.err = logStorageError(group.Propose(callCtx, b.lease.owner.Epoch, work.batches))
 	measure(&work.err)
 	b.metrics.observeBatch("data_commit", b.partition, len(work.requests), work.err)
 }
 
 func (b *mutationGroup) confirmRawWrite(ctx context.Context, epoch uint64, work *rawPendingWrite) error {
-	if work.err != nil {
-		return work.err
-	}
 	if err := b.requireRawLease(ctx, epoch); err != nil {
 		return err
 	}
-	if work.batch.Number != 0 {
-		if err := b.rawWriter.accept(work.batch); err != nil {
+	if work.confirmed > 0 {
+		if err := b.rawWriter.accept(work.batches[:work.confirmed]...); err != nil {
 			return err
 		}
-		b.lease.head.Store(work.batch.last())
-		if b.onCommit != nil {
-			b.onCommit()
-		}
+		b.lease.head.Store(work.batches[work.confirmed-1].last())
 	}
-	for n, request := range work.requests {
-		result := work.results[n]
+	answered := 0
+	for i, request := range work.requests {
+		if work.required[i] > work.confirmed {
+			break
+		}
+		result := work.results[i]
 		result.record = cloneRecord(result.record)
 		request.result <- result
+		answered++
 	}
-	return nil
+	work.requests = work.requests[answered:]
+	if work.confirmed > 0 && b.onCommit != nil {
+		b.onCommit()
+	}
+	return work.err
 }
 
 func (b *mutationGroup) failRawWrites(err error, batch []*mutationRequest, pending []*rawPendingWrite) {

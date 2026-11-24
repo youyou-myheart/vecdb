@@ -25,6 +25,7 @@ from vectorstore import Client
 
 class BenchGuard(ResourceGuard):
     limit_owned_disk = False
+    limit_busy_cpu = False
 
     def processes(self):
         return super().processes() + list(self.fixture.drivers)
@@ -263,6 +264,10 @@ def run(args):
     if reason:
         raise RuntimeError(reason)
     trial = CapacityTrial(args)
+    if args.data_backend:
+        trial.c.env['DATA_BACKEND'] = args.data_backend
+        if args.data_backend == 'raw':
+            trial.c.env['CONSUMER_RETENTION'] = '0'
     print('REPORT', trial.logs, flush=True)
     (trial.state_dir / '.capacity-owned').write_text(trial.run_id)
     trial.drivers = []
@@ -273,6 +278,9 @@ def run(args):
                         clients=args.clients, max_inflight_per_client=args.inflight, timeout_seconds=3,
                         service_gomaxprocs=os.environ.get('GOMAXPROCS', 'runtime default'), client_gomaxprocs=2,
                         background_services=args.background_services, target_met=False)
+    trial.report.update(data_backend=trial.c.env.get('DATA_BACKEND', 'txn'),
+                        consumer_retention=trial.c.env['CONSUMER_RETENTION'] == '1',
+                        max_owned_rss_bytes=None, cpu_load_stop_enabled=guard.limit_busy_cpu)
     try:
         if sys.platform == 'darwin':
             trial.report['executables'] = {
@@ -348,6 +356,8 @@ if __name__ == '__main__':
     parser.add_argument('--seconds', type=int, default=60)
     parser.add_argument('--drain-seconds', type=int, default=150)
     parser.add_argument('--clients', type=int, default=8)
+    parser.add_argument('--data-backend', choices=('raw', 'txn'),
+                        help='select the data WAL backend; raw disables consumer retention')
     parser.add_argument('--write-gateways', type=int, choices=(1, 2), default=2,
                         help='number of Gateways receiving inserts; both services stay active')
     parser.add_argument('--write-stages', action='store_true',

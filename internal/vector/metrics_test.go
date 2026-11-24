@@ -56,11 +56,12 @@ func TestDispatchObservationsTrackFailuresAndDuplicates(t *testing.T) {
 	if err := f.services[0].Sync(f.ctx); err != nil {
 		t.Fatal(err)
 	}
-	f.db.commitErr = injected
+	begin := f.r.beginTxn
+	f.r.beginTxn = func() (transactionAPI, error) { return nil, injected }
 	if err := c.dispatchSource(f.ctx, 0, &dataDispatcher{owner: o}); err == nil {
 		t.Fatal("injection lost")
 	}
-	f.db.commitErr = nil
+	f.r.beginTxn = begin
 	if err := c.dispatchSource(f.ctx, 0, &dataDispatcher{owner: o}); err != nil {
 		t.Fatal(err)
 	}

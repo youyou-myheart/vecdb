@@ -41,7 +41,7 @@ func (c *ClusterService) verifyDelivery(id IndexPartitionID, q Delivery) bool {
 	return err == nil && hmac.Equal(sum, q.proof)
 }
 
-func (c *ClusterService) signRawDelivery(id IndexPartitionID, q Delivery, b *mutationGroup, checkpoint uint64) ([]byte, error) {
+func (c *ClusterService) signRawDelivery(id IndexPartitionID, q Delivery, b *mutationGroup, completed uint64) ([]byte, error) {
 	snap, ok := b.confirmedSnapshot()
 	if !ok || !sameOwner(b.lease.owner, q.Owner) {
 		return nil, ErrFenced
@@ -49,7 +49,7 @@ func (c *ClusterService) signRawDelivery(id IndexPartitionID, q Delivery, b *mut
 	if q.Through > snap.end || q.Previous >= q.Through || q.Through-q.Previous > dispatchBatchSize {
 		return nil, errors.New("invalid WAL proof range")
 	}
-	if q.Previous > checkpoint && q.Previous > b.proofs.read(id).through {
+	if q.Previous > completed && q.Previous > b.proofs.read(id).through {
 		return nil, errors.New("uncertified source coverage boundary")
 	}
 	// Project from the confirmed history independently of the dispatch queue.

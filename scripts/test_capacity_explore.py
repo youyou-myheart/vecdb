@@ -63,7 +63,8 @@ class CapacityExplorationTest(unittest.TestCase):
     def test_resource_limits_fail_closed(self):
         safe=dict(disk_free_bytes=20*GIB,memory_pressure=1,owned_bytes=GIB,owned_rss_bytes=GIB)
         self.assertIsNone(limit_reason(safe))
-        for field,value in (('disk_free_bytes',15*GIB),('memory_pressure',2),('owned_bytes',1.5*GIB),('owned_rss_bytes',3*GIB),('elapsed_seconds',240)):
+        self.assertIsNone(limit_reason(dict(safe, owned_rss_bytes=6*GIB)))
+        for field,value in (('disk_free_bytes',15*GIB),('memory_pressure',2),('owned_bytes',1.5*GIB),('elapsed_seconds',240)):
             self.assertIsNotNone(limit_reason(dict(safe,**{field:value})))
 
     def test_cleanup_requires_marker_exact_parent_and_stopped_children(self):

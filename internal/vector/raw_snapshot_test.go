@@ -195,7 +195,7 @@ func TestRawFallbackRechecksPartialPageAcrossRegions(t *testing.T) {
 	probe.afterBatch = func(keys, values [][]byte) {
 		probe.afterBatch = nil
 		for _, batch := range []mutationLogBatch{data[1], data[0]} {
-			if err := writer.write(ctx, batch); err != nil {
+			if _, err := writer.write(ctx, batch); err != nil {
 				t.Fatal(err)
 			}
 		}

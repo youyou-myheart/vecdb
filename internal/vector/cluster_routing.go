@@ -8,6 +8,7 @@ import (
 	tikverr "github.com/tikv/client-go/v2/error"
 	"math"
 	"reflect"
+	"strings"
 )
 
 // ClusterRouting is immutable within a namespace. Worker placement/epochs are
@@ -60,11 +61,34 @@ func (r clusterRouter) IndexForRecord(_ DataPartitionID, v Record) (IndexPartiti
 	}
 	return r.route.target(v.Vector), nil
 }
-func (r *Repository) ensureRoutedLayout(ctx context.Context, n int, route *ClusterRouting, scheduler, domain string, retention bool) (PartitionLayout, error) {
-	return r.ensureRoutedLayoutWithBackend(ctx, n, route, scheduler, domain, retention, false)
+
+// Default fresh routed collections to RawKV. A running collection always
+// opens its recorded format, including legacy layouts without a mode key.
+func (r *Repository) preferRawData(ctx context.Context) (bool, error) {
+	tx, err := r.begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	mode, err := tx.Get(ctx, []byte(r.Prefix+"cluster-mode"))
+	if err == nil {
+		return strings.HasSuffix(strings.TrimSuffix(string(mode), "-graph-raw-v1"), "-data-raw-v1"), nil
+	}
+	if !tikverr.IsErrNotFound(err) {
+		return false, err
+	}
+	_, err = tx.Get(ctx, []byte(r.Prefix+"partition-layout"))
+	if tikverr.IsErrNotFound(err) {
+		return true, nil
+	}
+	return false, err
 }
 
-func (r *Repository) ensureRoutedLayoutWithBackend(ctx context.Context, n int, route *ClusterRouting, scheduler, domain string, retention, rawBackend bool) (PartitionLayout, error) {
+func (r *Repository) ensureRoutedLayout(ctx context.Context, n int, route *ClusterRouting, scheduler, domain string, retention bool) (PartitionLayout, error) {
+	return r.ensureRoutedLayoutWithBackend(ctx, n, route, scheduler, domain, retention, false, false)
+}
+
+func (r *Repository) ensureRoutedLayoutWithBackend(ctx context.Context, n int, route *ClusterRouting, scheduler, domain string, retention, rawBackend, rawGraph bool) (PartitionLayout, error) {
 	raw, _ := json.Marshal(route)
 	var frozen ClusterRouting
 	if e := json.Unmarshal(raw, &frozen); e != nil {
@@ -118,13 +142,19 @@ func (r *Repository) ensureRoutedLayoutWithBackend(ctx context.Context, n int, r
 	} else {
 		mode += "-data-wal-v1"
 	}
+	previousBackendMode := mode
+	if rawGraph {
+		mode += "-graph-raw-v1"
+	}
 	key = []byte(r.Prefix + "cluster-mode")
 	raw, e = tx.Get(ctx, key)
 	if e == nil && string(raw) != mode {
-		if rawBackend {
-			return l, errors.New("DATA_BACKEND=raw requires a fresh namespace")
-		}
-		if string(raw) != previous && string(raw) != previous+"-owner-append-v1" {
+		upgradeGraph := rawGraph && string(raw) == previousBackendMode
+		upgradeTxn := !rawBackend && (string(raw) == previous || string(raw) == previous+"-owner-append-v1")
+		if !upgradeGraph && !upgradeTxn {
+			if rawBackend {
+				return l, errors.New("DATA_BACKEND=raw requires a fresh namespace")
+			}
 			return l, errors.New("incompatible cluster routing protocol")
 		}
 		nodes, err := (&Coordinator{root: r}).nodesIn(ctx, tx)

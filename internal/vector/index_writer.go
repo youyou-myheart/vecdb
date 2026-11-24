@@ -124,15 +124,6 @@ func (g *graphReplica) syncLeased(ctx context.Context, s *Service, rebuild bool,
 			g.input.notify()
 		}
 	}()
-	if rebuild {
-		w.invalidate()
-		// Maintenance retains the fully fenced slow path. Its append is serialized
-		// with all cached appends and forces one recovery before reusing the cache.
-		if err := g.syncSlow(ctx, s, true, token); err != nil {
-			return err
-		}
-		return w.authority(token)
-	}
 	if !known {
 		measure := g.track("index_lease_recovery")
 		h, e := g.journal.claimLeased(ctx, token)
@@ -149,6 +140,15 @@ func (g *graphReplica) syncLeased(ctx context.Context, s *Service, rebuild bool,
 		if e != nil {
 			return e
 		}
+	}
+	if rebuild {
+		w.invalidate()
+		// Maintenance retains the fully fenced slow path. Its append is serialized
+		// with all cached appends and forces one recovery before reusing the cache.
+		if err := g.syncSlow(ctx, s, true, token); err != nil {
+			return err
+		}
+		return w.authority(token)
 	}
 	h, token, err := w.snapshot()
 	if err != nil {
@@ -180,20 +180,25 @@ func (g *graphReplica) syncLeased(ctx context.Context, s *Service, rebuild bool,
 	if err = g.commitRouted(ctx, s, h); err != nil {
 		return err
 	}
-	latest, _, err := w.snapshot()
-	if err != nil {
+	if err = g.applyPrepared(s); err != nil {
 		return err
 	}
-	if g.position != latest.Committed {
-		if g.prepared != latest.Committed || g.delta == nil {
-			return ErrConflict
-		}
-		if err = g.apply(s, g.delta, nil, latest.Committed); err != nil {
-			return err
-		}
-		g.prepared, g.delta, g.reset = GraphPosition{}, nil, nil
-	}
 	return w.authority(token)
+}
+
+func (g *graphReplica) applyPrepared(s *Service) error {
+	latest, _, err := g.writer.snapshot()
+	if err != nil || g.position == latest.Committed {
+		return err
+	}
+	if g.prepared != latest.Committed || g.delta == nil {
+		return ErrConflict
+	}
+	if err = g.apply(s, g.delta, nil, latest.Committed); err != nil {
+		return err
+	}
+	g.prepared, g.delta, g.reset = GraphPosition{}, nil, nil
+	return nil
 }
 
 // Exact events and sparse coverage are proved at admission from immutable data

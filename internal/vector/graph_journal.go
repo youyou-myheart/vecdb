@@ -21,6 +21,8 @@ type GraphPosition struct {
 	Hash       string `json:"hash"`
 }
 type GraphHead struct {
+	RawActive              *graphRawRun      `json:"raw_active,omitempty"`
+	RawSealed              []graphRawRun     `json:"raw_sealed,omitempty"`
 	SourceEpochs           map[string]uint64 `json:"source_epochs,omitempty"`
 	CheckpointSourceEpochs map[string]uint64 `json:"checkpoint_source_epochs,omitempty"`
 	LogBytes               uint64            `json:"log_bytes,omitempty"`
@@ -77,6 +79,10 @@ func readJSON(ctx context.Context, tx transactionAPI, key []byte, out any) error
 // checkpoint, or retention operations. The immutable tail supplies the current
 // durable position and source ACKs; appending never rewrites the head.
 func (j graphJournal) headIn(ctx context.Context, tx transactionAPI) (GraphHead, error) {
+	return j.readHeadIn(ctx, tx, false)
+}
+
+func (j graphJournal) readHeadIn(ctx context.Context, tx transactionAPI, recovering bool) (GraphHead, error) {
 	var h GraphHead
 	err := readJSON(ctx, tx, j.key("head"), &h)
 	if err != nil && !tikverr.IsErrNotFound(err) {
@@ -85,12 +91,16 @@ func (j graphJournal) headIn(ctx context.Context, tx transactionAPI) (GraphHead,
 	if h.Visible != h.Committed || h.Floor.Sequence > h.Visible.Sequence || h.Floor.Sequence > h.CheckpointPosition.Sequence {
 		return h, errors.New("invalid durable graph anchor (legacy publication protocol is not supported)")
 	}
+	if h.RawActive != nil {
+		return j.rawTail(ctx, h, recovering)
+	}
 	key, raw, err := tx.Last(ctx, j.key("entries/"), j.key("entries0"))
 	if err != nil && !tikverr.IsErrNotFound(err) {
 		return h, err
 	}
+	_, sealedTail := j.rawStreamAt(h, h.Committed.Sequence)
 	if len(key) == 0 {
-		if h.Committed != h.Floor {
+		if h.Committed != h.Floor && !sealedTail {
 			return h, errors.New("missing graph tail above retention floor")
 		}
 		return h, nil
@@ -98,6 +108,9 @@ func (j graphJournal) headIn(ctx context.Context, tx transactionAPI) (GraphHead,
 	var tail GraphEntry
 	if err := decodeGraphEntry(raw, &tail, false); err != nil {
 		return h, err
+	}
+	if tail.Position.Sequence < h.Committed.Sequence && sealedTail {
+		return h, nil
 	}
 	if string(key) != string(j.stream().Key(tail.Position.Sequence)) ||
 		tail.Position.Sequence == 0 || tail.Previous.Sequence != tail.Position.Sequence-1 ||
@@ -134,11 +147,11 @@ func (j graphJournal) Entry(ctx context.Context, seq uint64) (GraphEntry, error)
 	if seq <= h.Floor.Sequence {
 		return GraphEntry{}, ErrLogCompacted
 	}
-	return j.entryIn(ctx, tx, seq)
+	return j.entryIn(ctx, tx, h, seq)
 }
-func (j graphJournal) entryIn(ctx context.Context, tx transactionAPI, seq uint64) (GraphEntry, error) {
+func (j graphJournal) entryIn(ctx context.Context, tx transactionAPI, h GraphHead, seq uint64) (GraphEntry, error) {
 	var entry GraphEntry
-	e := readGraphEntry(ctx, tx, j.stream().Key(seq), &entry, true)
+	e := j.readEntryIn(ctx, tx, h, seq, &entry, true)
 	if e == nil && (entry.Position.Sequence != seq || entry.Position.Hash != entryHash(entry)) {
 		e = errors.New("graph journal hash mismatch")
 	}
@@ -198,18 +211,27 @@ func (j graphJournal) commitPayload(ctx context.Context, base GraphHead, offset 
 }
 func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, offset uint64, kind string, object Manifest, inputs []Delivery, cluster *ClusterService, payload []byte, token []byte, writer *indexWriter) (GraphEntry, error) {
 	var entry GraphEntry
-	tx, e := j.c.root.begin()
-	if e != nil {
-		return entry, e
+	var tx transactionAPI
+	var native tikvTransaction
+	var nativeSlot bool
+	var e error
+	rawSlot := j.c.rawGraph != nil && kind == "delta"
+	if rawSlot {
+		if writer == nil || base.RawActive == nil || base.RawActive.Closing || object.Key != "" {
+			return entry, ErrFenced
+		}
+	} else {
+		tx, e = j.c.root.begin()
+		if e != nil {
+			return entry, e
+		}
+		defer tx.Rollback()
+		if native, ok := tx.(interface{ SetEnable1PC(bool) }); ok {
+			native.SetEnable1PC(true)
+		}
+		native, nativeSlot = j.nativeAppend(tx)
+		nativeSlot = nativeSlot && writer != nil
 	}
-	defer tx.Rollback()
-	// Generic metadata writes prefer 1PC. The leased append below enforces
-	// single-slot 1PC for deltas and a bounded transaction for object resets.
-	if native, ok := tx.(interface{ SetEnable1PC(bool) }); ok {
-		native.SetEnable1PC(true)
-	}
-	native, nativeSlot := j.nativeAppend(tx)
-	nativeSlot = nativeSlot && writer != nil
 	var h GraphHead
 	leasedReset := writer != nil && kind == "reset"
 	if writer == nil || leasedReset {
@@ -231,7 +253,7 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 			// The grant can roll over in storage during the object upload.
 			// Its replacement may not yet be installed by the local writer.
 			e = j.c.fenceIndexGuard(ctx, tx, j.id, token)
-		} else if !nativeSlot {
+		} else if !nativeSlot && !rawSlot {
 			// A takeover cannot change the guard until the durable lease
 			// expires. Touch it to serialize an already-started commit with takeover.
 			e = tx.Set(j.c.indexGuardKey(j.id), token)
@@ -241,7 +263,7 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 		}
 	}
 	for _, input := range inputs {
-		if input.foldEpoch && nativeSlot {
+		if input.foldEpoch && (nativeSlot || rawSlot) {
 			e = validateAdmitted(h, input)
 		} else {
 			e = checkSourceEpoch(h, input)
@@ -276,7 +298,7 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 		}
 		key := fmt.Sprint(input.Source)
 		h.Sources[key] = input.Through
-		if input.foldEpoch && nativeSlot && input.Owner.Epoch > h.SourceEpochs[key] {
+		if input.foldEpoch && (nativeSlot || rawSlot) && input.Owner.Epoch > h.SourceEpochs[key] {
 			if h.SourceEpochs == nil {
 				h.SourceEpochs = map[string]uint64{}
 			}
@@ -288,7 +310,11 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 	}
 	entry = GraphEntry{LogBytes: h.LogBytes, Sources: h.Sources, SourceEpochs: maps.Clone(h.SourceEpochs), Term: h.Term, Previous: h.Committed, Position: GraphPosition{Sequence: h.Committed.Sequence + 1, DataOffset: offset}, Kind: kind, Object: object}
 	if j.c.referenceLogs {
-		entry.CreatedMS = txnMillis(tx)
+		if rawSlot {
+			entry.CreatedMS = time.Now().UnixMilli()
+		} else {
+			entry.CreatedMS = txnMillis(tx)
+		}
 		added := uint64(len(payload)) + uint64(max(int64(0), object.Size))
 		if added > ^uint64(0)-h.LogBytes {
 			return entry, errors.New("graph byte counter exhausted")
@@ -324,8 +350,22 @@ func (j graphJournal) commitWithAuthority(ctx context.Context, base GraphHead, o
 			return entry, ErrFenced
 		}
 	}
+	// A transactional reset is a boundary between two RawKV runs. Publish
+	// its own position together with the reset and object adoption.
+	if !rawSlot && h.RawActive != nil {
+		h.sealRawRun()
+		h.Committed, h.Visible = entry.Position, entry.Position
+		h.LogBytes, h.Sources, h.SourceEpochs = entry.LogBytes, entry.Sources, entry.SourceEpochs
+		if e = putJSON(tx, j.key("head"), h); e != nil {
+			return entry, e
+		}
+	}
 	var commit func(context.Context) error
-	if nativeSlot {
+	if rawSlot {
+		commit = func(ctx context.Context) error {
+			return j.proposeRawSlot(ctx, writer, token, *base.RawActive, entry.Position.Sequence, encoded)
+		}
+	} else if nativeSlot {
 		if leasedReset {
 			if err = native.insert(key, encoded); err != nil {
 				return entry, err
@@ -416,7 +456,7 @@ func (j graphJournal) saveCheckpoint(ctx context.Context, pos GraphPosition, m M
 		}
 		if pos.Sequence > h.Floor.Sequence {
 			var entry GraphEntry
-			if e = readGraphEntry(ctx, tx, j.stream().Key(pos.Sequence), &entry, false); e != nil {
+			if e = j.readEntryIn(ctx, tx, h, pos.Sequence, &entry, false); e != nil {
 				return e
 			}
 			if entry.Position != pos || entryHash(entry) != pos.Hash || entry.LogBytes != coverage.LogBytes || !maps.Equal(entry.Sources, coverage.Sources) || !maps.Equal(entry.SourceEpochs, coverage.SourceEpochs) {
@@ -453,6 +493,17 @@ func (j graphJournal) Progress(ctx context.Context, owner Ownership) (GraphPosit
 		return GraphPosition{}, e
 	}
 	defer tx.Rollback()
+	current, e := j.c.readOwner(ctx, tx, owner.Partition)
+	if e != nil {
+		return GraphPosition{}, e
+	}
+	if !sameOwner(current, owner) {
+		return GraphPosition{}, ErrFenced
+	}
+	if current.GraphPosition != nil {
+		return *current.GraphPosition, nil
+	}
+	// Older owners published their applied position in a separate key.
 	var ack graphAck
 	e = readJSON(ctx, tx, j.key("progress/"+string(owner.Partition)), &ack)
 	if e != nil {

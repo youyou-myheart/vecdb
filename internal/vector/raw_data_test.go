@@ -122,7 +122,7 @@ func rawTestAccept(t *testing.T, ctx context.Context, writer *rawShardWriter, re
 	if err != nil || len(results) != 1 || len(batch.Entries) != 1 || results[0].err != nil || results[0].record.Revision != 1 {
 		t.Fatal("bad raw prepare", results, batch, err)
 	}
-	if err := writer.write(ctx, batch); err != nil {
+	if _, err := writer.write(ctx, batch); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.accept(batch); err != nil {
@@ -170,7 +170,7 @@ func TestRawWriteFailureDoesNotPublishWithoutAnEnvelope(t *testing.T) {
 		}
 		return 0, injected
 	}
-	if err := writer.write(ctx, batch); !errors.Is(err, injected) {
+	if _, err := writer.write(ctx, batch); !errors.Is(err, injected) {
 		t.Fatal("failed BatchPut was acknowledged", err)
 	}
 	successorStore := newRawDataStore(client, rawTestNamespace)
@@ -252,7 +252,7 @@ func TestRawLateOldBatchCannotChangeSealedPrefix(t *testing.T) {
 	}
 	next := newRawDataStore(client, rawTestNamespace)
 	successor := rawTestRecover(t, ctx, next, repo, rawTestOwner(0, 2))
-	if err := writer.write(ctx, late); err != nil {
+	if _, err := writer.write(ctx, late); err != nil {
 		t.Fatal(err)
 	}
 	rawTestAccept(t, ctx, successor, rawTestRequest(t, repo, "bob", "two"))
@@ -327,6 +327,63 @@ func TestRawGroupRejectsDurableSuffixAfterFailedPrefix(t *testing.T) {
 	}
 }
 
+func TestRawGroupAcknowledgesConfirmedPrefixOfPartialBatch(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := newFakeRawData()
+	store := newRawDataStore(client, rawTestNamespace)
+	repo, owner := rawTestRepo(0), rawTestOwner(0, 1)
+	group := newMutationGroup(ctx, repo, &pipelineMetrics{}, string(owner.Partition))
+	group.lease = &appendLease{owner: owner}
+	confirmAppendGrant(t, group.lease, owner.Epoch, 1<<60, time.Minute)
+	group.rawWriter = rawTestRecover(t, ctx, store, repo, owner)
+	group.rawCtx, group.rawStop = context.WithCancel(ctx)
+	defer group.close()
+
+	requests := []*mutationRequest{
+		rawTestRequest(t, repo, "first", "one"),
+		rawTestRequest(t, repo, "second", "two"),
+		rawTestRequest(t, repo, "third", "three"),
+	}
+	for _, req := range requests {
+		req.ctx, req.result = ctx, make(chan mutationResult, 1)
+	}
+	work, err := group.prepareRawWrite(requests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.beforeBatch = func(_ context.Context, keys, values [][]byte) (int, error) {
+		if len(keys) != 3 {
+			t.Fatalf("expected three independent keys, got %d", len(keys))
+		}
+		client.mu.Lock()
+		client.data[string(keys[2])] = bytes.Clone(values[2])
+		client.mu.Unlock()
+		return 1, injected // The first and third keys reached storage.
+	}
+	group.writeRawBatch(ctx, work)
+	err = group.confirmRawWrite(ctx, owner.Epoch, work)
+	if !errors.Is(err, injected) {
+		t.Fatal(err)
+	}
+	group.failRawWrites(err, nil, []*rawPendingWrite{work})
+	for i, req := range requests {
+		result := receiveConsumer(t, req.result)
+		if i == 0 && (result.err != nil || result.record.Revision != 1) {
+			t.Fatal("durable prefix was not acknowledged", result)
+		}
+		if i != 0 && !errors.Is(result.err, injected) {
+			t.Fatal("request beyond the gap was acknowledged", result)
+		}
+	}
+	client.beforeBatch = nil
+	next := newRawDataStore(client, rawTestNamespace)
+	rawTestRecover(t, ctx, next, repo, rawTestOwner(0, 2))
+	if snap, err := next.snapshot(ctx, repo.Prefix); err != nil || snap.end != 1 {
+		t.Fatal("takeover did not recover exactly the contiguous prefix", snap, err)
+	}
+}
+
 func TestRawGroupLimitsConcurrentWritesAndBatchSize(t *testing.T) {
 	// More than sixteen full batches must remain queued until a slot frees up.
 	const slots, requests = 16, 1 + 17*mutationGroupRecords
@@ -337,21 +394,23 @@ func TestRawGroupLimitsConcurrentWritesAndBatchSize(t *testing.T) {
 	release := make(chan struct{})
 	var active, peak atomic.Int32
 	client.beforeBatch = func(ctx context.Context, keys, values [][]byte) (int, error) {
-		if len(keys) != 1 {
-			return 0, errors.New("raw batch split into multiple keys")
+		if len(keys) < 1 || len(keys) > mutationGroupRecords || len(keys) != len(values) {
+			return 0, fmt.Errorf("raw batch had %d keys and %d values", len(keys), len(values))
 		}
-		var envelope mutationLogBatch
-		if err := json.Unmarshal(values[0], &envelope); err != nil {
-			return 0, err
-		}
-		if size := len(envelope.Entries); size < 1 || size > mutationGroupRecords {
-			return 0, fmt.Errorf("raw batch had %d entries", size)
+		for _, value := range values {
+			var slot mutationLogBatch
+			if err := json.Unmarshal(value, &slot); err != nil {
+				return 0, err
+			}
+			if len(slot.Entries) != 1 {
+				return 0, fmt.Errorf("raw slot had %d entries", len(slot.Entries))
+			}
 		}
 		n := active.Add(1)
 		defer active.Add(-1)
 		for old := peak.Load(); old < n && !peak.CompareAndSwap(old, n); old = peak.Load() {
 		}
-		enter <- len(envelope.Entries)
+		enter <- len(keys)
 		select {
 		case <-release:
 			return len(keys), nil

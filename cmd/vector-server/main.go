@@ -49,8 +49,8 @@ func main() {
 		log.Fatal(err)
 	}
 	clusterMode := env("CLUSTER_MODE", "0") == "1"
-	dataBackend := env("DATA_BACKEND", "txn")
-	if dataBackend != "txn" && dataBackend != "raw" {
+	dataBackend := os.Getenv("DATA_BACKEND")
+	if dataBackend != "" && dataBackend != "txn" && dataBackend != "raw" {
 		log.Fatal("DATA_BACKEND must be txn or raw")
 	}
 	if dataBackend == "raw" && (!clusterMode || os.Getenv("CLUSTER_ROUTING_FILE") == "") {

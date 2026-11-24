@@ -120,7 +120,7 @@ func (c *Coordinator) ScheduleReplicas(ctx context.Context, leader Ownership, la
 				data.Prefix = fmt.Sprintf("%sdata/%04d/", c.root.Prefix, b.Data)
 			}
 			if layout.Routing != nil {
-				h, err := (graphJournal{c: c, id: b.Index}).headIn(ctx, tx)
+				h, err := (graphJournal{c: c, id: b.Index}).bootstrapHeadIn(ctx, tx)
 				e = err
 				next.Barrier = h.Committed.DataOffset
 			} else {

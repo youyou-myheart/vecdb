@@ -127,7 +127,7 @@ func (c *ClusterService) ReadChanges(ctx context.Context, q ChangeRequest) (Chan
 	var payloadBytes int64
 	for n := q.After; n < out.Head && len(out.Graph) < q.Limit; {
 		n++
-		entry, e := j.entryIn(ctx, tx, n)
+		entry, e := j.entryIn(ctx, tx, h, n)
 		if e == nil && entry.Payload != nil {
 			if len(out.Graph) > 0 && int64(entry.Payload.Size) > graphReplayBytes-payloadBytes {
 				break

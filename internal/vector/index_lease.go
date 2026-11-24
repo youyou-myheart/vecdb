@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"example.com/vector-storage/internal/lease"
+	"github.com/google/uuid"
 	tikverr "github.com/tikv/client-go/v2/error"
 )
 
@@ -216,6 +217,11 @@ func (g *graphReplica) refreshLease(ctx context.Context, plan ReplicaPlan) (err 
 // the head could install a stale cache; writing the guard in this transaction
 // makes either that earlier append or this recovery retry from durable state.
 func (j graphJournal) claimLeased(ctx context.Context, token []byte) (GraphHead, error) {
+	if j.c.rawGraph != nil {
+		if err := j.closeRawRun(ctx, token); err != nil {
+			return GraphHead{}, err
+		}
+	}
 	tx, err := j.c.root.begin()
 	if err != nil {
 		return GraphHead{}, err
@@ -227,7 +233,7 @@ func (j graphJournal) claimLeased(ctx context.Context, token []byte) (GraphHead,
 	if err = j.c.ReplicaFence(j.id, j.owner)(ctx, tx); err != nil {
 		return GraphHead{}, err
 	}
-	h, err := j.headIn(ctx, tx)
+	h, err := j.readHeadIn(ctx, tx, j.c.rawGraph != nil)
 	if err != nil {
 		return h, err
 	}
@@ -237,6 +243,15 @@ func (j graphJournal) claimLeased(ctx context.Context, token []byte) (GraphHead,
 		}
 		h.Term++
 		h.Leader = j.owner
+		if j.c.rawGraph == nil {
+			if err = putJSON(tx, j.key("head"), h); err != nil {
+				return h, err
+			}
+		}
+	}
+	if j.c.rawGraph != nil {
+		h.sealRawRun()
+		h.RawActive = &graphRawRun{ID: uuid.NewString(), After: h.Committed.Sequence}
 		if err = putJSON(tx, j.key("head"), h); err != nil {
 			return h, err
 		}

@@ -323,7 +323,7 @@ func TestDispatchRecoverySkipsCommittedWindow(t *testing.T) {
 	tx, _ := f.r.begin()
 	defer tx.Rollback()
 	done, e := c.completedIn(f.ctx, tx, 0)
-	if e != nil || done != 3 || len(state.window) != 0 {
+	if e != nil || done != 0 || state.completed != 3 || len(state.window) != 0 {
 		t.Fatal(done, state, e)
 	}
 	head, _ := a.graphReplica.journal.Head(f.ctx)
@@ -332,7 +332,7 @@ func TestDispatchRecoverySkipsCommittedWindow(t *testing.T) {
 	}
 }
 
-func TestDispatchRecoversUncertainCompletedCommit(t *testing.T) {
+func TestDispatchProgressNeedsNoCommit(t *testing.T) {
 	f, c, o := routedFixture(t)
 	a := f.services[0]
 	f.write(t, "first", false)
@@ -344,13 +344,11 @@ func TestDispatchRecoversUncertainCompletedCommit(t *testing.T) {
 		t.Fatal(e)
 	}
 	state := &dataDispatcher{owner: o}
-	f.db.commitErr, f.db.committedDespiteError = injected, true
-	if e := c.dispatchSource(f.ctx, 0, state); !errors.Is(e, injected) {
-		t.Fatal(e)
+	f.db.commitErr = injected
+	if e := c.dispatchSource(f.ctx, 0, state); e != nil || state.completed != 1 {
+		t.Fatal("dispatch progress depended on a storage commit", state.completed, e)
 	}
-	f.db.commitErr, f.db.committedDespiteError = nil, false
-	// TiKV committed, but the dispatcher's in-memory window is still stale.
-	// Further writes must progress without restarting this process.
+	f.db.commitErr = nil
 	f.write(t, "second", false)
 	if e := a.graphReplica.enqueue(f.ctx, deliveryFor(t, f, o, 1)); e != nil {
 		t.Fatal(e)
@@ -362,7 +360,7 @@ func TestDispatchRecoversUncertainCompletedCommit(t *testing.T) {
 		t.Fatal(e)
 	}
 	if state.completed != 2 || len(state.window) != 0 {
-		t.Fatalf("dispatcher stuck after uncertain commit: completed=%d window=%v", state.completed, state.window)
+		t.Fatalf("dispatcher stuck after in-memory advance: completed=%d window=%v", state.completed, state.window)
 	}
 }
 

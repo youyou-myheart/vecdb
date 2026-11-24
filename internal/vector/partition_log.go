@@ -83,7 +83,13 @@ func (r graphLogReader) ReadCommitted(ctx context.Context, w shardlog.Window) ([
 		}
 		defer tx.Rollback()
 	}
-	head, err := r.journal.headIn(ctx, tx)
+	var head GraphHead
+	var err error
+	if w.Through == 0 {
+		head, err = r.journal.headIn(ctx, tx)
+	} else {
+		head, err = r.journal.bootstrapHeadIn(ctx, tx)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +103,11 @@ func (r graphLogReader) ReadCommitted(ctx context.Context, w shardlog.Window) ([
 	if through > head.Visible.Sequence || w.After > through {
 		return nil, ErrInvalidLogCursor
 	}
-	return r.journal.stream().Tail(ctx, logReader(tx), w.After, through, w.Limit, true)
+	read := logReader(tx)
+	if head.RawActive != nil || len(head.RawSealed) > 0 {
+		read = r.journal.rawEntryReader(tx, head, w.After)
+	}
+	return r.journal.stream().Tail(ctx, read, w.After, through, w.Limit, true)
 }
 func (j graphJournal) log(node *shardlog.Node, tx transactionAPI) shardlog.Group[shardlog.Slot, [][]byte] {
 	return shardlog.Open(node, slotWriter(j.stream(), tx), graphLogReader{j, tx})
@@ -105,6 +115,15 @@ func (j graphJournal) log(node *shardlog.Node, tx transactionAPI) shardlog.Group
 
 // Token binds the graph base prepared by the caller to the publisher grant.
 func (j graphJournal) proposeSlot(ctx context.Context, w *indexWriter, token []byte, native tikvTransaction, seq uint64, value []byte) error {
+	if j.c.rawGraph != nil {
+		w.mu.Lock()
+		run := w.head.RawActive
+		w.mu.Unlock()
+		if run == nil {
+			return ErrFenced
+		}
+		return j.proposeRawSlot(ctx, w, token, *run, seq, value)
+	}
 	w.mu.Lock()
 	generation := w.lease.Generation
 	matches := bytes.Equal(token, w.lease.token())

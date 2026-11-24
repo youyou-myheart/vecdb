@@ -36,7 +36,9 @@ v13 聚类协议移除了图提交中的共享来源 fencing key 和 NOWAIT 悲�
 
 跨 Region 的图提交还可能让 ReplicaPlan 读取等待 2PC 锁。Gateway 的图查询在已有最近成功计划时，将新计划读取预算设为 100 ms；仅该读取超时时，才把最后一次成功读取的计划作为选副本的提示。地址提示不承担权限有效期；非租约读路径每次请求仍重新 Resolve 当前 owner；聚类图复制的普通查询使用轻量路由快照缓存地址，Worker 在查询前后校验本地读租约和 epoch（见 RPC.md）。计划年龄不能替代这些权威检查，也不能因为计划读取锁等待跨过一个任意缓存 TTL 就停止尝试仍然有效的副本。缓存不能用于 sync/checkpoint/prune/rebuild，不能授予构图或发布权限；不存在、损坏、空计划及调用者取消都不能被缓存掩盖。`vecdb_route_plan_fallback_total` 记录此回退，`route_plan/error` 继续保留底层超时证据。
 
-DataDispatcher 在数据持久化后收到本地唤醒。索引确认图提交后，同机 owner 直接接收内存回执，跨机通过 `wake_source` 发送源任期、目标索引和累计提交位置。来源按实际目标推进连续前缀，并合并写入完成检查点。未知提交只触发检查，丢失的回执由持久图日志补齐。
+DataDispatcher 在数据持久化后收到本地唤醒。索引确认图提交后，同机 owner 直接接收内存回执，跨机通过 `wake_source` 发送源任期、目标索引和累计提交位置。来源按实际目标推进内存中的连续完成位点，随现有数据 owner 续租上报。未知提交只触发检查，丢失的回执由持久图日志补齐。
+
+副本实际应用进度随原有 owner 续期写入 TiKV。控制循环每 `LEASE_TTL / 3` 检查一次，启用本地租约时，剩余有效期超过 TTL 的一半会跳过续期和进度写入。状态接口显示最近一次续期保存的位置，因此可能落后于副本内存中的实时进度。
 
 Follower 没有来源输入事件，通过带退避的空闲轮询追赶远端持久化图日志。Follower 查询捕获到更新的 Leader 位点时会立即唤醒消费者，转为 Leader 后关闭该轮询等待。DataDispatcher 保留 500 ms 控制巡检，用于租约管理、故障恢复和漏通知兜底；健康路径不等待它。旧的一一对应 pull 模式仍使用旧同步器。
 
@@ -425,7 +427,7 @@ curl -fsS -H "Authorization: Bearer $API_TOKEN" \
 | `dispatch_source` | 一个来源的读完成位点、读日志、查目标、推进完成及投递全过程，含空闲轮次 |
 | `dispatch_read_log` | 有界来源日志读取 |
 | `dispatch_poll_commits` | 逐个查询 IndexPartition 的 source commit |
-| `dispatch_advance_completed` | 完成前缀的 fencing 校验及 TiKV 事务提交 |
+| `dispatch_advance_completed` | 历史报告中的独立完成位点事务，当前分发路径已移除。 |
 | `dispatch_deliver` | 查目标 Leader、HTTP 投递到 admission 返回；含重试尝试，不等待构图 |
 | `dispatch_notify` | 异步来源提示的 owner 解析与网络发送，不在业务写 ACK 路径上 |
 | `index_admission` | 目标验证路由、日志证明、去重及入队；重复请求也计入 |
@@ -443,7 +445,6 @@ curl -fsS -H "Authorization: Bearer $API_TOKEN" \
 | `graph_catchup` | 对齐已发布版本，包含 load/apply；已经追平的空调用也计入 |
 | `graph_sync_lock_wait` / `graph_sync` | 等待 Service 同步互斥锁 / 拿锁后一次图同步 |
 | `worker_sync` / `worker_sync_interval` | 本进程整轮 SyncOwned / 相邻轮开始的间隔，后者首轮不采样；观察 Worker 时筛选 Worker 实例 |
-| `graph_progress_report` | 图位点、计划版本或上报状态变化时，将副本 Ready 状态与图进度合并提交到 TiKV |
 | `route_plan` / `route_owner` | Gateway 读取副本计划 / 解析 owner，用于区分元数据锁等待与 Worker 执行慢 |
 | `replica_rpc_search` / `replica_rpc_sync` 等 | Gateway 单次副本 RPC，包含通信及 Worker 执行，不包含获取计划与解析 owner |
 

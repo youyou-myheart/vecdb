@@ -67,7 +67,7 @@ func (c *Coordinator) writeGuardKey(id IndexPartitionID) []byte {
 
 func epochToken(epoch uint64) []byte { return strconv.AppendUint(nil, epoch, 10) }
 
-func (c *Coordinator) readOwner(ctx context.Context, tx transactionAPI, id IndexPartitionID) (Ownership, error) {
+func (c *Coordinator) readOwner(ctx context.Context, tx dataReader, id IndexPartitionID) (Ownership, error) {
 	b, e := tx.Get(ctx, c.ownerKey(id))
 	if e != nil {
 		return Ownership{}, e
@@ -128,7 +128,7 @@ func (c *Coordinator) Acquire(ctx context.Context, id IndexPartitionID, node Clu
 		return old, errors.New("ownership epoch exhausted")
 	}
 	o := Ownership{WriteEndpoint: registered.WriteEndpoint, Ready: id == masterLeaseID, Partition: id, Node: node.ID, Session: node.Session, URL: strings.TrimRight(node.URL, "/"), Epoch: old.Epoch + 1, Expires: now + c.ttl}
-	if c.root.packed != nil && strings.HasPrefix(string(id), "data-") {
+	if strings.HasPrefix(string(id), "data-") {
 		// This prefix was confirmed by every destination and reported in
 		// an existing lease renewal. It is safe to resume after takeover.
 		o.Offset = old.Offset

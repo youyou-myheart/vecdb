@@ -24,13 +24,13 @@ flowchart TD
 | 位置 | 内容 |
 |---|---|
 | TiKV data/wal/batch | 包含对应逻辑 LSN 的完整历史记录：向量、属性、revision、墓碑。旧版的物理 `data/log/LSN` 仍可读取。 |
-| TiKV graph/entries/sequence | previous、position、term、kind、累计 sources/source_epochs、累计 log_bytes、created_ms，以及内联的图增量正文、大小和 SHA-256 |
+| TiKV graph/raw-entries/run/sequence（聚类路由增量）或 graph/entries/sequence（历史与控制条目） | previous、position、term、kind、累计 sources/source_epochs、累计 log_bytes、created_ms，以及内联的图增量正文、大小和 SHA-256 |
 | 旧版 TiKV graph/payload/sequence/chunk | 升级前的外置图增量，按原描述读取，在对应条目 GC 时回收 |
 | SeaweedFS checkpoint | 完整的可恢复状态，见下一节 |
 
 原生补丁的 before/after 节点镜像也已去掉向量，不只是删除 JSON 的 records 字段。逻辑删除和后台旧位置清理用小型内联墓碑，无需捏造数据日志引用。
 
-每个新图增量只写一个 `entries/<sequence>` 键。TiKV 值依次包含四字节标记 `VGE1`、小端 uint32 的 JSON 头长度、JSON 头，以及 Snappy block 压缩的增量正文。头里的 `payload.chunks=0` 表示正文内联，`size` 和 SHA-256 均针对解压后的原文。检查点使用的 `log_bytes` 继续按原文累计。读取图尾仍会从 TiKV 取回整条压缩记录，但读取来源位点只解析头部。Follower 回放和订阅读取才解压正文，并核对原始长度与摘要。HTTP、gRPC 订阅返回原有 `payload_data`。控制条目沿用 JSON；历史 JSON 内联和历史多键分块都可回放、订阅和清理。原始正文上限为 32 MiB，本地和 CI 的 Raft entry 限额为 64 MiB。升级须先停旧版本，再启动新版全部角色。
+聚类路由的图增量用普通 RawKV 写一个 `raw-entries/<run>/<sequence>` 键。leader 按序写入，确认后应用。接管或写入结果未知时先暂停读取旧日志尾，确认旧日志的有效范围后使用新前缀，旧前缀上的迟到写入落在有效范围之外。旧 TxnKV 日志及 rebuild 的 `reset` 条目仍可按序回放。图检查点和订阅的回收位点照常推进，当前已越过该位点的 RawKV 图键保留在存储中。TiKV 值依次包含四字节标记 `VGE1`、小端 uint32 的 JSON 头长度、JSON 头，以及 Snappy block 压缩的增量正文。头里的 `payload.chunks=0` 表示正文内联，`size` 和 SHA-256 均针对解压后的原文。检查点使用的 `log_bytes` 继续按原文累计。读取图尾仍会从 TiKV 取回整条压缩记录，但读取来源位点只解析头部。Follower 回放和订阅读取才解压正文，并核对原始长度与摘要。HTTP、gRPC 订阅返回原有 `payload_data`。控制条目沿用 JSON；历史 JSON 内联和历史多键分块都可回放、订阅和清理。原始正文上限为 32 MiB，本地和 CI 的 Raft entry 限额为 64 MiB。升级须先停旧版本，再启动新版全部角色。
 
 Follower 按固定目标位点分批回放，在同一个 TiKV 快照中检查回收边界和日志哈希链，按原始载荷大小限制每批解压量。已完成检查点所覆盖的图日志在独立的回收锁下删除，采集订阅水位、校验检查点以及 TiKV 事务中的 fencing 仍然生效。
 

@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	tikverr "github.com/tikv/client-go/v2/error"
 	"golang.org/x/sync/errgroup"
 
 	"example.com/vector-storage/internal/lease"
@@ -49,10 +50,7 @@ type dataDispatcher struct {
 	writer       *mutationGroup
 	owner        Ownership
 	completed    uint64
-	persisted    uint64
 	recoveryHead uint64 // WAL tail recovered before accepting new requests
-	checkpointAt time.Time
-	windows      int
 	recovered    bool
 	window       []LogEvent
 	projection   dispatchProjection
@@ -110,31 +108,22 @@ func (p *dispatchProjection) destinations(event LogEvent) []IndexPartitionID {
 }
 
 func completedKey(r *Repository) []byte { return []byte(r.Prefix + "dispatch-completed") }
+
+// A legacy counter may still cover work completed before the upgrade.
+// Renewals publish current progress in the owner record.
 func (c *ClusterService) completedIn(ctx context.Context, tx dataReader, d DataPartitionID) (uint64, error) {
-	return c.data[d].readCounter(ctx, tx, "dispatch-completed")
-}
-
-// The packed writer reports its confirmed prefix with the existing lease
-// renewal. Graph cursors remain authoritative during replay after takeover.
-func (c *ClusterService) dispatchProgressKey(id DataPartitionID) []byte {
-	if c.data[id].packed != nil {
-		return c.coordinator.ownerKey(sourceID(id))
+	legacy, err := c.data[d].readCounter(ctx, tx, "dispatch-completed")
+	if err != nil {
+		return 0, err
 	}
-	return completedKey(c.data[id])
-}
-
-func (c *ClusterService) decodeDispatchProgress(id DataPartitionID, value []byte) (uint64, error) {
-	if len(value) == 0 {
-		return 0, nil
+	owner, err := c.coordinator.readOwner(ctx, tx, sourceID(d))
+	if tikverr.IsErrNotFound(err) {
+		return legacy, nil
 	}
-	if c.data[id].packed != nil {
-		var owner Ownership
-		err := json.Unmarshal(value, &owner)
-		return owner.Offset, err
+	if err != nil {
+		return 0, err
 	}
-	var completed uint64
-	err := json.Unmarshal(value, &completed)
-	return completed, err
+	return max(legacy, owner.Offset), nil
 }
 
 func (c *ClusterService) eventTargets(e LogEvent) []IndexPartitionID {
@@ -244,7 +233,7 @@ func (c *ClusterService) runDispatcher(ctx context.Context, id DataPartitionID, 
 
 func (c *ClusterService) dispatchTick(ctx context.Context) {
 	defer c.observations.pipeline.track("dispatch_tick", "")(nil)
-	if c.root.packed != nil {
+	if c.root.packed != nil || c.coordinator.rawGraph != nil {
 		// Route refresh belongs to the control loop. Delivery and ACKs only
 		// consume published snapshots and can retry after a route change.
 		_, _ = c.cachedSearchRoutes(ctx, false)
@@ -368,7 +357,7 @@ func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID,
 	done := s.completed
 	if len(s.window) == 0 {
 		s.projection = dispatchProjection{}
-		return c.flushCompleted(ctx, id, s, false)
+		return nil
 	}
 	// Each graph tail carries cumulative ACKs only for the events routed there.
 	// A delete broadcasts to all indexes, so its proof still requires all of them.
@@ -384,10 +373,6 @@ func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID,
 		if s.writer != nil {
 			s.writer.lease.indexed.Store(next)
 		}
-		s.windows++
-		if e = c.flushCompleted(ctx, id, s, s.writer == nil); e != nil {
-			return e
-		}
 		clear(s.window[:int(next-done)])
 		s.window = s.window[int(next-done):]
 		done = next
@@ -399,15 +384,10 @@ func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID,
 	}
 	var wg sync.WaitGroup
 	errs := make([]error, len(targets))
-	signWindow := s.writer != nil && s.writer.rawWriter == nil && c.token != ""
 	for n, target := range targets {
-		previous := max(commits[target], s.persisted)
-		// The live owner built byIndex from a complete, contiguous durable WAL
-		// window. Its completed prefix is backed by durable graph ACKs, even
-		// when the source's recovery checkpoint has not been flushed yet.
-		if signWindow {
-			previous = max(commits[target], done)
-		}
+		// Every event through done has a durable ACK from each of its
+		// destinations, including every index for a broadcast deletion.
+		previous := max(commits[target], done)
 		events := byIndex[target]
 		for len(events) > 0 && events[0].Sequence <= previous {
 			events = events[1:]
@@ -416,35 +396,24 @@ func (c *ClusterService) dispatchSource(ctx context.Context, id DataPartitionID,
 			continue
 		}
 		events = events[:min(len(events), dispatchBatchSize)]
-		// A long sparse skip needs a durable completed checkpoint for old peers.
-		if !signWindow && events[len(events)-1].Sequence-previous > dispatchBatchSize {
-			if e = c.flushCompleted(ctx, id, s, true); e != nil {
-				wg.Wait()
-				return e
-			}
-			previous = max(commits[target], done)
-		}
 		q := Delivery{Source: id, Owner: s.owner, RouteVersion: c.layout.Epoch, Previous: previous, Through: events[len(events)-1].Sequence, Events: events}
 		if s.writer != nil && s.writer.proofs.recentlyAdmitted(target, q.Through) {
 			continue
 		}
-		if signWindow {
-			var liveEpoch uint64
-			if !s.writer.lease.InLeaderLease(&liveEpoch) || liveEpoch != s.owner.Epoch {
-				wg.Wait()
-				return ErrFenced
+		if s.writer != nil && c.token != "" {
+			if s.writer.rawWriter != nil {
+				q.proof, e = c.signRawDelivery(target, q, s.writer, done)
+			} else {
+				var liveEpoch uint64
+				if !s.writer.lease.InLeaderLease(&liveEpoch) || liveEpoch != s.owner.Epoch {
+					wg.Wait()
+					return ErrFenced
+				}
+				q.proof, e = c.deliveryMAC(target, q, events)
 			}
-			q.proof, e = c.deliveryMAC(target, q, events)
 			if e != nil {
 				wg.Wait()
 				return e
-			}
-		} else if s.writer != nil && s.writer.rawWriter != nil && c.token != "" {
-			var err error
-			q.proof, err = c.signRawDelivery(target, q, s.writer, s.persisted)
-			if err != nil {
-				wg.Wait()
-				return err
 			}
 		}
 		if s.writer != nil {
@@ -472,7 +441,6 @@ func (c *ClusterService) loadDispatchWindow(ctx context.Context, id DataPartitio
 	}
 	if s.writer != nil && s.writer.lease.wal != nil && !s.recovered {
 		s.completed = s.writer.lease.wal.base
-		s.persisted = s.completed
 		s.writer.lease.indexed.Store(s.completed)
 		s.recovered = true
 	}
@@ -501,15 +469,12 @@ func (c *ClusterService) loadDispatchWindow(ctx context.Context, id DataPartitio
 		if e != nil {
 			return e
 		}
-		s.completed, s.persisted = done, done
+		s.completed = done
 		if s.writer != nil {
 			s.writer.lease.indexed.Store(done)
 		}
-		s.windows = 0
-		s.checkpointAt = time.Now()
 	}
-	// Commit can succeed in TiKV even when its response is lost. Reconcile the
-	// cached window against the durable prefix during recovery.
+	// Reconcile any cached window against the recovered durable prefix.
 	for len(s.window) > 0 && s.window[0].Sequence <= done {
 		s.window[0] = LogEvent{}
 		s.window = s.window[1:]
@@ -534,26 +499,9 @@ func (c *ClusterService) loadDispatchWindow(ctx context.Context, id DataPartitio
 		if err != nil {
 			return err
 		}
-		s.recovered = true
 		s.window = batch.Events
 	}
-	return nil
-}
-func (c *ClusterService) flushCompleted(ctx context.Context, id DataPartitionID, s *dataDispatcher, force bool) error {
-	if c.data[id].packed != nil && s.writer != nil && s.writer.lease.wal != nil {
-		return nil
-	}
-	if s.completed == s.persisted || !force && s.windows < 100 && time.Since(s.checkpointAt) < 500*time.Millisecond {
-		return nil
-	}
-	if err := c.advanceCompleted(ctx, id, s.owner, s.persisted, s.completed); err != nil {
-		s.recovered = false
-		s.window = nil
-		return err
-	}
-	s.persisted = s.completed
-	s.checkpointAt = time.Now()
-	s.windows = 0
+	s.recovered = true
 	return nil
 }
 
@@ -617,38 +565,6 @@ func (c *ClusterService) sourceCommits(ctx context.Context, id DataPartitionID, 
 		commits[target] = h.Sources[fmt.Sprint(id)]
 	}
 	return commits, nil
-}
-
-func (c *ClusterService) advanceCompleted(ctx context.Context, id DataPartitionID, owner Ownership, done, next uint64) (err error) {
-	defer c.observations.pipeline.track("dispatch_advance_completed", string(sourceID(id)))(&err)
-	tx, e := c.root.begin()
-	if e != nil {
-		return e
-	}
-	defer tx.Rollback()
-	commit := tx.Commit
-	if native, ok := nativeTiKV(tx); ok && c.coordinator.holdReleasedLeases {
-		grant, err := c.coordinator.liveOwner(ctx, tx, owner)
-		if err != nil {
-			return err
-		}
-		// The successor cannot take ownership until grant.Expires. Bound the
-		// only mutation (the cursor CAS) at TiKV as well as checking this snapshot.
-		commit = func(ctx context.Context) error { return native.commitOnePhaseBefore(ctx, grant.Expires) }
-	} else if e = c.coordinator.Fence(owner)(ctx, tx); e != nil {
-		return e
-	}
-	old, err := c.completedIn(ctx, tx, id)
-	if err != nil {
-		return err
-	}
-	if old != done || next < old {
-		return ErrConflict
-	}
-	if e = putJSON(tx, completedKey(c.data[id]), next); e != nil {
-		return e
-	}
-	return commit(ctx)
 }
 
 func (c *ClusterService) deliver(ctx context.Context, id IndexPartitionID, q Delivery) (err error) {

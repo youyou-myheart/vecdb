@@ -36,6 +36,7 @@ type Ownership struct {
 	Phase         string           `json:"phase,omitempty"`
 	LastError     string           `json:"last_error,omitempty"`
 	Offset        uint64           `json:"offset,omitempty"`
+	GraphPosition *GraphPosition   `json:"graph_position,omitempty"`
 	Partition     IndexPartitionID `json:"partition"`
 	Node          string           `json:"node"`
 	Session       string           `json:"session"`
@@ -46,6 +47,7 @@ type Ownership struct {
 	Released      bool             `json:"released,omitempty"`
 }
 type Coordinator struct {
+	rawGraph           graphRawClient
 	leaseReads         bool
 	holdReleasedLeases bool
 	referenceLogs      bool

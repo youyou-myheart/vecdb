@@ -14,12 +14,15 @@ func TestRawRoutedLayoutBackendIsolation(t *testing.T) {
 	ctx := context.Background()
 	route := &ClusterRouting{Version: 1, Centers: [][]float64{{0, 0}}}
 	open := func(r *Repository, raw bool) (PartitionLayout, error) {
-		return r.ensureRoutedLayoutWithBackend(ctx, 2, route, "hash", "node", false, raw)
+		return r.ensureRoutedLayoutWithBackend(ctx, 2, route, "hash", "node", false, raw, false)
 	}
 	const txnMode = "v14-cluster-routing-lease-hash-node-retention=false-owner-append-v1"
 
 	t.Run("raw restart", func(t *testing.T) {
 		r, db := newFakeRepo()
+		if raw, err := r.preferRawData(ctx); err != nil || !raw {
+			t.Fatal("new namespace should use RawKV", raw, err)
+		}
 		first, err := open(r, true)
 		if err != nil {
 			t.Fatal(err)
@@ -32,6 +35,9 @@ func TestRawRoutedLayoutBackendIsolation(t *testing.T) {
 		}
 		if err = r.ensureMode(ctx, false); err == nil {
 			t.Fatal("standalone startup accepted a raw namespace")
+		}
+		if raw, err := r.preferRawData(ctx); err != nil || !raw {
+			t.Fatal("existing RawKV namespace should keep its backend", raw, err)
 		}
 		second, err := open(r, true)
 		if err != nil || !reflect.DeepEqual(first, second) {
@@ -53,6 +59,9 @@ func TestRawRoutedLayoutBackendIsolation(t *testing.T) {
 				delete(db.data, key)
 			} else {
 				db.data[key] = []byte(existing)
+			}
+			if raw, err := r.preferRawData(ctx); err != nil || raw {
+				t.Fatal("existing TxnKV namespace should keep its backend", raw, err)
 			}
 			if _, err := open(r, true); err == nil {
 				t.Fatalf("raw startup accepted an existing routed layout with mode %q", existing)
@@ -91,16 +100,14 @@ func TestRawTiKVFallbackReadsContiguousBatchKeys(t *testing.T) {
 		}
 		batches = append(batches, b)
 	}
-	for _, n := range []int{0, 2} {
-		if err := writer.write(ctx, batches[n]); err != nil {
-			t.Fatal(err)
-		}
+	if confirmed, err := writer.write(ctx, batches[0], batches[2]); err != nil || confirmed != 2 {
+		t.Fatal(confirmed, err)
 	}
 	probe.heads = 0
 	if prefix, err := reader.snapshot(ctx, repo.Prefix); err != nil || prefix.end != 1 || probe.heads != 1 {
 		t.Fatal(prefix, err, probe.heads)
 	}
-	if err := writer.write(ctx, batches[1]); err != nil {
+	if _, err := writer.write(ctx, batches[1]); err != nil {
 		t.Fatal(err)
 	}
 	if prefix, err := reader.snapshot(ctx, repo.Prefix); err != nil || prefix.end != 3 {

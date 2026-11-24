@@ -181,7 +181,7 @@ func TestRoutedMinVisibleReadsRecordAndSynchronizesOnce(t *testing.T) {
 	l, _ := newLayout(1)
 	l.Routing = &ClusterRouting{Version: 1, Centers: [][]float64{{0, 0}}}
 	index := &visibilityPartition{}
-	c := &ClusterService{root: r, PartitionedService: &PartitionedService{layout: l, router: clusterRouter{IdentityPartitionRouter{l}, l.Routing}, data: map[DataPartitionID]*Repository{0: r}, indexes: map[IndexPartitionID]PartitionIndex{"index-0000": index}, dimension: 2}}
+	c := &ClusterService{root: r, coordinator: &Coordinator{root: r}, PartitionedService: &PartitionedService{layout: l, router: clusterRouter{IdentityPartitionRouter{l}, l.Routing}, data: map[DataPartitionID]*Repository{0: r}, indexes: map[IndexPartitionID]PartitionIndex{"index-0000": index}, dimension: 2}}
 	base := r.beginTxn
 	reads := map[string]int{}
 	r.beginTxn = func() (transactionAPI, error) { tx, err := base(); return &countedScheduleTx{tx, reads}, err }

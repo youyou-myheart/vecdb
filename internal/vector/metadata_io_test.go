@@ -98,52 +98,112 @@ func TestDispatcherIdleAndCachedWindowMetadataIO(t *testing.T) {
 		t.Fatal("retired wake renewed authority", calls)
 	}
 }
-func TestReplicaProgressReportsOnlyConfirmedChanges(t *testing.T) {
+func TestReplicaGraphProgressSharesRenewal(t *testing.T) {
 	f := newMigrationFixture(t)
 	p := f.tick()
 	f.ready(p, 0)
 	o := f.owners[p.Serving[0].Partition]
-	renewed, err := f.c.Resolve(f.ctx, o.Partition)
-	if err != nil {
-		t.Fatal(err)
-	}
 	j := graphJournal{f.c, "index-0000", o}
-	service := &localPartition{owner: o}
-	var metrics pipelineMetrics
-	report := func(v uint64, pos GraphPosition) error {
-		return service.reportGraphProgress(f.ctx, j, v, renewed, pos, &metrics)
-	}
-	first := GraphPosition{Sequence: 1, DataOffset: 2, Hash: "first"}
+	g := &graphReplica{journal: j}
+	entry := &localPartition{owner: o, service: &Service{graphReplica: g}}
+	t.Cleanup(entry.retireReads)
+	c := &ClusterService{root: f.root, coordinator: f.c, localOwnerLeases: true}
+	renew := func() { c.renewAssignedReplica(f.ctx, entry, f.layout.Bindings[0], p) }
+	// A renewal reads ownership and assignment, and writes only ownership.
+	f.db.getFail = string(f.c.taskFenceKey(j.id))
+	f.db.setFail = 2
 	before := f.db.commits
-	if err = report(p.Version, first); err != nil || f.db.commits != before+1 {
-		t.Fatal(err, f.db.commits-before)
+	renew()
+	current, err := f.c.Resolve(f.ctx, o.Partition)
+	if err != nil || f.db.commits != before+1 || current.GraphPosition == nil || *current.GraphPosition != g.position || current.Phase != "Ready" {
+		t.Fatal("empty graph position was not included in renewal", current, err)
 	}
-	renewed, err = f.c.Resolve(f.ctx, o.Partition)
-	if err != nil || renewed.Offset != 2 {
-		t.Fatal(err, renewed)
+	if _, found := f.db.data[string(j.key("progress/"+string(o.Partition)))]; found {
+		t.Fatal("renewal wrote a separate progress record")
 	}
-	f.db.beginErr = injected // No transaction on an idle confirmed heartbeat.
-	if err = report(p.Version, first); err != nil {
+	// Applying more entries cannot trigger storage IO before renewal is due.
+	g.position = GraphPosition{Sequence: 1, DataOffset: 2, Hash: "first"}
+	begin := f.root.beginTxn
+	f.root.beginTxn = func() (transactionAPI, error) {
+		t.Fatal("progress opened a transaction before renewal was due")
+		return nil, injected
+	}
+	renew()
+	f.root.beginTxn = begin
+	if pos, err := j.Progress(f.ctx, o); err != nil || pos != (GraphPosition{}) {
+		t.Fatal("progress changed before renewal", pos, err)
+	}
+	for _, uncertain := range []bool{false, true} {
+		entry.grantReadLease(time.Now().Add(-40*time.Second), current, time.Minute)
+		old, _ := entry.readLease.Snapshot()
+		f.db.commitErr, f.db.committedDespiteError = injected, uncertain
+		renew()
+		if now, ok := entry.readLease.Snapshot(); !ok || now != old {
+			t.Fatal("unconfirmed renewal extended local authority", now, old)
+		}
+		f.db.commitErr, f.db.committedDespiteError = nil, false
+		before = f.db.commits
+		renew()
+		if f.db.commits != before+1 {
+			t.Fatal("progress retry needed a separate commit", f.db.commits-before)
+		}
+		current, err = f.c.Resolve(f.ctx, o.Partition)
+		if err != nil || current.Offset != g.position.DataOffset || current.GraphPosition == nil || *current.GraphPosition != g.position {
+			t.Fatal("renewal did not report the applied position", current, err)
+		}
+		// Control entries advance the graph sequence without changing DataOffset.
+		g.position = GraphPosition{Sequence: 2, DataOffset: 2, Hash: "next"}
+	}
+	if pos, err := j.Progress(f.ctx, o); err != nil || pos != g.position {
+		t.Fatal(pos, err)
+	}
+	// A delayed capture must not overwrite a newer confirmed position.
+	g.position = GraphPosition{Sequence: 1, DataOffset: 2, Hash: "first"}
+	entry.grantReadLease(time.Now().Add(-40*time.Second), current, time.Minute)
+	renew()
+	if pos, err := j.Progress(f.ctx, o); err != nil || pos != *current.GraphPosition {
+		t.Fatal("older capture replaced newer progress", pos, err)
+	}
+}
+
+func TestReplicaGraphProgressLegacyAndReplacement(t *testing.T) {
+	f := newMigrationFixture(t)
+	p := f.tick()
+	f.ready(p, 0)
+	o := f.owners[p.Serving[0].Partition]
+	j := graphJournal{f.c, "index-0000", o}
+	pos := GraphPosition{Sequence: 1, DataOffset: 2, Hash: "legacy"}
+	seed(f.db, j.key("progress/"+string(o.Partition)), graphAck{o, pos})
+	if got, err := j.Progress(f.ctx, o); err != nil || got != pos {
+		t.Fatal("legacy progress unreadable", got, err)
+	}
+	next := GraphPosition{Sequence: 2, DataOffset: 2, Hash: "renewed"}
+	if _, err := f.c.update(f.ctx, o, true, false, func(current *Ownership) {
+		current.GraphPosition = &next
+		current.Offset = next.DataOffset
+	}); err != nil {
 		t.Fatal(err)
-	}
-	f.db.beginErr = nil
-	// An epoch-control entry can advance the graph sequence without a data change.
-	next := GraphPosition{Sequence: 2, DataOffset: 2, Hash: "next"}
-	f.db.commitErr = injected
-	f.db.committedDespiteError = true
-	if err = report(p.Version, next); !errors.Is(err, injected) {
-		t.Fatal(err)
-	}
-	f.db.commitErr = nil
-	before = f.db.commits
-	if err = report(p.Version, next); err != nil || f.db.commits != before+1 {
-		t.Fatal("unknown outcome cached", err)
 	}
 	if got, err := j.Progress(f.ctx, o); err != nil || got != next {
-		t.Fatal(got, err)
+		t.Fatal("legacy progress hid the renewed position", got, err)
 	}
-	if err = report(p.Version+1, next); !errors.Is(err, ErrFenced) {
-		t.Fatal("stale plan report accepted", err)
+	if _, err := f.c.Update(f.ctx, o, false, true); err != nil {
+		t.Fatal(err)
+	}
+	var node ClusterNode
+	for _, n := range f.nodes {
+		if n.ID == o.Node {
+			node = n
+		}
+	}
+	replacement, err := f.c.Acquire(f.ctx, o.Partition, node)
+	if err != nil || replacement.GraphPosition != nil || replacement.Offset != 0 {
+		t.Fatal("replacement inherited another process's applied position", replacement, err)
+	}
+	for _, owner := range []Ownership{o, replacement} {
+		if _, err := j.Progress(f.ctx, owner); !errors.Is(err, ErrFenced) {
+			t.Fatal("old process progress accepted", err)
+		}
 	}
 }
 

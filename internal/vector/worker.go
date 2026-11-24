@@ -4,19 +4,23 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"example.com/vector-storage/internal/lease"
 )
 
 // Worker follows durable master intent. It never computes placement itself.
 type Worker struct{ cluster *ClusterService }
 
-func (c *ClusterService) renewReplica(ctx context.Context, entry *localPartition, ready bool) (Ownership, error) {
+func (c *ClusterService) renewReplica(ctx context.Context, entry *localPartition, ready bool, report func(*Ownership)) (Ownership, error) {
 	ttl := time.Duration(c.coordinator.ttl) * time.Millisecond
 	if ready && c.localReadLeases() {
 		if grant, live := entry.readLease.Snapshot(); live && time.Until(grant.Deadline) > ttl/2 {
 			return Ownership{}, nil
 		}
 	}
-	o, started, err := c.coordinator.renewOwner(ctx, entry.owner, ready)
+	o, started, err := lease.Refresh(ctx, func(ctx context.Context) (Ownership, error) {
+		return c.coordinator.update(ctx, entry.owner, ready, false, report)
+	})
 	if err == nil && ready {
 		entry.grantReadLease(started, o, ttl)
 	}
@@ -52,7 +56,7 @@ func (w *Worker) Tick(ctx context.Context) {
 		entry.mu.RLock()
 		ready := entry.service != nil
 		entry.mu.RUnlock()
-		if _, err := c.renewReplica(ctx, entry, ready); errors.Is(err, ErrFenced) {
+		if _, err := c.renewReplica(ctx, entry, ready, nil); errors.Is(err, ErrFenced) {
 			c.remove(entry)
 		}
 	}

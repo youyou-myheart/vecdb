@@ -127,6 +127,11 @@ func TestDataWALTiKVRecoveryAndDispatch(t *testing.T) {
 	if err := f.c.dispatchSource(f.ctx, 0, recovered); err != nil || recovered.completed != 2 {
 		t.Fatal("recover target ACKs", recovered.completed, err)
 	}
+	if _, err := f.c.coordinator.update(ctx, f.source, true, false, func(o *Ownership) {
+		o.Offset = recovered.completed
+	}); err != nil {
+		t.Fatal("report confirmed prefix with lease renewal", err)
+	}
 	next := state(2)
 	if err := repo.recoverDataWAL(ctx, next); err != nil || next.head.Load() != 2 {
 		t.Fatal("recover WAL", next.head.Load(), err)
@@ -136,8 +141,8 @@ func TestDataWALTiKVRecoveryAndDispatch(t *testing.T) {
 		t.Fatal(results, next.head.Load(), err)
 	}
 	resumed := &dataDispatcher{owner: f.source}
-	if err := f.c.loadDispatchWindow(ctx, 0, resumed); err != nil || resumed.persisted != 2 || len(resumed.window) != 1 || resumed.window[0].Sequence != 3 {
-		t.Fatal("cursor on restart", resumed.persisted, resumed.window, err)
+	if err := f.c.loadDispatchWindow(ctx, 0, resumed); err != nil || resumed.completed != 2 || len(resumed.window) != 1 || resumed.window[0].Sequence != 3 {
+		t.Fatal("cursor on restart", resumed.completed, resumed.window, err)
 	}
 	if wal.Load() != 2 || commits.Load() != 0 {
 		t.Fatal("WAL one-phase commits / separate commits", wal.Load(), commits.Load())

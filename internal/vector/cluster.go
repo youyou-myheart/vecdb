@@ -83,10 +83,7 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 	if err := cfg.IndexPolicy.Validate(); err != nil {
 		return nil, err
 	}
-	if cfg.DataBackend == "" {
-		cfg.DataBackend = "txn"
-	}
-	if cfg.DataBackend != "txn" && cfg.DataBackend != "raw" {
+	if cfg.DataBackend != "" && cfg.DataBackend != "txn" && cfg.DataBackend != "raw" {
 		return nil, errors.New("DATA_BACKEND must be txn or raw")
 	}
 	rawBackend := cfg.DataBackend == "raw"
@@ -173,12 +170,19 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 		return nil, e
 	}
 	var layout PartitionLayout
+	rawGraph := cfg.Routing != nil && root.Client != nil
 	var e error
 	if cfg.Routing != nil {
 		if cfg.IndexReplication != "graph" || cfg.Replicas != 2 {
 			return nil, errors.New("cluster routing requires graph replication and two replicas")
 		}
-		layout, e = root.ensureRoutedLayoutWithBackend(ctx, count, cfg.Routing, cfg.Scheduler, cfg.FailureDomain, cfg.ConsumerRetention, rawBackend)
+		if cfg.DataBackend == "" && !cfg.ConsumerRetention {
+			rawBackend, e = root.preferRawData(ctx)
+			if e != nil {
+				return nil, e
+			}
+		}
+		layout, e = root.ensureRoutedLayoutWithBackend(ctx, count, cfg.Routing, cfg.Scheduler, cfg.FailureDomain, cfg.ConsumerRetention, rawBackend, rawGraph)
 	} else {
 		layout, e = root.ensureLayout(ctx, count)
 	}
@@ -217,22 +221,28 @@ func OpenClusterService(ctx context.Context, root *Repository, objects ObjectAPI
 		walRoot.packed = &packedStore{namespace: root.Prefix, count: count, client: root.Client}
 		root = &walRoot
 	}
-	if rawBackend {
-		raw, err := openRawDataStore(ctx, root.pd, root.Prefix)
-		if err != nil {
-			return nil, err
+	var rawStore *rawDataStore
+	if rawBackend || rawGraph {
+		rawStore, e = openRawDataStore(ctx, root.pd, root.Prefix)
+		if e != nil {
+			return nil, e
 		}
 		defer func() {
 			if !started {
-				_ = raw.Close()
+				_ = rawStore.Close()
 			}
 		}()
-		rawRoot := *root
-		rawRoot.raw = raw
-		root = &rawRoot
+		if rawBackend {
+			rawRoot := *root
+			rawRoot.raw = rawStore
+			root = &rawRoot
+		}
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	c := &ClusterService{indexPolicy: cfg.IndexPolicy.clone(), cachedRouting: true, localOwnerLeases: true, runCtx: runCtx, consumerRetention: cfg.ConsumerRetention, graphReplication: cfg.IndexReplication == "graph", lastSample: time.Now(), replicas: cfg.Replicas, PartitionedService: &PartitionedService{layout: layout, router: IdentityPartitionRouter{layout}, data: map[DataPartitionID]*Repository{}, indexes: map[IndexPartitionID]PartitionIndex{}, dimension: root.Dimension}, coordinator: &Coordinator{leaseReads: cfg.Routing != nil, holdReleasedLeases: true, failureDomain: cfg.FailureDomain, loadBalance: cfg.Scheduler == "load", balanceCooldown: cfg.BalanceCooldown, root: root, ttl: cfg.LeaseTTL.Milliseconds()}, node: node, objects: objects, token: cfg.Token, root: root, locals: map[IndexPartitionID]*localPartition{}, cancel: cancel, done: make(chan struct{}), client: &http.Client{Timeout: 30 * time.Second}}
+	if rawGraph {
+		c.coordinator.rawGraph = rawStore.client.(graphRawClient)
+	}
 	if cfg.Routing != nil {
 		c.router = clusterRouter{IdentityPartitionRouter{layout}, layout.Routing}
 		c.writers = make(map[DataPartitionID]*mutationGroup)
@@ -389,7 +399,11 @@ func (c *ClusterService) Close() {
 	if c.master != nil {
 		c.master.releaseLease(ctx)
 	}
-	if c.root.raw != nil {
+	if c.coordinator.rawGraph != nil {
+		if err := c.coordinator.rawGraph.Close(); err != nil {
+			log.Printf("close raw graph store: %v", err)
+		}
+	} else if c.root.raw != nil {
 		if err := c.root.raw.Close(); err != nil {
 			log.Printf("close raw data store: %v", err)
 		}

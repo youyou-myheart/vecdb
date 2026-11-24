@@ -33,11 +33,22 @@ func (c tikvRawDataClient) BatchPut(ctx context.Context, keys, values [][]byte) 
 }
 
 func (c tikvRawDataClient) CompareAndSwap(ctx context.Context, key, old, next []byte) ([]byte, bool, error) {
-	return c.Client.CompareAndSwap(ctx, key, old, next)
+	// Takeover keys use CAS. WAL keys use plain RawKV writes. Keep the
+	// transport shared and set the mode on a copy of the client handle.
+	cas := *c.Client
+	return cas.SetAtomicForCAS(true).CompareAndSwap(ctx, key, old, next)
 }
 
 func (c tikvRawDataClient) BatchGet(ctx context.Context, keys [][]byte) ([][]byte, error) {
 	return c.Client.BatchGet(ctx, keys)
+}
+
+func (c tikvRawDataClient) last(ctx context.Context, start, end []byte) ([]byte, []byte, error) {
+	keys, values, err := c.ReverseScan(ctx, end, start, 1)
+	if err != nil || len(keys) == 0 {
+		return nil, nil, err
+	}
+	return keys[0], values[0], nil
 }
 
 type rawDataStore struct {
@@ -59,7 +70,7 @@ func openRawDataStore(ctx context.Context, pd []string, namespace string) (*rawD
 	if err != nil {
 		return nil, err
 	}
-	return newRawDataStore(tikvRawDataClient{client.SetAtomicForCAS(true)}, namespace), nil
+	return newRawDataStore(tikvRawDataClient{client}, namespace), nil
 }
 
 func (s *rawDataStore) Close() error { return s.client.Close() }

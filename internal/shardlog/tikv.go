@@ -9,7 +9,6 @@ import (
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	tikverr "github.com/tikv/client-go/v2/error"
 	"github.com/tikv/client-go/v2/kv"
-	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/tikvrpc"
 	"github.com/tikv/client-go/v2/tikvrpc/interceptor"
 	"github.com/tikv/client-go/v2/txnkv/transaction"
@@ -26,7 +25,7 @@ func Insert(ctx context.Context, t *transaction.KVTxn, key, value []byte) error 
 	if err := t.GetMemBuffer().SetWithFlags(key, value, kv.SetPresumeKeyNotExists); err != nil {
 		return err
 	}
-	err := commitOnePhase(ctx, t, 0, key)
+	err := commitOnePhase(ctx, t, key)
 	var exists *tikverr.ErrKeyExist
 	if errors.As(err, &exists) {
 		return ErrOccupied
@@ -34,14 +33,7 @@ func Insert(ctx context.Context, t *transaction.KVTxn, key, value []byte) error 
 	return err
 }
 
-func CommitBefore(ctx context.Context, t *transaction.KVTxn, expires int64) error {
-	if expires <= oracle.ExtractPhysical(t.StartTS()) {
-		return ErrFenced
-	}
-	return commitOnePhase(ctx, t, oracle.ComposeTS(expires, 0)-1, nil)
-}
-
-func commitOnePhase(ctx context.Context, t *transaction.KVTxn, lastTS uint64, insertKey []byte) error {
+func commitOnePhase(ctx context.Context, t *transaction.KVTxn, insertKey []byte) error {
 	var split atomic.Bool
 	start := t.StartTS()
 	t.SetEnable1PC(true)
@@ -65,12 +57,6 @@ func commitOnePhase(ctx context.Context, t *transaction.KVTxn, lastTS uint64, in
 				!bytes.Equal(p.Mutations[0].Key, insertKey) || !bytes.Equal(p.PrimaryLock, insertKey)) {
 				return rejectPrewrite("expected one immutable log slot"), nil
 			}
-			if lastTS != 0 && (p.MaxCommitTs == 0 || p.MaxCommitTs > lastTS) {
-				p.MaxCommitTs = lastTS
-			}
-			if p.MaxCommitTs != 0 && p.MinCommitTs > p.MaxCommitTs {
-				return rejectPrewrite("commit timestamp exceeds its bound"), nil
-			}
 			return next(target, req)
 		}
 	}
@@ -91,7 +77,7 @@ func rejectPrewrite(reason string) *tikvrpc.Response {
 
 // Commit uses one 1PC request for an already buffered set of mutations.
 // The caller must ensure all keys fit in one request and one Region.
-func Commit(ctx context.Context, t *transaction.KVTxn) error { return commitOnePhase(ctx, t, 0, nil) }
+func Commit(ctx context.Context, t *transaction.KVTxn) error { return commitOnePhase(ctx, t, nil) }
 
 func (s Stream) Append(ctx context.Context, t *transaction.KVTxn, lsn uint64, payload []byte) error {
 	if len(s) == 0 || lsn == 0 || len(payload) == 0 {
