@@ -314,7 +314,7 @@ func oneProcessPipeline(t *testing.T, graph, retention bool, clustered ...bool) 
 		state := status(g0)
 		if routing != nil {
 			for _, d := range state.DataProgress {
-				if d.Completed != d.Head {
+				if !d.Fresh || d.Completed != d.Head {
 					return false
 				}
 			}
@@ -623,7 +623,7 @@ func oneProcessPipeline(t *testing.T, graph, retention bool, clustered ...bool) 
 					return false
 				}
 				for _, d := range s.DataProgress {
-					if d.Floor > d.Completed || d.Completed != d.Head || d.Owner.Node == "" {
+					if !d.Fresh || d.Floor > d.Completed || d.Completed != d.Head || d.Owner.Node == "" {
 						return false
 					}
 				}

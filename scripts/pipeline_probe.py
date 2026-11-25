@@ -128,6 +128,8 @@ def drain_summary(rows):
     """
     if not rows: raise ValueError('empty drain trace')
     final = rows[-1]['state']
+    if not all(d.get('progress_fresh', d.get('owner_available', False)) for d in final['data_progress'].values()):
+        raise ValueError('final data progress is not current')
     heads = final['graph_heads']
     targets = {replica['partition']:head['committed']['sequence']
                for index, head in heads.items() for replica in final['replica_owners'][index]['owners']}
@@ -141,10 +143,12 @@ def drain_summary(rows):
             graph_visible=all(state['graph_heads'][index]['visible']['sequence']>=head['committed']['sequence'] for index,head in heads.items()),
             replicas_local=all(local.get(replica,-1)>=sequence for replica,sequence in targets.items()),
             replicas_reported=all(state.get('graph_positions',{}).get(replica,{}).get('sequence',-1)>=sequence for replica,sequence in targets.items()),
-            source_completed=all(state['data_progress'][source]['completed_lsn']>=d['head'] for source,d in final['data_progress'].items()))
+            source_completed=all(state['data_progress'][source].get('progress_fresh', state['data_progress'][source].get('owner_available', False)) and
+                state['data_progress'][source]['completed_lsn']>=d['head'] for source,d in final['data_progress'].items()))
         for name, done in checks.items():
             if done: first.setdefault(name, row['elapsed_seconds'])
     return dict(first_observed_seconds=first, all_converged_seconds=rows[-1]['elapsed_seconds'], samples=len(rows),
                 max_observation_gap_seconds=max((b['elapsed_seconds']-a['elapsed_seconds'] for a,b in zip(rows,rows[1:])),default=0),
-                initial_pending_events=sum(d['head']-d['completed_lsn'] for d in rows[0]['state']['data_progress'].values()),
+                initial_pending_events=(sum(d['head']-d['completed_lsn'] for d in rows[0]['state']['data_progress'].values())
+                    if all(d.get('progress_fresh', d.get('owner_available', False)) for d in rows[0]['state']['data_progress'].values()) else None),
                 drain_stage_metrics=interval(rows[0]['local'],rows[-1]['local']))

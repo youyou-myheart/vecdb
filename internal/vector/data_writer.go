@@ -17,6 +17,7 @@ func (c *ClusterService) recoverWriterWithLease(ctx context.Context, id DataPart
 	defer c.observations.pipeline.track("data_writer_recover", string(o.Partition))(&err)
 	repo := c.data[id]
 	state.owner, state.guard, state.token = o, c.coordinator.writeGuardKey(o.Partition), epochToken(o.Epoch)
+	state.indexed.Store(o.Offset)
 	state.boundCommitTS = c.coordinator.holdReleasedLeases
 	group := newMutationGroup(c.runCtx, repo, &c.observations.pipeline, string(o.Partition))
 	group.lease = state
@@ -44,6 +45,11 @@ func (c *ClusterService) recoverWriterWithLease(ctx context.Context, id DataPart
 		return nil, err
 	}
 	state.head.Store(head)
+	floor, err := repo.readCounter(ctx, tx, "log-floor")
+	if err != nil {
+		return nil, err
+	}
+	state.floor.Store(floor)
 	return group, nil
 }
 func (c *ClusterService) retireWriter(id DataPartitionID) {

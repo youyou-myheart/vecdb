@@ -9,7 +9,7 @@ import (
 
 func TestClusterMetricsSemantics(t *testing.T) {
 	s := ClusterStatus{Ready: true, Routing: &ClusterRouting{Version: 7},
-		DataProgress:   map[string]DataProgress{"data-0000": {Head: 20, Completed: 12, Floor: 5, Owner: Ownership{Node: "worker", Epoch: 4, LastError: "failure"}}},
+		DataProgress:   map[string]DataProgress{"data-0000": {Known: true, Fresh: true, Head: 20, Completed: 12, Floor: 5, Owner: Ownership{Node: "worker", Epoch: 4, LastError: "failure"}}},
 		GraphHeads:     map[IndexPartitionID]GraphHead{"index-0000": {SourceEpochs: map[string]uint64{"0": 4}, Term: 3, Committed: GraphPosition{Sequence: 9}, Visible: GraphPosition{Sequence: 9}, Sources: map[string]uint64{"0": 17}}},
 		ReplicaOwners:  map[IndexPartitionID]ReplicaOwners{"index-0000": {Owners: []Ownership{{Partition: "replica-a"}, {Partition: "replica-b"}}}},
 		GraphPositions: map[IndexPartitionID]GraphPosition{"replica-a": {Sequence: 6}},
@@ -73,6 +73,7 @@ func TestDispatchObservationsTrackFailuresAndDuplicates(t *testing.T) {
 
 func TestDataOwnerAvailabilityAfterRelease(t *testing.T) {
 	f, c, owner := routedFixture(t)
+	attachProgressWriter(t, f, c, owner)
 	s, err := c.Status(f.ctx)
 	if err != nil || !s.DataProgress["data-0000"].OwnerAvailable {
 		t.Fatal(s, err)

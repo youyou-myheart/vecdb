@@ -163,7 +163,7 @@ Worker 在既有心跳的 `load` 中上报 `live_records` 与 `records_known`。
 - 后台自动运行有界清理；`cluster prune` 也可显式触发；本模式返回 data-NNNN 的 floor。图 floor 在 cluster status 中查看。
 - 数据快照暂不回收；历史图快照和永久对象回收标记的既有保留边界不变。
 
-`vectorctl cluster status`、HTTP `/v1/cluster` 和 gRPC GetCluster 提供 `data_progress`：每个数据分区的 head、completed_lsn、floor、处理器 ownership；`graph_heads[*].sources` 展示来源完成水位，`source_epochs` 展示该 Index 已接受的来源 epoch。响应中的来源 owner.offset 取该数据快照的 completed_lsn。owner 续租时同时上报 offset 与最近一次处理错误。状态是观测信息，不是全局原子快照。
+`vectorctl cluster status`、HTTP `/v1/cluster` 和 gRPC GetCluster 提供 `data_progress`：每个数据分区的 head、completed_lsn、floor、处理器 ownership。查询先批量读取负责人信息，再通过内部 `data_progress` 请求取得负责人内存中的三个数字，不读取数据日志。`progress_fresh` 表示本次收到有效回复；失联时返回带 `observed_at_ms`、`observed_epoch` 的旧样本或 `progress_known=false`，不能据此判断已经追平。`owner.offset` 是上次续租保存的进度，可能落后于本次内存中的 `completed_lsn`。owner 续租时同时上报 offset 与最近一次处理错误。`graph_heads[*].sources` 展示来源完成水位，`source_epochs` 展示该 Index 已接受的来源 epoch。状态是观测信息，不是全局原子快照。
 
 ## 启动与验收
 

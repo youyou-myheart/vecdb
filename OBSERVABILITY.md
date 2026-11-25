@@ -30,7 +30,11 @@ curl -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:18202/v1/cluster
 .tools/vectorctl cluster status
 ```
 
-地址随本地集群端口参数变化。Python `client.cluster()`、Go SDK GetCluster 和 vectorctl 的集群状态保留精确 uint64 位点，并新增 `data_progress[data-NNNN].owner_available`。`owner` 可能保留已过期 owner 的 epoch、错误和身份，是否可用必须看 `owner_available`。
+地址随本地集群端口参数变化。Python `client.cluster()`、Go SDK GetCluster 和 vectorctl 的集群状态保留精确 uint64 位点。`data_progress[data-NNNN]` 直接向当前数据分区负责人查询内存中的进度数字，不读取或缓存历史数据日志。
+
+`progress_fresh=true` 表示本次查询收到当前负责人的有效回复。`progress_known=true` 表示至少拿到过一次进度；负责人无法回复时，保留上次的数字并将 `progress_fresh`、`owner_available` 设为 false。首次查询就失败时，`progress_known=false`，此时零值不代表分区为空。`observed_at_ms` 是负责人采样时的 Unix 毫秒时间，`observed_epoch` 是该次采样的负责人任期。`owner` 则描述本次查到的负责人，可能与旧样本所属任期不同。
+
+自动判断“已经追平”必须先检查 `progress_fresh`，再比较 `head` 与 `completed_lsn`。任一数据分区没有新进度时，集群状态的 `ready=false`。所有进度 RPC 共用 1 秒等待预算，最多并发 8 个；该预算不包含 TiKV 中负责人、索引等元数据的读取时间。
 
 ## 指标语义
 
@@ -47,7 +51,8 @@ curl -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:18202/v1/cluster
 | `vecdb_data_head_lsn` / `completed_lsn` / `floor_lsn` | 每个 DataPartition 的写入头、连续完成前缀、保留底线；应满足 floor ≤ completed ≤ head |
 | `vecdb_data_pending_events` | head − completed；持续大于零且 completed 不变表示投递或构图停滞 |
 | `vecdb_data_retained_events` | head − floor；消费租约 pin 住 GC 时可能增大，不一定是投递异常 |
-| `vecdb_data_owner_available` / `owner_epoch` / `dispatch_error` | 来源调度者的租约可用性、最近看到的 epoch、当前报告是否含错误；错误详情看状态中的 owner.last_error |
+| `vecdb_data_owner_available` / `owner_epoch` / `dispatch_error` | 当前负责人是否回复了有效进度、最近看到的 epoch、当前报告是否含错误；错误详情看状态中的 owner.last_error |
+| `vecdb_data_progress_fresh` / `progress_known` | 是否收到本次有效进度、是否曾取得进度；fresh 为 0 时不输出 head/completed/floor/pending/retained 指标，避免把未知或旧数据当作零积压 |
 | `vecdb_index_source_epoch{index_partition,source}` | 该 Index 已持久化接受的来源 epoch，不等于 Coordinator 当前租约，也不表示副本已回放 |
 | `vecdb_index_source_epoch_advances_total{index_partition,source}` | 本进程确认提交成功的 epoch 控制记录数；未知提交后来恢复的不补记，权威状态看 source_epoch gauge |
 | `vecdb_index_source_epoch_rejections_total{index_partition,phase}` | `admission` / `commit` 阶段拒绝旧 epoch 的次数；与背压、一般 Index Leader fencing 分开 |
@@ -109,7 +114,7 @@ Graph committed 与 visible 在新协议中相等，均表示持久化可回放�
 
 ### 数据分片写入 owner
 
-聚类布局下，Worker 的 `vecdb_pipeline_stage_seconds` 按分片记录三个阶段。通过 `stage="data_writer_recover"` 的 `_count` 和 `_sum` 查看恢复次数和耗时，聚类 TxnKV 恢复会读取批日志尾、逻辑事件尾或回收位点，并补齐末批的记录和回执。连续写入时观察 `data_owner_mutate` 的请求数和 `data_group_commit` 的批次数。后者的耗时包括批日志持久化和记录、事件、回执投影。Dispatcher 的日志读取另计入 `dispatch_read_log`。SDK 直连的写入计入 Worker 指标。Gateway 的 `data_mutate` 只统计从 Gateway 转发的调用。运维查询 `data_progress` 可以在 owner 离线时从 TiKV 快照读取持久化 head、floor、completed_lsn。
+聚类布局下，Worker 的 `vecdb_pipeline_stage_seconds` 按分片记录三个阶段。通过 `stage="data_writer_recover"` 的 `_count` 和 `_sum` 查看恢复次数和耗时，聚类 TxnKV 恢复会读取批日志尾、逻辑事件尾或回收位点，并补齐末批的记录和回执。连续写入时观察 `data_owner_mutate` 的请求数和 `data_group_commit` 的批次数。后者的耗时包括批日志持久化和记录、事件、回执投影。Dispatcher 的日志读取另计入 `dispatch_read_log`。SDK 直连的写入计入 Worker 指标。Gateway 的 `data_mutate` 只统计从 Gateway 转发的调用。运维查询 `data_progress` 在 owner 离线时只返回带采样时间的旧数字或未知状态，不再恢复历史日志；恢复日志仍由新负责人接管时执行。
 
 
 在 Worker 指标中，`vecdb_pipeline_batch_items{stage="source_heads"}` 记录每个来源窗口实际读取的 Index 数量。用同一时间段的 `_sum` 增量除以 `_count` 增量，可以区分单簇窗口与多目标窗口的平均读取量。图副本进度随 owner 续期保存，状态接口和 `vecdb_graph_replica_applied_sequence` 使用最近一次保存的位置。历史 `graph_progress_report` 阶段对应的单独进度事务已移除。各阶段对应的键和计数见 [TiKV 元数据访问清单](CLUSTER_ROUTING.md#tikv-元数据访问清单)。

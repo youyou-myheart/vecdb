@@ -234,6 +234,8 @@ func (r *Repository) loadDataMemory(ctx context.Context, state *appendLease) err
 	if base > head {
 		return ErrInvalidLogCursor
 	}
+	state.floor.Store(floor)
+	state.indexed.Store(base)
 	m := &dataWALMemory{
 		base:   base,
 		latest: make(map[string]Record),

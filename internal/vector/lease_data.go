@@ -20,6 +20,7 @@ type appendLease struct {
 	token         []byte
 	boundCommitTS bool
 	head          atomic.Uint64
+	floor         atomic.Uint64
 	indexed       atomic.Uint64 // contiguous source prefix confirmed by every target
 	// Only the partition's drainer counts confirmed, nonempty commits.
 	wal               *dataWALMemory

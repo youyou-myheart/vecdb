@@ -58,6 +58,14 @@ func clusterMetrics(s ClusterStatus) *metricText {
 	}
 	for id, d := range s.DataProgress {
 		labels := fmt.Sprintf("{data_partition=%q}", id)
+		m.add("vecdb_data_owner_epoch", "gauge", "Current resolved dispatcher fencing epoch.", labels, d.Owner.Epoch)
+		m.add("vecdb_data_owner_available", "gauge", "Current dispatcher responded with valid progress.", labels, flag(d.OwnerAvailable))
+		m.add("vecdb_data_progress_fresh", "gauge", "Progress sampled from the current live dispatcher in this request.", labels, flag(d.Fresh))
+		m.add("vecdb_data_progress_known", "gauge", "At least one progress sample has been observed.", labels, flag(d.Known))
+		m.add("vecdb_data_dispatch_error", "gauge", "Current dispatcher reports an error; details in cluster status.", labels, flag(d.Owner.LastError != ""))
+		if !d.Fresh {
+			continue // Unknown or stale counters must not look like zero lag.
+		}
 		for _, v := range []struct {
 			name, help string
 			value      uint64
@@ -67,12 +75,9 @@ func clusterMetrics(s ClusterStatus) *metricText {
 			{"floor_lsn", "Data log retention floor.", d.Floor},
 			{"pending_events", "Data events beyond contiguous completion.", lag(d.Head, d.Completed)},
 			{"retained_events", "Retained data log span.", lag(d.Head, d.Floor)},
-			{"owner_epoch", "Current resolved dispatcher fencing epoch.", d.Owner.Epoch},
 		} {
 			m.add("vecdb_data_"+v.name, "gauge", v.help, labels, v.value)
 		}
-		m.add("vecdb_data_owner_available", "gauge", "Dispatcher lease resolves successfully.", labels, flag(d.OwnerAvailable))
-		m.add("vecdb_data_dispatch_error", "gauge", "Current dispatcher reports an error; details in cluster status.", labels, flag(d.Owner.LastError != ""))
 	}
 	for id, plan := range s.ReplicaPlans {
 		m.add("vecdb_index_publisher_lease_draining", "gauge", "Master is waiting for the old publisher lease before switching.", fmt.Sprintf("{index_partition=%q}", id), flag(plan.LeaseDraining))

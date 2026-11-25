@@ -110,7 +110,7 @@ vecdb_graph_local_owner_epoch{index_partition="index-0000",replica="replica-a"} 
         state=dict(graph_heads={'index-0000':dict(sources={'0':5},committed={'sequence':3},visible={'sequence':3})},
                    replica_owners={'index-0000':{'owners':[{'partition':'a'},{'partition':'b'}]}},
                    graph_positions={'a':{'sequence':3},'b':{'sequence':3}},
-                   data_progress={'data-0000':dict(head=5,completed_lsn=5)})
+                   data_progress={'data-0000':dict(head=5,completed_lsn=5,progress_fresh=True)})
         base=dict(elapsed_seconds=4,state=state,local={'node':dict(histograms={},applied={'a':3,'b':3})})
         rows=[copy.deepcopy(base) for _ in range(4)]
         for n,row in enumerate(rows): row['elapsed_seconds']=n+1
@@ -123,3 +123,8 @@ vecdb_graph_local_owner_epoch{index_partition="index-0000",replica="replica-a"} 
         self.assertEqual(summary['first_observed_seconds'],dict(source_commits=2,graph_visible=2,replicas_local=3,replicas_reported=4,source_completed=3))
         self.assertEqual(summary['initial_pending_events'],1)
         self.assertEqual(summary['max_observation_gap_seconds'],1)
+        rows[2]['state']['data_progress']['data-0000']['progress_fresh']=False
+        self.assertEqual(drain_summary(rows)['first_observed_seconds']['source_completed'],4)
+        rows[-1]['state']['data_progress']['data-0000']['progress_fresh']=False
+        with self.assertRaisesRegex(ValueError, 'not current'):
+            drain_summary(rows)

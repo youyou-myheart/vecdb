@@ -46,6 +46,8 @@ type ClusterService struct {
 	writerMu           sync.RWMutex
 	writers            map[DataPartitionID]*mutationGroup
 	writeRoutes        map[DataPartitionID]Ownership
+	progressMu         sync.Mutex
+	progressCache      map[DataPartitionID]DataProgress
 	mutationGroups     map[DataPartitionID]*mutationGroup
 	observations       clusterObservations
 	dispatchers        map[DataPartitionID]*dataDispatcher

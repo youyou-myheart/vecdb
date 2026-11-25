@@ -228,7 +228,7 @@ graph 模式默认按 30 MB / 3 分钟自动检查点和有界 GC；消费租约
 
 ## 聚类布局扩展
 
-Layout.routing 和 ClusterStatus.routing 描述固定中心，protobuf 为 ClusterRouting(version, centers)，每个 Center 包含 vector。聚类布局 Binding.data_partition 为 -1（字段类型扩展为 int32，原非负值编码不变），表示索引没有唯一数据绑定。ClusterStatus.data_progress 返回各 data-NNNN 的 head/completed_lsn/floor/owner，GraphHead.sources 的键为来源数据分区十进制编号。data 订阅和租约请求使用 data-NNNN，graph 使用 index-NNNN；两种 LSN 不可混用。数据 reset 快照为 data-records-v1 的 JSON Record 数组，完整协议见 [CLUSTER_ROUTING.md](CLUSTER_ROUTING.md)。Python/Go SDK 生成类型已更新。
+Layout.routing 和 ClusterStatus.routing 描述固定中心，protobuf 为 ClusterRouting(version, centers)，每个 Center 包含 vector。聚类布局 Binding.data_partition 为 -1（字段类型扩展为 int32，原非负值编码不变），表示索引没有唯一数据绑定。ClusterStatus.data_progress 返回各 data-NNNN 的 head/completed_lsn/floor/owner，以及 progress_known、progress_fresh、observed_at_ms、observed_epoch。只有 progress_fresh=true 才能用本次数字判断是否追平；否则是旧样本或未知状态，见 [OBSERVABILITY.md](OBSERVABILITY.md)。GraphHead.sources 的键为来源数据分区十进制编号。data 订阅和租约请求使用 data-NNNN，graph 使用 index-NNNN；两种 LSN 不可混用。数据 reset 快照为 data-records-v1 的 JSON Record 数组，完整协议见 [CLUSTER_ROUTING.md](CLUSTER_ROUTING.md)。Python/Go SDK 生成类型已更新。
 
 ## Index 来源 epoch（聚类协议 v13）
 

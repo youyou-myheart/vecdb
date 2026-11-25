@@ -100,13 +100,17 @@ def catchup(client, load, *, centers, read_state, check_background, logs, drain_
     check_at = 0
     status_read = None
     attempt, first_probe_ms = 0, None
+    def timed_state():
+        started = time.monotonic()
+        state = read_state()
+        return state, (time.monotonic() - started) * 1000
     # Keep probing while the control plane reads all source and graph positions.
     observer = ThreadPoolExecutor(max_workers=1)
     try:
         while time.monotonic() < until:
             check_background()
             if status_read is None and time.monotonic() >= check_at:
-                status_read = observer.submit(read_state)
+                status_read = observer.submit(timed_state)
             sent = time.monotonic()
             attempt += 1
             sent_ms = (sent - t0) * 1000
@@ -121,7 +125,7 @@ def catchup(client, load, *, centers, read_state, check_background, logs, drain_
                 samples.append(follower_sample(result, attempt, sent, time.monotonic(), t0))
             if status_read is not None and status_read.done():
                 try:
-                    state = status_read.result()
+                    state, status_ms = status_read.result()
                 except TimeoutError as err:
                     observations.append(dict(at_ms=(time.monotonic() - t0) * 1000, status_error=str(err)))
                     status_read = None
@@ -130,6 +134,11 @@ def catchup(client, load, *, centers, read_state, check_background, logs, drain_
                 status_read = None
                 data = state['data_progress']
                 assert set(data) == {f'data-{i:04d}' for i in range(len(load['ack_shards']))}
+                if any(not d.get('progress_fresh', d.get('owner_available', False)) for d in data.values()):
+                    observations.append(dict(at_ms=(time.monotonic() - t0) * 1000, status_ms=status_ms,
+                                             status_error='current data progress unavailable'))
+                    check_at = time.monotonic() + .5
+                    continue
                 heads = {k: v['head'] for k, v in data.items()}
                 if heads != pinned:
                     # Timeouts can have committed. Include observed durable events
@@ -138,7 +147,7 @@ def catchup(client, load, *, centers, read_state, check_background, logs, drain_
                     pinned, frontier = heads, None
                 assert all(0 <= d['completed_lsn'] <= heads[k] for k, d in data.items())
                 pending = sum(pinned[k] - d['completed_lsn'] for k, d in data.items())
-                observations.append(dict(at_ms=(time.monotonic() - t0) * 1000,
+                observations.append(dict(at_ms=(time.monotonic() - t0) * 1000, status_ms=status_ms,
                                          pending=pending, head=sum(heads.values())))
                 if pending == 0 and frontier is None:
                     assert set(state['graph_heads']) == index_ids

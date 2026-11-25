@@ -13,6 +13,8 @@ def final_frontier(state, records, indexes, partitions):
         shard = int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], 'big') % partitions
         expected[f'data-{shard:04d}'] += record['revision']
     progress = state['data_progress']
+    if any(not d.get('progress_fresh', d.get('owner_available', False)) for d in progress.values()):
+        return None
     if set(progress) != set(expected) or any(progress[k]['head'] != n for k, n in expected.items()):
         raise AssertionError('durable data heads differ from the acknowledged workload')
     if any(progress[k]['completed_lsn'] != n for k, n in expected.items()):

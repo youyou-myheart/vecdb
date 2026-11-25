@@ -29,6 +29,7 @@ type partitionRPC struct {
 	Query       Search           `json:"query"`
 }
 type partitionReply struct {
+	DataProgress  *DataProgress     `json:"data_progress,omitempty"`
 	Record        *Record           `json:"record,omitempty"`
 	FollowerRead  *FollowerReadInfo `json:"follower_read,omitempty"`
 	SourceEpoch   *SourceEpochError `json:"source_epoch,omitempty"`
@@ -129,6 +130,21 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 	if req.Namespace != c.root.Prefix {
 		return reply, ErrFenced
 	}
+	if req.Operation == "data_progress" {
+		if req.Source == nil || req.Partition != sourceID(*req.Source) {
+			return reply, ErrFenced
+		}
+		group, err := c.localDataWriter(*req.Source, req.Epoch, req.Session)
+		if err != nil {
+			return reply, err
+		}
+		progress, err := group.dataProgress()
+		if err != nil {
+			return reply, err
+		}
+		reply.DataProgress = &progress
+		return reply, nil
+	}
 	if req.Operation == "get_owned" {
 		if req.Source == nil || *req.Source != c.router.DataForID(req.ID) || req.Partition != sourceID(*req.Source) {
 			return reply, ErrFenced
@@ -166,6 +182,13 @@ func (c *ClusterService) execute(ctx context.Context, req partitionRPC) (partiti
 			return reply, err
 		}
 		reply.Floor, err = c.pruneData(ctx, *req.Source, group.lease.owner)
+		if err == nil {
+			for old := group.lease.floor.Load(); old < reply.Floor; old = group.lease.floor.Load() {
+				if group.lease.floor.CompareAndSwap(old, reply.Floor) {
+					break
+				}
+			}
+		}
 		var after uint64
 		if err == nil && (!group.lease.InLeaderLease(&after) || req.Epoch != after) {
 			return partitionReply{}, ErrFenced

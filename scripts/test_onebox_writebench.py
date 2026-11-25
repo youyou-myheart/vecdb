@@ -95,7 +95,7 @@ class WriteBenchTest(unittest.TestCase):
             state_calls.append(None)
             if len(state_calls) == 1:
                 raise TimeoutError('control sample timed out')
-            return dict(data_progress={'data-0000': dict(head=1, completed_lsn=1)},
+            return dict(data_progress={'data-0000': dict(head=1, completed_lsn=1, progress_fresh=len(state_calls)>2)},
                         graph_heads={'index-0000': dict(committed=position)})
 
         attempts = []

@@ -36,37 +36,15 @@ func (c *ClusterService) Status(ctx context.Context) (ClusterStatus, error) {
 	s := ClusterStatus{Assignments: map[IndexPartitionID]Assignment{}, LocalPartitions: []IndexPartitionID{}, Node: c.node, Owners: map[IndexPartitionID]Ownership{}, Ready: true}
 	if c.layout.Routing != nil {
 		s.Routing = c.layout.Routing
-		s.DataProgress = map[string]DataProgress{}
-		for d, r := range c.data {
-			tx, e := r.begin()
-			if e != nil {
-				return s, e
-			}
-			head, e := r.logHead(ctx, tx)
-			if e != nil {
-				_ = tx.Rollback()
-				return s, e
-			}
-			floor, e := r.readCounter(ctx, tx, "log-floor")
-			if e != nil {
-				_ = tx.Rollback()
-				return s, e
-			}
-			done, e := r.readCounter(ctx, tx, "dispatch-completed")
-			if e != nil {
-				_ = tx.Rollback()
-				return s, e
-			}
-			owner, ownerErr := c.coordinator.resolveIn(ctx, tx, sourceID(d))
-			_ = tx.Rollback()
-			if owner.Epoch != 0 {
-				done = max(done, owner.Offset)
-				owner.Offset = done
-			}
-			if ownerErr != nil {
+		var err error
+		s.DataProgress, err = c.dataProgress(ctx)
+		if err != nil {
+			return s, err
+		}
+		for _, progress := range s.DataProgress {
+			if !progress.Fresh {
 				s.Ready = false
 			}
-			s.DataProgress[string(sourceID(d))] = DataProgress{Head: head, Completed: done, Floor: floor, Owner: owner, OwnerAvailable: ownerErr == nil}
 		}
 	}
 	s.ConsumerRetention = c.consumerRetention
@@ -184,6 +162,10 @@ func (c *ClusterService) Status(ctx context.Context) (ClusterStatus, error) {
 }
 
 type DataProgress struct {
+	Known          bool      `json:"progress_known"`
+	Fresh          bool      `json:"progress_fresh"`
+	ObservedAtMS   int64     `json:"observed_at_ms"`
+	ObservedEpoch  uint64    `json:"observed_epoch"`
 	Head           uint64    `json:"head"`
 	Completed      uint64    `json:"completed_lsn"`
 	Floor          uint64    `json:"floor"`

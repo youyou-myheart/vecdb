@@ -19,7 +19,7 @@ class FollowerCatchupProbeTest(unittest.TestCase):
     def test_final_targets_require_coverage_of_every_ack_and_source(self):
         key = 'v-0001'
         shard = int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], 'big') % 2
-        progress = {f'data-{i:04d}': dict(head=0, completed_lsn=0) for i in range(2)}
+        progress = {f'data-{i:04d}': dict(head=0, completed_lsn=0, progress_fresh=True) for i in range(2)}
         source = progress[f'data-{shard:04d}']
         source.update(head=5, completed_lsn=4)
         state = dict(data_progress=progress, graph_heads={'index': dict(committed=position(3))})
@@ -27,6 +27,9 @@ class FollowerCatchupProbeTest(unittest.TestCase):
         self.assertIsNone(final_frontier(state, records, {'index'}, 2))
         source['completed_lsn'] = 5
         self.assertEqual(final_frontier(state, records, {'index'}, 2), {'index': position(3)})
+        source['progress_fresh'] = False
+        self.assertIsNone(final_frontier(state, records, {'index'}, 2))
+        source['progress_fresh'] = True
         source['head'] = 4
         with self.assertRaises(AssertionError):
             final_frontier(state, records, {'index'}, 2)
