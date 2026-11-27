@@ -154,7 +154,7 @@ func (s rawShardStore) put(ctx context.Context, key, val []byte) error {
 // order, with nil for an absent key. A later slot is unusable until the gap
 // closes, even if the two keys were read from different TiKV Regions.
 func (s rawShardStore) readEpoch(ctx context.Context, h *rawShardHistory, epoch, after, through uint64) (uint64, error) {
-	const pageSize = 4
+	pageSize := rawReadDecodeSlots
 	for after < through && ctx.Err() == nil {
 		values, err := shardlog.Stream(s.epochPrefix(epoch)).Tail(ctx, s.client.BatchGet, after, through, pageSize, false)
 		if err != nil {
@@ -163,26 +163,58 @@ func (s rawShardStore) readEpoch(ctx context.Context, h *rawShardHistory, epoch,
 		if len(values) == 0 {
 			break
 		}
-		page := make([]mutationLogBatch, 0, len(values))
-		for i, value := range values {
-			var batch mutationLogBatch
-			if err = json.Unmarshal(value, &batch); err != nil {
+		nextSize := rawNextReadSize(values)
+		if len(values) < pageSize {
+			nextSize = rawReadDecodeSlots
+		}
+		for len(values) > 0 {
+			if err := ctx.Err(); err != nil {
 				return after, err
 			}
-			if batch.Number != after+uint64(i)+1 {
-				return after, errors.New("raw batch number mismatch")
+			// Keep the old four-slot validation/apply boundary, including
+			// legacy multi-record values. A bad later chunk must return the
+			// cursor of the already accepted prefix, so retry never replays it.
+			count := min(rawReadDecodeSlots, len(values))
+			page := make([]mutationLogBatch, 0, count)
+			for i, value := range values[:count] {
+				var batch mutationLogBatch
+				if err = json.Unmarshal(value, &batch); err != nil {
+					return after, err
+				}
+				if batch.Number != after+uint64(i)+1 {
+					return after, errors.New("raw batch number mismatch")
+				}
+				page = append(page, batch)
 			}
-			page = append(page, batch)
+			if err = h.extend(page); err != nil {
+				return after, err
+			}
+			after += uint64(count)
+			clear(values[:count])
+			values = values[count:]
 		}
-		if err = h.extend(page); err != nil {
-			return after, err
-		}
-		after += uint64(len(page))
+		pageSize = nextSize
 		// On a partially filled page, probe again starting at the hole. A
 		// cross-Region BatchGet could have observed that hole before it saw
 		// an earlier slot. An absent first slot now certifies the whole prefix.
 	}
 	return after, ctx.Err()
+}
+
+const rawReadDecodeSlots = 4
+const rawReadMaxSlots = 32
+const rawReadTargetBytes = 1 << 20
+
+// Estimate the next response from the largest value just observed, rather
+// than multiplying a legacy large WAL value by the maximum key count.
+// This is an estimate, not a byte limit: later values may be larger.
+func rawNextReadSize(values [][]byte) int {
+	largest := 1
+	for _, value := range values {
+		largest = max(largest, len(value))
+	}
+	slots := min(rawReadMaxSlots, max(rawReadDecodeSlots, rawReadTargetBytes/largest))
+	return slots - slots%rawReadDecodeSlots
 }
 
 func (s rawShardStore) loadSealed(ctx context.Context, h rawShardHead) (*rawShardHistory, error) {
