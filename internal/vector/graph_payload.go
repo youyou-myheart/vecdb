@@ -97,21 +97,19 @@ func (g *graphReplica) loadReferenceEntry(ctx context.Context, e GraphEntry) (*G
 		}
 	}
 	measure = g.track("graph_data_load")
-	values, err := batchGet(ctx, tx, keys)
+	events, err := readGraphSourceEvents(ctx, tx, keys)
 	measure(&err)
 	if err != nil {
 		return nil, err
 	}
 	d := wire.Delta
+	refIndex := 0
 	for _, ch := range wire.Changes {
 		r := ch.Tombstone
 		if ch.Ref != nil {
 			ref := ch.Ref
-			repo := g.journal.c.data[ref.Source]
-			var event LogEvent
-			if err = json.Unmarshal(values[string(repo.logKey(ref.LSN))], &event); err != nil {
-				return nil, fmt.Errorf("missing or invalid data log reference: %w", err)
-			}
+			event := events[refIndex]
+			refIndex++
 			if event.Sequence != ref.LSN || event.Record.ID != ref.ID || event.Record.Revision != ref.Revision || recordHash(event.Record) != ref.Hash {
 				return nil, errors.New("data log reference mismatch")
 			}
