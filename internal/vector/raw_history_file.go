@@ -1,7 +1,6 @@
 package vector
 
 import (
-	"encoding/json"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -49,12 +48,14 @@ func (h *rawShardHistory) spillLocked(incomingEntries, incomingBytes int) error 
 		var locations []rawHistoryLocation
 		released := 0
 		for i := h.spilled; i < len(h.entries) && len(locations) < 512; i++ {
-			encoded, err := json.Marshal(h.entries[i])
+			start := len(data)
+			var err error
+			data, err = appendRawHistoryEntry(data, *h.entries[i])
 			if err != nil {
 				return err
 			}
-			locations = append(locations, rawHistoryLocation{offset: h.archiveEnd + int64(len(data)), size: uint32(len(encoded)), checksum: crc32.ChecksumIEEE(encoded)})
-			data = append(data, encoded...)
+			encoded := data[start:]
+			locations = append(locations, rawHistoryLocation{offset: h.archiveEnd + int64(start), size: uint32(len(encoded)), checksum: crc32.ChecksumIEEE(encoded)})
 			released += rawEntryBytes(*h.entries[i])
 			if len(data) >= 8<<20 {
 				break
@@ -90,7 +91,5 @@ func (h *rawShardHistory) entryLocked(seq uint64) (mutationLogEntry, error) {
 	if crc32.ChecksumIEEE(data) != loc.checksum {
 		return mutationLogEntry{}, fmt.Errorf("raw history cache checksum mismatch at %d", seq)
 	}
-	var e mutationLogEntry
-	err := json.Unmarshal(data, &e)
-	return e, err
+	return decodeRawHistoryEntry(data)
 }
