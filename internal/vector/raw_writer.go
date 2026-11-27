@@ -18,11 +18,7 @@ type rawShardWriter struct {
 func newRawShardWriter(store rawShardStore, owner Ownership, history *rawShardHistory, count uint64) *rawShardWriter {
 	w := &rawShardWriter{
 		store: store, owner: owner, history: history,
-		mutationBatchState: mutationBatchState{number: count, end: history.end(), records: make(map[string]uint64, len(history.records)), receipts: make(map[string]receipt, len(history.receipts))},
-	}
-	for _, entry := range history.entries {
-		w.records[entry.Record.ID] = entry.Record.Revision
-		w.receipts[entry.RequestID] = receipt{Digest: entry.Digest, Record: entry.Record}
+		mutationBatchState: mutationBatchState{confirmed: history, number: count, end: history.end(), records: make(map[string]uint64), receipts: make(map[string]receipt)},
 	}
 	return w
 }
@@ -57,5 +53,18 @@ func (w *rawShardWriter) write(ctx context.Context, batches ...mutationLogBatch)
 }
 
 func (w *rawShardWriter) accept(batches ...mutationLogBatch) error {
-	return w.history.extend(batches)
+	if err := w.history.extend(batches); err != nil {
+		return err
+	}
+	// The drainer calls prepare and accept in order. A later pending write
+	// may already have advanced the same record; preserve that projection.
+	for _, batch := range batches {
+		for _, e := range batch.Entries {
+			delete(w.receipts, e.RequestID)
+			if w.records[e.Record.ID] == e.Record.Revision {
+				delete(w.records, e.Record.ID)
+			}
+		}
+	}
+	return nil
 }

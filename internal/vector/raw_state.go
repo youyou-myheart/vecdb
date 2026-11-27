@@ -17,6 +17,27 @@ func newRawShardHistory() *rawShardHistory {
 	return &rawShardHistory{records: make(map[string][]uint64), receipts: make(map[string]uint64)}
 }
 
+func (h *rawShardHistory) receipt(id string) (receipt, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	seq := h.receipts[id]
+	if seq == 0 {
+		return receipt{}, false
+	}
+	e := h.entries[seq-1]
+	return receipt{Digest: e.Digest, Record: e.Record}, true
+}
+
+func (h *rawShardHistory) revision(id string) uint64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	versions := h.records[id]
+	if len(versions) == 0 {
+		return 0
+	}
+	return h.entries[versions[len(versions)-1]-1].Record.Revision
+}
+
 func (h *rawShardHistory) end() uint64 {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

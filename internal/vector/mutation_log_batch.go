@@ -21,10 +21,13 @@ func (b mutationLogBatch) last() uint64 { return b.First + uint64(len(b.Entries)
 
 // The partition owner retains revisions and receipts in memory across appends.
 type mutationBatchState struct {
-	records  map[string]uint64
-	receipts map[string]receipt
-	number   uint64
-	end      uint64
+	// Raw writers keep only unconfirmed decisions in the maps below.
+	// Confirmed decisions already live in the shared WAL history.
+	confirmed *rawShardHistory
+	records   map[string]uint64
+	receipts  map[string]receipt
+	number    uint64
+	end       uint64
 }
 
 // The drainer prepares operations in queue order. Projected revisions let the
@@ -35,7 +38,11 @@ func (w *mutationBatchState) prepare(requests []*mutationRequest) ([]mutationRes
 	var batch mutationLogBatch
 	for i, request := range requests {
 		q := request.preparedMutation
-		if previous, ok := w.receipts[q.mutation.RequestID]; ok {
+		previous, ok := w.receipts[q.mutation.RequestID]
+		if !ok && w.confirmed != nil {
+			previous, ok = w.confirmed.receipt(q.mutation.RequestID)
+		}
+		if ok {
 			if previous.Digest != q.digest {
 				results[i].err = ErrConflict
 			} else {
@@ -43,7 +50,11 @@ func (w *mutationBatchState) prepare(requests []*mutationRequest) ([]mutationRes
 			}
 			continue
 		}
-		record, err := q.nextRecord(w.records[q.id])
+		revision := w.records[q.id]
+		if revision == 0 && w.confirmed != nil {
+			revision = w.confirmed.revision(q.id)
+		}
+		record, err := q.nextRecord(revision)
 		if errors.Is(err, ErrConflict) {
 			results[i].err = err
 			continue
