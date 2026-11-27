@@ -104,8 +104,7 @@ func (o *Objects) saveTracked(ctx context.Context, namespace string, dimension i
 	if err := o.Client.Put(ctx, o.Bucket, m.Key, data); err != nil {
 		return Manifest{}, err
 	}
-	_, err := o.loadBytes(ctx, m)
-	return m, err
+	return m, o.verifyBytes(ctx, m)
 }
 
 func (o *Objects) Load(ctx context.Context, m Manifest) ([]Record, error) {
@@ -144,14 +143,7 @@ type GraphObjectAPI interface {
 }
 
 func (o *Objects) SaveState(ctx context.Context, namespace string, s IndexSnapshot) (Manifest, error) {
-	data, err := json.Marshal(s)
-	if err != nil {
-		return Manifest{}, err
-	}
-	m, err := o.saveBytes(ctx, namespace, s.Dimension, s.Format, data)
-	m.LogVersion = s.LogVersion
-	m.Offset = s.Offset
-	return m, err
+	return o.saveStateTracked(ctx, namespace, s, nil)
 }
 func (o *Objects) LoadState(ctx context.Context, m Manifest) (IndexSnapshot, error) {
 	data, err := o.loadBytes(ctx, m)
@@ -185,6 +177,10 @@ func (m minioBlobs) Create(ctx context.Context, b string) error {
 }
 func (m minioBlobs) Put(ctx context.Context, b, k string, data []byte) error {
 	_, err := m.client.PutObject(ctx, b, k, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{ContentType: "application/json"})
+	return err
+}
+func (m minioBlobs) PutReader(ctx context.Context, b, k string, reader io.Reader, size int64) error {
+	_, err := m.client.PutObject(ctx, b, k, reader, size, minio.PutObjectOptions{ContentType: "application/json", PartSize: 8 << 20, NumThreads: 1})
 	return err
 }
 func (m minioBlobs) Get(ctx context.Context, b, k string) (io.ReadCloser, error) {

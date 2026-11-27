@@ -451,6 +451,21 @@ func (g *graphReplica) saveBlob(ctx context.Context, format string, data []byte)
 	})
 }
 func (g *graphReplica) saveState(ctx context.Context, state IndexSnapshot) (Manifest, error) {
+	if saver, ok := g.objects.(interface {
+		saveStateTracked(context.Context, string, IndexSnapshot, func(Manifest) error) (Manifest, error)
+	}); ok {
+		var before func(Manifest) error
+		if g.retention {
+			before = func(m Manifest) (err error) {
+				defer g.track("graph_object_intent")(&err)
+				return retryIndexCommit(ctx, func() error { return g.journal.stageObject(ctx, g.repo, m) }, func() {})
+			}
+		}
+		var err error
+		defer g.track("graph_object_save")(&err)
+		m, err := saver.saveStateTracked(ctx, g.repo.Namespace(), state, before)
+		return m, err
+	}
 	data, e := json.Marshal(state)
 	if e != nil {
 		return Manifest{}, e
