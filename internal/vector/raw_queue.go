@@ -9,6 +9,7 @@ import (
 )
 
 const rawWritesInFlight = 16
+const rawSmallWritesInFlight = 2
 
 type rawPendingWrite struct {
 	requests  []*mutationRequest
@@ -29,8 +30,10 @@ func (w *rawPendingWrite) ready() bool {
 	}
 }
 
-// One drainer resolves requests in admission order, then issues each batch
-// immediately. A slot stays occupied until all earlier writes are confirmed:
+// One drainer resolves requests in admission order. Keep small writes to two
+// outstanding batches so incoming requests can accumulate during storage IO.
+// Full queues may use the rest of the window without waiting for a timer.
+// A slot stays occupied until all earlier writes are confirmed:
 // a completed suffix may contain revisions derived from an unconfirmed prefix.
 func (b *mutationGroup) drainRaw(ctx context.Context, batch []*mutationRequest) {
 	defer b.wg.Done()
@@ -59,7 +62,7 @@ func (b *mutationGroup) drainRaw(ctx context.Context, batch []*mutationRequest) 
 		var queueChanged <-chan struct{}
 		if len(pending) < rawWritesInFlight {
 			if len(batch) == 0 {
-				batch, queueChanged = b.takeRawBatch(len(pending) == 0)
+				batch, queueChanged = b.takeRawBatch(len(pending) == 0, len(pending) >= rawSmallWritesInFlight)
 			}
 			if len(batch) > 0 {
 				write, err := b.prepareRawWrite(batch)
@@ -94,13 +97,22 @@ func (b *mutationGroup) drainRaw(ctx context.Context, batch []*mutationRequest) 
 	}
 }
 
-func (b *mutationGroup) takeRawBatch(idle bool) ([]*mutationRequest, <-chan struct{}) {
+func (b *mutationGroup) rawQueueFull() bool {
+	// Called under b.mu. A near-byte-limit batch should not wait for 32
+	// records; the next request may be too large to enter the queue.
+	return len(b.queue) >= mutationGroupRecords || b.bytes >= mutationGroupBytes/2
+}
+
+func (b *mutationGroup) takeRawBatch(idle, fullOnly bool) ([]*mutationRequest, <-chan struct{}) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if len(b.queue) == 0 {
 		if idle {
 			b.running = false
 		}
+		return nil, b.changed
+	}
+	if fullOnly && !b.rawQueueFull() {
 		return nil, b.changed
 	}
 	batch := b.queue

@@ -105,7 +105,7 @@ func (b *mutationGroup) mutate(ctx context.Context, id string, m Mutation, delet
 			if b.running {
 				b.queue = append(b.queue, r)
 				b.bytes += q.size
-				if b.rawWriter != nil && len(b.queue) == 1 {
+				if b.rawWriter != nil && (len(b.queue) == 1 || b.rawQueueFull()) {
 					b.signalLocked()
 				}
 			} else {

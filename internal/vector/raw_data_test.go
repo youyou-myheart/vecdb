@@ -385,8 +385,8 @@ func TestRawGroupAcknowledgesConfirmedPrefixOfPartialBatch(t *testing.T) {
 }
 
 func TestRawGroupLimitsConcurrentWritesAndBatchSize(t *testing.T) {
-	// More than sixteen full batches must remain queued until a slot frees up.
-	const slots, requests = 16, 1 + 17*mutationGroupRecords
+	// Requests beyond the write window stay queued until a slot frees up.
+	const slots, requests = rawWritesInFlight, 1 + (rawWritesInFlight+1)*mutationGroupRecords
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	client := newFakeRawData()
@@ -445,7 +445,7 @@ func TestRawGroupLimitsConcurrentWritesAndBatchSize(t *testing.T) {
 	}
 	select {
 	case <-enter:
-		t.Fatal("started a seventeenth concurrent RawKV write")
+		t.Fatal("exceeded the concurrent RawKV write limit")
 	case <-time.After(10 * time.Millisecond):
 	}
 	close(release)
