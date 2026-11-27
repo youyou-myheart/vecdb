@@ -1,8 +1,29 @@
 import unittest
-from onebox_e2e import Oracle, Measurements, vector_for, percentile, operation_name
+from onebox_e2e import Onebox, Oracle, Measurements, vector_for, percentile, operation_name
 
 
 class OneboxOracleTest(unittest.TestCase):
+    def test_stale_progress_does_not_replace_last_live_observation(self):
+        box = Onebox.__new__(Onebox)
+        box.centers = [[0, 0]]
+        box.last_completed, box.last_head, box.last_terms, box.report = {}, {}, {}, {}
+
+        def sample(head, completed, fresh):
+            state = dict(routing=dict(centers=box.centers, version=1),
+                         data_progress={'data-0000': dict(floor=0, head=head,
+                             completed_lsn=completed, progress_fresh=fresh)})
+            box.request = lambda *a, **k: state
+            return box.state()
+
+        sample(10, 8, True)
+        self.assertFalse(sample(0, 0, False)['data_progress']['data-0000']['progress_fresh'])
+        sample(20, 20, False)
+        self.assertEqual((box.last_head['data-0000'], box.last_completed['data-0000']), (10, 8))
+        for head, completed in [(9, 8), (10, 7)]:
+            with self.assertRaises(AssertionError):
+                sample(head, completed, True)
+        sample(11, 9, True)
+
     def test_operation_labels_exclude_record_ids_and_cursors(self):
         self.assertEqual(operation_name('GET','/v1/records?limit=10&cursor=secret'), 'GET record-list')
         self.assertEqual(operation_name('GET','/v1/records/private-id'), 'GET records')

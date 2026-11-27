@@ -299,6 +299,11 @@ class Onebox:
         assert s['routing']['centers']==self.centers and s['routing']['version']==1
         for id,d in s.get('data_progress',{}).items():
             assert d['floor']<=d['completed_lsn']<=d['head'], d
+            # A different Gateway may only have an older cached sample while
+            # the owner is unavailable. Keep the last live observation so a
+            # genuinely regressed value still fails once the owner responds.
+            if not d.get('progress_fresh', d.get('owner_available', True)):
+                continue
             assert d['completed_lsn']>=self.last_completed.get(id,0), ('completed regressed', id, d)
             assert d['head']>=self.last_head.get(id,0), ('head regressed', id, d)
             self.last_completed[id]=d['completed_lsn']; self.last_head[id]=d['head']
