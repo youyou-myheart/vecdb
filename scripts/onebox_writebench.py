@@ -150,8 +150,13 @@ def catchup(client, load, *, centers, read_state, check_background, logs, drain_
                 observations.append(dict(at_ms=(time.monotonic() - t0) * 1000, status_ms=status_ms,
                                          pending=pending, head=sum(heads.values())))
                 if pending == 0 and frontier is None:
-                    assert set(state['graph_heads']) == index_ids
-                    frontier = {k: v['committed'] for k, v in state['graph_heads'].items()}
+                    graph_heads = state.get('graph_heads', {})
+                    if set(graph_heads) != index_ids:
+                        observations.append(dict(at_ms=(time.monotonic() - t0) * 1000,
+                                                 status_error='current graph progress unavailable'))
+                        check_at = time.monotonic() + .5
+                        continue
+                    frontier = {k: v['committed'] for k, v in graph_heads.items()}
                 check_at = time.monotonic() + .5
             if frontier:
                 hit = summarize_capture(samples, frontier)

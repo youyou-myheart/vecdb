@@ -21,9 +21,9 @@ def final_frontier(state, records, indexes, partitions):
         return None
     # ClusterStatus reads graph heads AFTER the source completion observations.
     # A later control-only graph entry can make this frontier conservative.
-    heads = state['graph_heads']
+    heads = state.get('graph_heads', {})
     if set(heads) != indexes:
-        raise AssertionError('incomplete graph heads')
+        return None
     return {index: head['committed'] for index, head in heads.items()}
 
 

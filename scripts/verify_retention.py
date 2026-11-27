@@ -29,9 +29,9 @@ def main():
             if value:return value
             time.sleep(.15)
         raise TimeoutError(name)
-    def head():return c.status()['graph_heads']['index-0000']
+    def head():return c.status().get('graph_heads',{}).get('index-0000')
     def ready_at(offset):
-        state=c.status();owners=state['replica_owners']['index-0000']['owners']
+        state=c.status();owners=state.get('replica_owners',{}).get('index-0000',{}).get('owners',[])
         return len(owners)==2 and all(o.get('offset',0)>=offset for o in owners)
     def absent(key):
         try:s3.head_object(Bucket=bucket,Key=key)
@@ -85,7 +85,7 @@ def main():
             follower=next(o for o in owners if o['partition']!=plan['publisher'])
             paused=follower['node'];os.kill(c.children[paused].pid,signal.SIGSTOP)
             for i in range(40,45):c.request('/v1/records/'+str(i),'PUT',dict(request_id='new-'+str(i),vector=[i%4,i/100]))
-            wait('leader publishes while follower paused',lambda:head()['visible']['data_offset']>=45)
+            wait('leader publishes while follower paused',lambda:(h:=head()) is not None and h['visible']['data_offset']>=45)
             c.request('/v1/checkpoint','POST',{});c.request('/v1/log/prune','POST',{})
             assert head()['floor']['sequence']>visible
             os.kill(c.children[paused].pid,signal.SIGCONT);paused=None
@@ -93,7 +93,7 @@ def main():
             report['checks'].append('lagging_follower_recovers_after_graph_reference_log_GC')
             oldterm=head()['term'];killed=leader['node'];c.children[killed].kill();c.children[killed].wait(timeout=10);c.workers.remove(killed)
             c.request('/v1/records/tail','PUT',dict(request_id='tail',vector=[0,0]))
-            wait('post-GC takeover',lambda:head()['term']>oldterm and head()['visible']['data_offset']>=46)
+            wait('post-GC takeover',lambda:(h:=head()) is not None and h['term']>oldterm and h['visible']['data_offset']>=46)
             report['checks'].append('recovered_follower_promotes_and_resumes_writes_after_GC')
         report['status']='passed'
     except BaseException as exc:

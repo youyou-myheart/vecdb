@@ -36,6 +36,8 @@ curl -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:18202/v1/cluster
 
 自动判断“已经追平”必须先检查 `progress_fresh`，再比较 `head` 与 `completed_lsn`。任一数据分区没有新进度时，集群状态的 `ready=false`。所有进度 RPC 共用 1 秒等待预算，最多并发 8 个；该预算不包含 TiKV 中负责人、索引等元数据的读取时间。
 
+索引切主期间，图日志进度可能暂时无法确认。状态接口此时返回 `ready=false`、`fully_replicated=false`，并省略该分区的 `graph_heads` 和副本进度；缺失的条目表示未知，不表示零积压。真正的日志损坏或存储错误仍会返回错误。
+
 ## 指标语义
 
 日志合批新增 `vecdb_pipeline_batch_items{stage,partition,outcome}` Histogram，`stage=data_commit` 表示每次数据组提交尝试的请求数（包含幂等和语义冲突请求），`source_heads` 表示一轮来源进度读取的 Index head 数，`graph_replay` 表示一个图回放窗口的日志数。`sum/count` 是平均批量，不能把请求数当成新增 LSN 数；与 `vecdb_index_batch_records` 一起看是否实际形成合批。

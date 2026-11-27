@@ -37,16 +37,16 @@ def run(mode):
             time.sleep(.15)
         raise TimeoutError(name+': '+json.dumps(c.status()))
 
-    def full_checkpoint():
-        s = c.status()
-        hs = s['graph_heads']
+    def full_checkpoint(s=None):
+        if s is None: s = c.status()
+        hs = s.get('graph_heads', {})
         return len(hs) == 3 and all(h['committed']['sequence'] > 0 and h['checkpoint_position'] == h['committed']
             and h.get('checkpoint_bytes', 0) == h.get('log_bytes', 0) and h.get('checkpoint_sources') == h.get('sources')
             and h.get('checkpoint_source_epochs') == h.get('source_epochs') for h in hs.values())
 
     def graph_pruned_and_data_indexed():
         s = c.status()
-        return full_checkpoint() and all(h['floor'] == h['checkpoint_position'] for h in s['graph_heads'].values()) and all(
+        return full_checkpoint(s) and all(h['floor'] == h['checkpoint_position'] for h in s['graph_heads'].values()) and all(
             d['head'] > 0 and d['head'] == d['completed_lsn'] and d['floor'] == 0 for d in s['data_progress'].values())
 
     def write(client, start, end):

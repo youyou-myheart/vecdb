@@ -30,6 +30,9 @@ class FollowerCatchupProbeTest(unittest.TestCase):
         source['progress_fresh'] = False
         self.assertIsNone(final_frontier(state, records, {'index'}, 2))
         source['progress_fresh'] = True
+        heads = state.pop('graph_heads')
+        self.assertIsNone(final_frontier(state, records, {'index'}, 2))
+        state['graph_heads'] = heads
         source['head'] = 4
         with self.assertRaises(AssertionError):
             final_frontier(state, records, {'index'}, 2)

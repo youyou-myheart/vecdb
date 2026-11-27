@@ -2,6 +2,7 @@ package vector
 
 import (
 	"context"
+	"errors"
 )
 
 type ReplicaOwners struct {
@@ -95,6 +96,13 @@ func (c *ClusterService) Status(ctx context.Context) (ClusterStatus, error) {
 			j := graphJournal{c: c.coordinator, id: b.Index}
 			if c.graphReplication {
 				h, err := j.Head(ctx)
+				if errors.Is(err, ErrConflict) {
+					// During publisher takeover, the old run may be closing or
+					// change while its tail is sampled. Keep status available,
+					// but never report that unverified tail as current progress.
+					s.Ready, s.FullyReplicated = false, false
+					continue
+				}
 				if err != nil {
 					return s, err
 				}

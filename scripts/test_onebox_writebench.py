@@ -96,7 +96,7 @@ class WriteBenchTest(unittest.TestCase):
             if len(state_calls) == 1:
                 raise TimeoutError('control sample timed out')
             return dict(data_progress={'data-0000': dict(head=1, completed_lsn=1, progress_fresh=len(state_calls)>2)},
-                        graph_heads={'index-0000': dict(committed=position)})
+                        graph_heads={'index-0000': dict(committed=position)} if len(state_calls)>3 else {})
 
         attempts = []
         class ProbeTimeout(grpc.RpcError):
@@ -123,4 +123,5 @@ class WriteBenchTest(unittest.TestCase):
         self.assertEqual(result['status'], 'confirmed')
         self.assertEqual((result['confirming_attempt'], result['probe_errors']), (2, 1))
         self.assertEqual(result['pinned_durable_events'], 1)
-        self.assertGreaterEqual(len(state_calls), 2)
+        self.assertGreaterEqual(len(state_calls), 4)
+        self.assertTrue(any(row.get('status_error') == 'current graph progress unavailable' for row in trace['observations']))
