@@ -43,7 +43,7 @@ func TestRawReadBatchesSmallValuesAndKeepsLegacyRecords(t *testing.T) {
 			if err != nil || after != slots || h.end() != slots*uint64(records) {
 				t.Fatal(after, h.end(), err)
 			}
-			if len(*widths) >= slots/16 {
+			if len(*widths) >= slots/6 {
 				t.Fatal("small logs still require too many reads", *widths)
 			}
 			for _, width := range *widths {
@@ -80,7 +80,7 @@ func TestRawReadShrinksAfterLargeValues(t *testing.T) {
 				t.Fatal(after, err)
 			}
 			if tc.mixed {
-				if len(*widths) < 3 || (*widths)[0] != 4 || (*widths)[1] != 32 || (*widths)[2] != 4 {
+				if len(*widths) < 3 || (*widths)[0] != 4 || (*widths)[1] != 8 || (*widths)[2] != 4 {
 					t.Fatal("did not adapt to large values", *widths)
 				}
 			} else {
@@ -161,7 +161,7 @@ func TestRawReadCancellationPreservesAcceptedCursor(t *testing.T) {
 	}
 	h := newRawShardHistory()
 	after, err := s.readEpoch(ctx, h, 1, 0, 80)
-	if !errors.Is(err, context.Canceled) || after != 36 || h.end() != 36 {
+	if !errors.Is(err, context.Canceled) || after != 12 || h.end() != 12 {
 		t.Fatal(after, h.end(), err)
 	}
 	probe.afterBatch = nil

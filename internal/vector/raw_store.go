@@ -202,7 +202,7 @@ func (s rawShardStore) readEpoch(ctx context.Context, h *rawShardHistory, epoch,
 }
 
 const rawReadDecodeSlots = 4
-const rawReadMaxSlots = 32
+const rawReadMaxSlots = 8
 const rawReadTargetBytes = 1 << 20
 
 // Estimate the next response from the largest value just observed, rather
