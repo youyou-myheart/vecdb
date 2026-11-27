@@ -12,6 +12,8 @@ Go 服务提供向量读写、HNSW 和精确检索、属性过滤。TiKV 持久�
 
 Gateway 另提供版本化 gRPC 接口和 Python/Go SDK，开启方式、示例和错误语义见 [RPC.md](RPC.md)。
 
+Go SDK 遇到写入超时或服务暂不可用时，会重新确认分区地址；地址不变就复用现有连接，避免故障期间反复建连耗尽本机端口。地址改变后，旧连接等待已有请求结束再关闭。超时和暂不可用的写入不会自动重试，调用方重试时仍须复用原请求 ID。
+
 Worker 双副本与先恢复后退出的迁移已提供，可用 `--replicas 2` 在新 namespace 启用；升级边界、状态和验收见 [REPLICAS.md](REPLICAS.md)。
 
 onebox 默认分片数现为 32；负载放置调度使用 `--replicas 2 --scheduler load`，详见 [BALANCING.md](BALANCING.md)。

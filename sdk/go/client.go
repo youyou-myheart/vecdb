@@ -89,7 +89,7 @@ func (c *Client) Close() error {
 	defer c.mu.Unlock()
 	c.closed = true
 	for _, r := range c.routes {
-		r.conn.Close()
+		r.link.conn.Close()
 	}
 	clear(c.routes)
 	return c.conn.Close()

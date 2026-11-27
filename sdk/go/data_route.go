@@ -13,7 +13,14 @@ import (
 )
 
 type dataRoute struct {
-	route   *pb.WriteRoute
+	route *pb.WriteRoute
+	link  *dataRouteConnection
+	stale bool
+}
+
+// Route generations are immutable, but a refreshed generation at the same
+// endpoint can share its transport. A timeout must not cause a reconnect storm.
+type dataRouteConnection struct {
 	conn    *grpc.ClientConn
 	stub    pb.VectorStoreClient
 	users   int
@@ -35,8 +42,8 @@ func (c *Client) acquireRoute(ctx context.Context, id string) (*dataRoute, error
 		return nil, nil
 	}
 	if c.partitions > 0 {
-		if r := c.routes[shardFor(id, c.partitions)]; r != nil {
-			r.users++
+		if r := c.routes[shardFor(id, c.partitions)]; r != nil && !r.stale {
+			r.link.users++
 			c.mu.Unlock()
 			return r, nil
 		}
@@ -60,15 +67,29 @@ func (c *Client) acquireRoute(ctx context.Context, id string) (*dataRoute, error
 		return nil, status.Error(codes.Internal, "invalid data write route")
 	}
 	c.partitions = hint.Partitions
-	if r := c.routes[hint.Partition]; r != nil {
-		r.users++
-		return r, nil
+	old := c.routes[hint.Partition]
+	if old != nil && !old.stale {
+		old.link.users++
+		return old, nil
 	}
-	conn, err := grpc.DialContext(ctx, hint.Endpoint, c.dialOpts...)
-	if err != nil {
-		return nil, err
+	var link *dataRouteConnection
+	if old != nil && old.route.Endpoint == hint.Endpoint {
+		link = old.link
+	} else {
+		conn, err := grpc.DialContext(ctx, hint.Endpoint, c.dialOpts...)
+		if err != nil {
+			return nil, err
+		}
+		link = &dataRouteConnection{conn: conn, stub: pb.NewVectorStoreClient(conn)}
 	}
-	r := &dataRoute{route: hint, conn: conn, stub: pb.NewVectorStoreClient(conn), users: 1}
+	if old != nil && old.link != link {
+		old.link.retired = true
+		if old.link.users == 0 {
+			old.link.conn.Close()
+		}
+	}
+	r := &dataRoute{route: hint, link: link}
+	link.users++
 	c.routes[hint.Partition] = r
 	return r, nil
 }
@@ -78,13 +99,12 @@ func (c *Client) releaseRoute(r *dataRoute, err error) {
 	code := status.Code(err)
 	if code == codes.FailedPrecondition || code == codes.Unavailable || code == codes.DeadlineExceeded {
 		if c.routes[r.route.Partition] == r {
-			delete(c.routes, r.route.Partition)
+			r.stale = true
 		}
-		r.retired = true
 	}
-	r.users--
-	if r.retired && r.users == 0 {
-		r.conn.Close()
+	r.link.users--
+	if r.link.retired && r.link.users == 0 {
+		r.link.conn.Close()
 	}
 }
 func (c *Client) write(ctx context.Context, id string, call func(context.Context, pb.VectorStoreClient, *pb.WriteRoute) (*pb.MutationResponse, error)) (*pb.MutationResponse, error) {
@@ -98,7 +118,7 @@ func (c *Client) write(ctx context.Context, id string, call func(context.Context
 		if r == nil {
 			return call(ctx, c.VectorStoreClient, nil)
 		}
-		reply, err := call(ctx, r.stub, r.route)
+		reply, err := call(ctx, r.link.stub, r.route)
 		c.releaseRoute(r, err)
 		if attempt != 0 || status.Code(err) != codes.FailedPrecondition {
 			return reply, err
