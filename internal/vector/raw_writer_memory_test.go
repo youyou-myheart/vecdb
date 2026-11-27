@@ -66,7 +66,7 @@ func TestRawWriterProjectionDoesNotGrowWithConfirmedHistory(t *testing.T) {
 	if w.history.end() != 2048 || len(w.records) != 0 || len(w.receipts) != 0 {
 		t.Fatal("recovery duplicated history")
 	}
-	w.store.client = nil // Retrying old requests must remain memory-only.
+	w.store.client = nil // Retrying old requests must not read TiKV.
 	for _, id := range []string{"0", "1024", "2047"} {
 		results, batch, err := w.prepare([]*mutationRequest{rawTestRequest(t, repo, id, id)})
 		if err != nil || results[0].err != nil || batch.Number != 0 || results[0].record.Revision != 1 {

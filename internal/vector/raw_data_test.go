@@ -260,7 +260,7 @@ func TestRawLateOldBatchCannotChangeSealedPrefix(t *testing.T) {
 	if err != nil || snapshot.end != 2 {
 		t.Fatal(snapshot, err)
 	}
-	if _, found := snapshot.record("late"); found {
+	if _, found, err := snapshot.record("late"); found || err != nil {
 		t.Fatal("late old write entered successor history")
 	}
 }

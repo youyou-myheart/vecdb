@@ -188,7 +188,10 @@ func (r *Repository) Get(ctx context.Context, id string) (Record, error) {
 		if err != nil {
 			return Record{}, err
 		}
-		record, found := snapshot.record(id)
+		record, found, err := snapshot.record(id)
+		if err != nil {
+			return Record{}, err
+		}
 		if !found {
 			return Record{}, ErrNotFound
 		}

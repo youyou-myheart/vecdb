@@ -243,7 +243,11 @@ func (b *mutationGroup) readOwnedRecord(id string) (Record, error) {
 	case b.rawWriter != nil && before == b.rawWriter.owner.Epoch:
 		history := b.rawWriter.history
 		snap := rawShardSnapshot{history: history, end: history.end()}
-		record, found = snap.record(id)
+		var err error
+		record, found, err = snap.record(id)
+		if err != nil {
+			return Record{}, err
+		}
 		record = cloneRecord(record)
 	default:
 		return Record{}, ErrFenced

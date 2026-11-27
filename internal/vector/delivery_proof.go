@@ -56,7 +56,10 @@ func (c *ClusterService) signRawDelivery(id IndexPartitionID, q Delivery, b *mut
 	// Omitting a routed update or a broadcast delete invalidates the proof.
 	var events []LogEvent
 	for n := q.Previous; n < q.Through; n++ {
-		entry, ok := snap.entry(n + 1)
+		entry, ok, err := snap.entry(n + 1)
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			return nil, errors.New("missing WAL entry for delivery proof")
 		}

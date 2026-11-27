@@ -154,16 +154,16 @@ func TestRawFallbackDropsLateOldTailAtFinalFence(t *testing.T) {
 			if err != nil || view.end != 2 {
 				t.Fatal(view, err)
 			}
-			if _, ok := view.record("replacement"); !ok {
+			if _, ok, err := view.record("replacement"); !ok || err != nil {
 				t.Fatal("successor WAL missing")
 			}
-			if _, ok := view.record("late"); ok {
+			if _, ok, err := view.record("late"); ok || err != nil {
 				t.Fatal("read obsolete tail")
 			}
 			if pinned.end != 1 {
 				t.Fatal("previous view changed", pinned.end)
 			}
-			if _, ok := pinned.record("replacement"); ok {
+			if _, ok, err := pinned.record("replacement"); ok || err != nil {
 				t.Fatal("previous view saw the new epoch")
 			}
 		})

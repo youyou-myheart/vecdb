@@ -194,7 +194,10 @@ func (t *rawSnapshotTransaction) commitBeforeLeaseExpiry(ctx context.Context, ex
 }
 
 func marshalRawRecord(snap *rawShardSnapshot, id string) ([]byte, error) {
-	r, ok := snap.record(id)
+	r, ok, err := snap.record(id)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, tikverr.ErrNotExist
 	}
@@ -202,7 +205,10 @@ func marshalRawRecord(snap *rawShardSnapshot, id string) ([]byte, error) {
 }
 
 func marshalRawEvent(snap *rawShardSnapshot, seq uint64) ([]byte, error) {
-	entry, ok := snap.entry(seq)
+	entry, ok, err := snap.entry(seq)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, tikverr.ErrNotExist
 	}
@@ -338,8 +344,8 @@ func (t *rawSnapshotTransaction) Iter(start, end []byte) (iteratorAPI, error) {
 		}
 		return t.transactionAPI.Iter(start, end)
 	}
-	// transactionAPI.Iter has no context. Only acquiring the view can do IO;
-	// advancing the iterator marshals one immutable item at a time.
+	// transactionAPI.Iter has no context. Acquiring the view can read TiKV;
+	// advancing reads one immutable item from memory or the local cache file.
 	parent := t.readCtx
 	if parent == nil {
 		parent = context.Background()

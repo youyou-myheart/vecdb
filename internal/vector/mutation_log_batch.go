@@ -40,7 +40,11 @@ func (w *mutationBatchState) prepare(requests []*mutationRequest) ([]mutationRes
 		q := request.preparedMutation
 		previous, ok := w.receipts[q.mutation.RequestID]
 		if !ok && w.confirmed != nil {
-			previous, ok = w.confirmed.receipt(q.mutation.RequestID)
+			var err error
+			previous, ok, err = w.confirmed.receipt(q.mutation.RequestID)
+			if err != nil {
+				return nil, mutationLogBatch{}, err
+			}
 		}
 		if ok {
 			if previous.Digest != q.digest {
